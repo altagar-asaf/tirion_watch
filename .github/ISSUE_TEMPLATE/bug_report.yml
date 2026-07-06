@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible problem in the local agent, CLI, or webhook flow.
+title: "[Bug]: "
+labels: ["bug", "needs-repro"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include prompts, source code, secrets, raw telemetry, absolute paths, private repository names, or real webhook payloads. Report security issues privately using SECURITY.md.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: Minimal commands or steps using synthetic data.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tirion version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

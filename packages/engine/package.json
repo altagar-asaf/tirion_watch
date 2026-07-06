@@ -1,0 +1,46 @@
+{
+  "name": "@tirion/engine",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/altagar-asaf/tirion.git",
+    "directory": "packages/engine"
+  },
+  "bugs": {
+    "url": "https://github.com/altagar-asaf/tirion/issues"
+  },
+  "homepage": "https://github.com/altagar-asaf/tirion#readme",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "production": [
+        "hosted-dist/packages/engine/hosted/index.d.ts"
+      ]
+    }
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./production": {
+      "types": "./hosted-dist/packages/engine/hosted/index.d.ts",
+      "default": "./hosted-dist/packages/engine/hosted/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p ./ && tsc -p tsconfig.production.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tirion/agent-contract": "file:../agent-contract"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.24",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.8"
+  }
+}

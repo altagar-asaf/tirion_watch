@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": "hosted-dist",
+    "rootDir": "../..",
+    "strict": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": [
+    "hosted/**/*.ts",
+    "../../src/types.ts",
+    "../../src/aggregation/**/*.ts",
+    "../../src/normalization/**/*.ts",
+    "../../src/privacy/privacyGuard.ts",
+    "../../src/billing/billingContextResolver.ts",
+    "../../src/pricing/**/*.ts",
+    "../../src/budget/budgetWarnings.ts"
+    ,"../../src/attribution/fingerprints.ts"
+    ,"../../src/attribution/gitCli.ts"
+    ,"../../src/attribution/repositoryObservation.ts"
+    ,"../../src/attribution/commitAttributionPolicy.ts"
+    ,"../../src/attribution/agenticWorkEpisode.ts"
+    ,"../../src/attribution/workspaceChangeTracker.ts"
+    ,"../../src/attribution/gitAttribution.ts"
+    ,"../../src/storage/commitAttributionLedger.ts"
+  ],
+  "exclude": [
+    "../../src/**/*.test.ts"
+  ]
+}

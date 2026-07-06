@@ -1,0 +1,36 @@
+{
+  "name": "@tirion/agent",
+  "version": "0.1.6",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/altagar-asaf/tirion.git",
+    "directory": "packages/agent"
+  },
+  "bugs": {
+    "url": "https://github.com/altagar-asaf/tirion/issues"
+  },
+  "homepage": "https://github.com/altagar-asaf/tirion#readme",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "tirion-agent": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p ./",
+    "test": "npm run build && vitest run"
+  },
+  "dependencies": {
+    "@tirion/agent-contract": "file:../agent-contract",
+    "@tirion/agent-storage": "file:../agent-storage",
+    "@tirion/engine": "file:../engine",
+    "@tirion/platform": "file:../platform",
+    "smol-toml": "^1.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.24",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.8"
+  }
+}

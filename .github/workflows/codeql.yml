@@ -1,0 +1,25 @@
+name: codeql
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/tirion-tui/go.mod
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript,go
+      - uses: github/codeql-action/analyze@v3

@@ -1,0 +1,55 @@
+{
+  "name": "tirion",
+  "description": "Agent-first local measurement and estimated cost attribution for supported AI coding telemetry.",
+  "version": "0.1.6",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/altagar-asaf/tirion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/altagar-asaf/tirion/issues"
+  },
+  "homepage": "https://github.com/altagar-asaf/tirion#readme",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "keywords": [
+    "ai-coding",
+    "observability",
+    "opentelemetry",
+    "cost-estimation",
+    "developer-tools",
+    "local-first",
+    "webhooks"
+  ],
+  "workspaces": [
+    "packages/agent-contract",
+    "packages/agent-storage",
+    "packages/agent",
+    "packages/distribution",
+    "packages/engine",
+    "packages/platform",
+    "packages/tirionctl"
+  ],
+  "scripts": {
+    "compile": "npm run build --workspace @tirion/agent-contract && npm run build --workspace @tirion/engine && npm run build --workspace @tirion/platform && npm run build --workspace @tirion/agent-storage && npm run build --workspace @tirion/agent && npm run build --workspace @tirion/tirionctl && npm run build --workspace @tirion/distribution && tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run && npm run test --workspace @tirion/agent-contract && npm run test --workspace @tirion/engine && npm run test --workspace @tirion/platform && npm run test --workspace @tirion/agent-storage && npm run test --workspace @tirion/agent && npm run test --workspace @tirion/tirionctl && npm run test --workspace @tirion/distribution",
+    "tui:build": "cd packages/tirion-tui && go build ./cmd/tirion-tui",
+    "tui:test": "cd packages/tirion-tui && go test ./...",
+    "tui:check": "npm run tui:build && npm run tui:test",
+    "audit:security": "npm audit --audit-level=high",
+    "check": "npm run compile && npm test && npm run tui:check && npm run audit:security",
+    "package:macos": "npm run compile && npm run tui:build && npm run build --workspace @tirion/distribution && node packages/distribution/dist/main.js"
+  },
+  "devDependencies": {
+    "@tirion/agent-contract": "file:packages/agent-contract",
+    "@tirion/engine": "file:packages/engine",
+    "@tirion/platform": "file:packages/platform",
+    "@types/node": "^22.15.24",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.8"
+  }
+}

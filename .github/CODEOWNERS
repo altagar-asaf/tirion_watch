@@ -1,0 +1,7 @@
+* @altagar-asaf
+/packages/agent/** @altagar-asaf
+/packages/engine/** @altagar-asaf
+/packages/agent-contract/** @altagar-asaf
+/src/privacy/** @altagar-asaf
+/constructs.md @altagar-asaf
+/SECURITY.md @altagar-asaf
