@@ -27,8 +27,8 @@
   },
   "devDependencies": {
     "@tirion/agent": "file:../agent",
-    "@types/node": "^22.15.24",
-    "typescript": "^5.8.3",
-    "vitest": "^4.1.8"
+    "@types/node": "^26.1.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
   }
 }
