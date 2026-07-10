@@ -313,6 +313,7 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
     }
     if (assembled.length > 0) {
       await this.episodeTracker.observeWorkspaceEvidence(assembled);
+      await this.notifyEvidenceBound();
     }
     return assembled;
   }

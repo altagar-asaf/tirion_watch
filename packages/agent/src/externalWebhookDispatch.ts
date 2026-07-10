@@ -188,8 +188,8 @@ export class ExternalWebhookDispatchService {
       return;
     }
     this.running = true;
-    await this.reconcileCommitEvents();
     this.scheduleRetry();
+    void this.reconcileCommitEvents().catch(() => undefined);
   }
 
   async stop(): Promise<void> {
@@ -1345,12 +1345,14 @@ export class ExternalWebhookDispatchService {
       });
       return undefined;
     }
-    const repoKeys = uniqueStrings(
+    const queryEvidenceRepoKeys = uniqueStrings(
       episode.evidence
         .filter((item) => item.queryId === queryId)
         .map((item) => item.repoKey)
-        .concat(episode.repoKeys ?? [])
     );
+    const repoKeys = queryEvidenceRepoKeys.length > 0
+      ? queryEvidenceRepoKeys
+      : uniqueStrings(episode.repoKeys ?? []);
     if (repoKeys.length !== 1) {
       if (repoKeys.length === 0) {
         const liveBinding = this.bindCompletedRunToLiveRepository(run);

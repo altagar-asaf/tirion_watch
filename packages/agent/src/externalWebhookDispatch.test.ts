@@ -1981,6 +1981,67 @@ describe("external webhook dispatch", () => {
     }));
   });
 
+  it("uses query-specific evidence when a wider episode spans multiple repositories", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({
+      attribution: {
+        listWorkEpisodes: async () => [workEpisodeWithEvidence({
+          episodeId: "episode_multi_repo",
+          repoKey: "repo_a",
+          repoKeys: ["repo_a", "repo_b"],
+          runIds: ["run_query_a", "run_query_b"],
+          queryIds: ["qry_query_a", "qry_query_b"],
+          evidence: [
+            { runId: "run_query_a", queryId: "qry_query_a", repoKey: "repo_a", artifactKeys: ["artifact_a"] },
+            { runId: "run_query_b", queryId: "qry_query_b", repoKey: "repo_b", artifactKeys: ["artifact_b"] }
+          ]
+        })]
+      },
+      repositories: {
+        relativePaths: () => ["tirion-webhook-smoke-2.txt"],
+        resolveGitHubRepository: async () => undefined,
+        listRepositories: async () => [{ root: "/tmp/tirion_local_log_server", repoKey: "repo_a" }]
+      }
+    });
+
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeCompletedRuns([productionRun({
+      runId: "run_query_a",
+      queryId: "qry_query_a",
+      correlationId: "trace_query_a",
+      provider: "codex",
+      runtime: "codex",
+      inputTokens: 10,
+      outputTokens: 2,
+      totalTokens: 12,
+      startedAt: "2026-06-08T00:20:00.000Z",
+      endedAt: "2026-06-08T00:20:01.000Z"
+    })]);
+
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
+
+    const ended = received.find((event) => (event as { eventType?: string }).eventType === "run.ended");
+    expect(ended).toMatchObject({
+      eventType: "run.ended",
+      repository: {
+        repoKey: "repo_a",
+        fullName: "local/tirion_local_log_server"
+      },
+      filesChanged: ["tirion-webhook-smoke-2.txt"]
+    });
+  });
+
   it("blocks privacy-invalid changed-file paths before outbound delivery", async () => {
     const diagnostics: DiagnosticEvent[] = [];
     const received: unknown[] = [];

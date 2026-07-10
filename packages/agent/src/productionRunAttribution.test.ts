@@ -68,9 +68,14 @@ describe("agent production run attribution foundation", () => {
 
     const attribution = new AgentProductionRunAttribution(storage, repositories);
     await attribution.start();
+    let evidenceBoundCount = 0;
+    attribution.onWorkspaceEvidenceBound(async () => {
+      evidenceBoundCount += 1;
+    });
     await attribution.observeProductionRuns([{ ...run(baselineAt, endedAt), endedAt: undefined }]);
     expect(await attribution.listEvidence()).toEqual([]);
     await attribution.observeProductionRuns([run(baselineAt, endedAt)]);
+    expect(evidenceBoundCount).toBe(1);
     expect(await attribution.listEvidence()).toEqual([
       expect.objectContaining({
         queryId: "correlation_12345678",

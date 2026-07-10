@@ -52,7 +52,7 @@ describe("DefaultRepositoryObservation", () => {
     ]);
 
     expect(startResult).toBe("started");
-    await wait(20);
+    await waitUntil(() => cli.blocked, 500);
     expect(cli.blocked).toBe(true);
     cli.releaseBlockedHead();
     await observation.stop();
@@ -486,6 +486,13 @@ async function gitOutput(cwd: string, args: string[]): Promise<string> {
 
 async function wait(delayMs: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await wait(10);
+  }
 }
 
 class RacingGitCli extends GitCli {

@@ -33,7 +33,7 @@ export class AgentRepositoryObservationService {
     this.snapshots = new SqliteRepositorySnapshotStore(storage);
   }
 
-  async start(): Promise<void> {
+  async start(options: { background?: boolean } = {}): Promise<void> {
     if (this.observation) {
       return;
     }
@@ -55,7 +55,20 @@ export class AgentRepositoryObservationService {
         await this.snapshots.append(event.snapshot);
       }
     });
-    await observation.start({ deferInitialScan: true });
+    const start = observation.start({ deferInitialScan: true });
+    if (options.background) {
+      void start.catch(() => {
+        this.recordEvent({
+          kind: "constructLifecycle",
+          construct: "RepositoryObservation",
+          operation: "observer",
+          state: "failed",
+          reason: "repository_observer_background_start_failed"
+        });
+      });
+      return;
+    }
+    await start;
   }
 
   async stop(): Promise<void> {

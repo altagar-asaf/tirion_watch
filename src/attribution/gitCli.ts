@@ -9,6 +9,8 @@ import { AttributionHasher } from "./fingerprints";
 const execFileAsync = promisify(execFile);
 const EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const READ_ONLY_GIT_ENV = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+export const MAX_WORKTREE_SNAPSHOT_ARTIFACTS = 100;
+const STATUS_ENTRY_STAT_CONCURRENCY = 64;
 
 export type GitRepository = {
   root: string;
@@ -94,10 +96,11 @@ export class GitCli {
       this.gitOptional(repo.root, ["diff", "--numstat", "HEAD", "--"])
     ]);
     const changedEntries = parseStatusEntries(statusOutput ?? "");
+    const prioritizedEntries = await prioritizeStatusEntries(repo.root, changedEntries);
     const statsByIdentifier = parseNumstat(numstatOutput ?? "");
     const artifacts: GitArtifactSnapshot[] = [];
 
-    for (const entry of changedEntries) {
+    for (const entry of prioritizedEntries.slice(0, MAX_WORKTREE_SNAPSHOT_ARTIFACTS)) {
       artifacts.push(await this.artifactSnapshot(repo, entry, statsByIdentifier.get(normalizeGitIdentifier(entry.identifier))));
     }
 
@@ -293,6 +296,44 @@ export class GitCli {
       return undefined;
     }
   }
+}
+
+async function prioritizeStatusEntries(root: string, entries: GitStatusEntry[]): Promise<GitStatusEntry[]> {
+  if (entries.length <= MAX_WORKTREE_SNAPSHOT_ARTIFACTS) {
+    return entries;
+  }
+  const ranked = await mapConcurrent(entries, STATUS_ENTRY_STAT_CONCURRENCY, async (entry, index) => {
+    const absolute = path.resolve(root, entry.identifier);
+    const stat = await fs.stat(absolute).catch(() => undefined);
+    return {
+      entry,
+      index,
+      mtimeMs: stat?.isFile() ? stat.mtimeMs : 0
+    };
+  });
+  return ranked
+    .sort((left, right) =>
+      right.mtimeMs - left.mtimeMs
+      || left.entry.identifier.localeCompare(right.entry.identifier)
+      || left.index - right.index)
+    .map((item) => item.entry);
+}
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 export function resolveGitHubRepositoryIdentity(configOutput: string): GitHubRepositoryIdentity | undefined {

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { AttributionHasher } from "./fingerprints";
-import { GitCli, parseGitHubRemote, resolveGitHubRepositoryIdentity } from "./gitCli";
+import { GitCli, MAX_WORKTREE_SNAPSHOT_ARTIFACTS, parseGitHubRemote, resolveGitHubRepositoryIdentity } from "./gitCli";
 
 const execFileAsync = promisify(execFile);
 const tempDirs: string[] = [];
@@ -105,6 +105,31 @@ describe("GitCli", () => {
         classification: "text"
       })
     ]);
+  });
+
+  it("prioritizes recently changed files when the dirty worktree is huge", async () => {
+    const dir = await repository();
+    const cli = new GitCli(new AttributionHasher("test-salt"));
+    const [repo] = (await cli.discoverRepositories([dir])).repositories;
+    await fs.mkdir(path.join(dir, "tirion-events"));
+    const old = Date.now() - 60_000;
+    for (let index = 0; index < MAX_WORKTREE_SNAPSHOT_ARTIFACTS + 5; index += 1) {
+      const file = path.join(dir, "tirion-events", `${String(index).padStart(4, "0")}.json`);
+      await fs.writeFile(file, "{}\n", "utf8");
+      await fs.utimes(file, old / 1000, old / 1000);
+    }
+    await fs.writeFile(path.join(dir, "tirion-webhook-smoke.txt"), "ok\n", "utf8");
+
+    const snapshot = await cli.snapshot(repo);
+
+    expect(snapshot.dirty).toBe(true);
+    expect(snapshot.artifacts).toHaveLength(MAX_WORKTREE_SNAPSHOT_ARTIFACTS);
+    expect(snapshot.artifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        identifier: "tirion-webhook-smoke.txt",
+        artifactKey: new AttributionHasher("test-salt").artifactKey(repo.repoKey, "tirion-webhook-smoke.txt")
+      })
+    ]));
   });
 
   it("classifies committed deletions without persisting a state key", async () => {

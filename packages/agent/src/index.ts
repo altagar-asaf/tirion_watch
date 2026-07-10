@@ -103,6 +103,9 @@ export const USAGE_RECONCILIATION_SWEEP_MS = 30_000;
 export const LIVE_RECOVERY_WINDOW_MS = 15 * 60 * 1000;
 export const DIAGNOSTIC_REFRESH_WAIT_MS = 100;
 export const USAGE_PROJECTION_READ_WAIT_MS = 250;
+export const LIVE_REPOSITORY_OBSERVATION_WINDOW_MS = 30_000;
+export const LIVE_REPOSITORY_OBSERVATION_POLL_MS = 500;
+export const WEBHOOK_LIFECYCLE_PROJECTION_BATCH_SIZE = 25;
 
 export type AgentRuntimeOptions = {
   paths?: AgentPaths;
@@ -189,6 +192,9 @@ export class AgentRuntime {
   private usageRebuildQueue: Promise<ProductionRunV1[]> = Promise.resolve([]);
   private readonly runtimeWork = new RuntimeWorkScheduler();
   private pendingLiveObservations: SafeObservationV1[] = [];
+  private readonly pendingWebhookLifecycleProjectionRuns = new Map<string, ProductionRunV1>();
+  private pendingWebhookLifecycleCommitReconcile = false;
+  private historicalWebhookLifecycleProjectionScheduled = false;
 
   constructor(options: AgentRuntimeOptions = {}) {
     this.paths = options.paths ?? resolveAgentPaths();
@@ -1709,16 +1715,11 @@ export class AgentRuntime {
 
   private handleWorkspaceEvidenceBound(): void {
     this.runtimeWork.enqueue("webhook_evidence_projection", async () => {
-      if (this.requireMetadata().ownershipState !== "agent_full_owner" || !this.webhookDispatch) {
+      if (this.requireMetadata().ownershipState !== "agent_full_owner") {
         return;
       }
       const runs = await this.requireProductionUsage().runs("agent_full_owner");
-      const completedRuns = runs.filter((run) => Boolean(run.endedAt && run.endedAt >= run.startedAt));
-      if (completedRuns.length > 0) {
-        await this.webhookDispatch.observeCompletedRuns(completedRuns);
-      }
-      await this.webhookDispatch.reconcileCommitEvents();
-      this.emitEvent("webhook_changed");
+      this.scheduleWebhookLifecycleProjection(runs, { reconcileCommitEvents: true });
     });
   }
 
@@ -1759,7 +1760,7 @@ export class AgentRuntime {
 
   private async startFullOwnerCoreServices(options: { includeCurrentRuns?: boolean } = {}): Promise<void> {
     const includeCurrentRuns = options.includeCurrentRuns !== false;
-    await this.repositoryObservation?.start();
+    await this.repositoryObservation?.start({ background: true });
     if (!this.verifiedAttribution) {
       const attribution = new AgentVerifiedAttributionService(
         this.requireStorage(),
@@ -1769,6 +1770,9 @@ export class AgentRuntime {
       );
       this.verifiedAttribution = attribution;
       this.verifiedAttributionReady = false;
+      if (!this.webhookDispatch) {
+        await this.startWebhookDispatch();
+      }
       this.verifiedAttributionStart = attribution.start()
         .then(() => {
           if (this.verifiedAttribution === attribution) {
@@ -2392,6 +2396,12 @@ export class AgentRuntime {
   private async drainLiveIngestProcessing(): Promise<void> {
     const observations = this.pendingLiveObservations.splice(0);
     if (this.metadata?.ownershipState === "agent_full_owner") {
+      if (observations.length > 0) {
+        this.repositoryObservation?.requestActiveObservationWindow(
+          LIVE_REPOSITORY_OBSERVATION_WINDOW_MS,
+          LIVE_REPOSITORY_OBSERVATION_POLL_MS
+        );
+      }
       for (const observation of observations) {
         await this.verifiedAttribution?.observeSafeObservation(observation).catch(() => undefined);
         await this.webhookDispatch?.observeSafeObservation(observation).catch(() => undefined);
@@ -2438,6 +2448,10 @@ export class AgentRuntime {
     if (owner !== "agent_usage_owner" && owner !== "agent_full_owner") {
       return [];
     }
+    const previousRuns = await this.requireProductionUsage().runs(owner).catch(() => []);
+    const previousCompletedSignatures = new Map(previousRuns
+      .filter(isCompletedProductionRun)
+      .map((run) => [run.runId, productionRunProjectionSignature(run)]));
     const runs = await this.requireProductionUsage().rebuild(owner);
     await this.requireBudgetWarnings().rebuild(runs);
     const rebuiltAt = this.now().toISOString();
@@ -2446,11 +2460,15 @@ export class AgentRuntime {
     this.emitEvent("usage_changed");
     this.emitEvent("warnings_changed");
     if (owner === "agent_full_owner") {
-      const completedRuns = runs.filter((run) => Boolean(run.endedAt && run.endedAt >= run.startedAt));
+      const completedRuns = runs.filter(isCompletedProductionRun);
+      const completedRunsForLifecycleProjection = this.historicalWebhookLifecycleProjectionScheduled
+        ? completedRuns.filter((run) => previousCompletedSignatures.get(run.runId) !== productionRunProjectionSignature(run))
+        : completedRuns;
+      this.historicalWebhookLifecycleProjectionScheduled = true;
       if (completedRuns.length > 0) {
-        await this.webhookDispatch?.observeCompletedRuns(completedRuns);
-        await this.webhookDispatch?.reconcileCommitEvents();
-        this.emitEvent("webhook_changed");
+        this.scheduleWebhookLifecycleProjection(completedRunsForLifecycleProjection, {
+          reconcileCommitEvents: true
+        });
       }
       const attribution = this.verifiedAttributionReady ? this.verifiedAttribution : undefined;
       if (!attribution) {
@@ -2463,12 +2481,14 @@ export class AgentRuntime {
         processedCount = incremental.processedCount;
         deferredCount = incremental.deferredCount;
         if (incremental.processedCount > 0 && completedRuns.length > 0) {
-          await this.webhookDispatch?.observeCompletedRuns(completedRuns);
-          await this.webhookDispatch?.reconcileCommitEvents();
-          this.emitEvent("webhook_changed");
+          this.scheduleWebhookLifecycleProjection(completedRuns, {
+            reconcileCommitEvents: true
+          });
         }
         if (incremental.processedCount > 0) {
-          await this.webhookDispatch?.reconcileCommitEvents();
+          this.scheduleWebhookLifecycleProjection([], {
+            reconcileCommitEvents: true
+          });
           this.emitEvent("attribution_changed");
           this.emitEvent("webhook_changed");
         }
@@ -2484,6 +2504,72 @@ export class AgentRuntime {
       }
     });
     return runs;
+  }
+
+  private scheduleWebhookLifecycleProjection(
+    runs: ProductionRunV1[],
+    options: { reconcileCommitEvents?: boolean } = {}
+  ): void {
+    for (const run of runs.filter(isCompletedProductionRun)) {
+      this.pendingWebhookLifecycleProjectionRuns.set(run.runId, run);
+    }
+    this.pendingWebhookLifecycleCommitReconcile ||= options.reconcileCommitEvents !== false;
+    if (this.pendingWebhookLifecycleProjectionRuns.size === 0 && !this.pendingWebhookLifecycleCommitReconcile) {
+      return;
+    }
+    this.runtimeWork.enqueue("webhook_lifecycle_projection", async () => {
+      await this.drainWebhookLifecycleProjection();
+    });
+  }
+
+  private async drainWebhookLifecycleProjection(): Promise<void> {
+    if (this.requireMetadata().ownershipState !== "agent_full_owner" || !this.webhookDispatch) {
+      this.pendingWebhookLifecycleProjectionRuns.clear();
+      this.pendingWebhookLifecycleCommitReconcile = false;
+      return;
+    }
+    const pendingRuns = [...this.pendingWebhookLifecycleProjectionRuns.values()]
+      .sort((left, right) =>
+        (right.endedAt ?? right.startedAt).localeCompare(left.endedAt ?? left.startedAt));
+    const runs = pendingRuns.slice(0, WEBHOOK_LIFECYCLE_PROJECTION_BATCH_SIZE);
+    for (const run of runs) {
+      this.pendingWebhookLifecycleProjectionRuns.delete(run.runId);
+    }
+    const reconcileCommitEvents = this.pendingWebhookLifecycleCommitReconcile
+      && this.pendingWebhookLifecycleProjectionRuns.size === 0;
+    if (reconcileCommitEvents) {
+      this.pendingWebhookLifecycleCommitReconcile = false;
+    }
+    try {
+      if (runs.length > 0) {
+        await this.webhookDispatch.observeCompletedRuns(runs);
+      }
+      if (reconcileCommitEvents) {
+        await this.webhookDispatch.reconcileCommitEvents();
+      }
+      if (runs.length > 0 || reconcileCommitEvents) {
+        this.emitEvent("webhook_changed");
+      }
+    } catch (error) {
+      this.recordLivePipelineEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "failed",
+        reason: "webhook_lifecycle_projection_failed",
+        severity: "warning",
+        details: {
+          errorCode: safeErrorCode(error),
+          pendingRunCount: this.pendingWebhookLifecycleProjectionRuns.size,
+          batchRunCount: runs.length
+        }
+      });
+    }
+    if (this.pendingWebhookLifecycleProjectionRuns.size > 0 || this.pendingWebhookLifecycleCommitReconcile) {
+      this.runtimeWork.enqueue("webhook_lifecycle_projection", async () => {
+        await this.drainWebhookLifecycleProjection();
+      });
+    }
   }
 
   private async promptCaptureEnabled(provider: SupportedProvider): Promise<boolean> {
@@ -3089,6 +3175,14 @@ function safeErrorCode(error: unknown): SafeErrorCode {
     "internal_error"
   ];
   return safe.includes(message as SafeErrorCode) ? message as SafeErrorCode : "internal_error";
+}
+
+function isCompletedProductionRun(run: ProductionRunV1): boolean {
+  return Boolean(run.endedAt && run.endedAt >= run.startedAt);
+}
+
+function productionRunProjectionSignature(run: ProductionRunV1): string {
+  return createHash("sha256").update(JSON.stringify(run)).digest("hex");
 }
 
 function listen(server: Server, socketPath: string): Promise<void> {
