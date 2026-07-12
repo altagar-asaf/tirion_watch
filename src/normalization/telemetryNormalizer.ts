@@ -330,6 +330,16 @@ function normalizeStatus(value: unknown): string | undefined {
   if (!isRecord(value)) {
     return firstString(value);
   }
+  const numericCode = toNumber(value.code);
+  if (numericCode === 2) {
+    return "STATUS_CODE_ERROR";
+  }
+  if (numericCode === 1) {
+    return "STATUS_CODE_OK";
+  }
+  if (numericCode === 0) {
+    return "STATUS_CODE_UNSET";
+  }
   return firstString(value.code, value.message);
 }
 

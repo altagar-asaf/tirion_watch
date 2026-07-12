@@ -13,8 +13,9 @@ set -euo pipefail
 # 1. Cursor source configuration is safe and local to the temp test home.
 # 2. Cursor beforeSubmitPrompt -> afterAgentResponse -> activity -> stop hooks
 #    produce run.start, run.update, and run.ended webhook events.
-# 3. Token totals are preserved on run.update/run.ended, while usage value and
-#    Cursor Composer catalog cost estimates are verified on run.ended.
+# 3. Token totals are preserved on run.update/run.ended; terminal activity
+#    conserves those totals and keeps usage attribution explicit; usage value
+#    and Cursor Composer catalog cost estimates are verified on run.ended.
 # 4. Sensitive prompt, command, shell output, file path, and file content fields
 #    do not leave the machine through webhooks.
 # 5. A commit made from the mocked Cursor work is attributed to the Cursor run.
@@ -311,6 +312,17 @@ assert_cursor_run_ended_event() {
   assert_json "$file" '.totalTokens == 2560'
   assert_cursor_run_cost "$file"
   assert_json "$file" '.coverage.usageCoverage == "final"'
+  assert_json "$file" '(.activity | type) == "array" and (.activity | length) >= 1'
+  assert_json "$file" '(.activity | all(.[]; (.count | type) == "number" and .count >= 1 and (.failureCount | type) == "number" and .failureCount >= 0 and .failureCount <= .count))'
+  assert_json "$file" '(.activity | any(.name == "shell_exec" and .kind == "tool")) and (.activity | any(.name == "file_edit" and .kind == "tool"))'
+  assert_json "$file" '(.activity | any(.name == "Unallocated run usage" and .kind == "unknown" and .usageAttributionBasis == "unavailable"))'
+  assert_json "$file" '([.activity[] | (.inputTokens // 0)] | add // 0) == .inputTokens'
+  assert_json "$file" '([.activity[] | (.outputTokens // 0)] | add // 0) == .outputTokens'
+  assert_json "$file" '([.activity[] | (.cacheReadInputTokens // 0)] | add // 0) == .cacheReadInputTokens'
+  assert_json "$file" '([.activity[] | (.cacheCreationInputTokens // 0)] | add // 0) == .cacheCreationInputTokens'
+  assert_json "$file" '([.activity[] | (.reasoningOutputTokens // 0)] | add // 0) == .reasoningOutputTokens'
+  assert_json "$file" '([.activity[] | (.totalTokens // 0)] | add // 0) == .totalTokens'
+  assert_json "$file" '(.activity | all(.[]; .evidence.basis == "usage_projection" and .evidence.delayed == true))'
   assert_json "$file" '(.filesChanged | type) == "array"'
   assert_json "$file" '(.filesChanged | all(.[]; (startswith("/") or startswith("../") or startswith("~") or test("^[A-Za-z]:")) | not))'
   assert_trace_ids "$file"

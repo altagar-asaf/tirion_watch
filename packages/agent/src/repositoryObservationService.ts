@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import * as path from "node:path";
 import type { AgentStorageClient } from "@tirion/agent-storage";
 import type { SupportedProvider } from "@tirion/agent-contract";
 import {
@@ -15,6 +16,14 @@ import { writePrivateFileAtomic } from "@tirion/platform";
 import { RepositoryScopeManagement } from "./repositoryScopeManagement";
 import { SqliteRepositoryObservationStore, SqliteRepositorySnapshotStore } from "./repositoryObservationStore";
 
+export const MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES = 100;
+const MAX_REPOSITORY_SNAPSHOT_DOCUMENTS = 1_000;
+
+export type ResolvedWorkspaceEvidence = {
+  repositoryKey: string;
+  artifactKeys: string[];
+};
+
 export class AgentRepositoryObservationService {
   private observation?: RepositoryObservation;
   private snapshotUnsubscribe?: () => void;
@@ -22,6 +31,7 @@ export class AgentRepositoryObservationService {
   private hasher?: AttributionHasher;
   private gitCli?: GitCli;
   private readonly artifactPathsByRepo = new Map<string, Map<string, string>>();
+  private watchedRepositories?: GitRepository[];
 
   constructor(
     private readonly storage: AgentStorageClient,
@@ -36,6 +46,22 @@ export class AgentRepositoryObservationService {
   async start(options: { background?: boolean } = {}): Promise<void> {
     if (this.observation) {
       return;
+    }
+    const removedLegacySnapshots = await this.storage.pruneRepositorySnapshotDocuments(
+      MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES
+    );
+    if (removedLegacySnapshots > 0) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "RepositoryObservation",
+        operation: "snapshot",
+        state: "completed",
+        reason: "oversized_legacy_repository_snapshots_pruned",
+        details: {
+          removedSnapshotCount: removedLegacySnapshots,
+          maxArtifactStates: MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES
+        }
+      });
     }
     const locators = await this.scopes.activeLocators();
     const git = this.git();
@@ -53,6 +79,9 @@ export class AgentRepositoryObservationService {
     this.snapshotUnsubscribe = observation.onObservation(async (event) => {
       if (event.kind === "snapshot") {
         await this.snapshots.append(event.snapshot);
+        if (event.snapshot.observedSequence % 32 === 0) {
+          await this.storage.trimAgentDocuments("repository_snapshot", MAX_REPOSITORY_SNAPSHOT_DOCUMENTS);
+        }
       }
     });
     const start = observation.start({ deferInitialScan: true });
@@ -78,6 +107,7 @@ export class AgentRepositoryObservationService {
     this.snapshotUnsubscribe?.();
     this.snapshotUnsubscribe = undefined;
     this.artifactPathsByRepo.clear();
+    this.watchedRepositories = undefined;
   }
 
   async restart(): Promise<void> {
@@ -110,8 +140,52 @@ export class AgentRepositoryObservationService {
   }
 
   async listRepositories(_provider?: SupportedProvider): Promise<GitRepository[]> {
+    if (this.watchedRepositories) {
+      return this.watchedRepositories.map((repository) => ({ ...repository }));
+    }
     const locators = await this.scopes.activeLocators();
-    return (await this.git().discoverRepositories(locators.map((locator) => locator.path))).repositories;
+    const repositories = (await this.git().discoverRepositories(locators.map((locator) => locator.path))).repositories;
+    this.watchedRepositories = repositories.map((repository) => ({ ...repository }));
+    return repositories;
+  }
+
+  async resolveWorkspaceRepositoryKey(workspacePath: string): Promise<string | undefined> {
+    return (await this.resolveWorkspaceEvidence(workspacePath))?.repositoryKey;
+  }
+
+  async resolveWorkspaceEvidence(
+    workspacePath: string,
+    artifactPaths: string[] = []
+  ): Promise<ResolvedWorkspaceEvidence | undefined> {
+    const watched = await this.listRepositories();
+    const workspace = canonicalExistingPath(workspacePath);
+    const matches = watched
+      .map((repository) => ({ ...repository, canonicalRoot: canonicalExistingPath(repository.root) }))
+      .filter((repository) => workspace === repository.canonicalRoot || workspace.startsWith(`${repository.canonicalRoot}${path.sep}`))
+      .sort((left, right) => right.canonicalRoot.length - left.canonicalRoot.length);
+    if (matches.length === 0) {
+      return undefined;
+    }
+    const repository = matches[0];
+    const root = repository.canonicalRoot;
+    const cwd = workspace;
+    const known = this.artifactPathsByRepo.get(repository.repoKey) ?? new Map<string, string>();
+    const artifactKeys = new Set<string>();
+    for (const candidate of artifactPaths.slice(0, 64)) {
+      if (!validArtifactPathCandidate(candidate)) {
+        continue;
+      }
+      const absolute = canonicalExistingPath(path.isAbsolute(candidate) ? candidate : path.resolve(cwd, candidate));
+      const relative = path.relative(root, absolute).replace(/\\/g, "/");
+      if (relative === "" || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) {
+        continue;
+      }
+      const artifactKey = this.artifactKey(repository.repoKey, relative);
+      known.set(artifactKey, relative);
+      artifactKeys.add(artifactKey);
+    }
+    this.artifactPathsByRepo.set(repository.repoKey, known);
+    return { repositoryKey: repository.repoKey, artifactKeys: [...artifactKeys].sort() };
   }
 
   async resolveGitHubRepository(repoKey: string) {
@@ -168,6 +242,19 @@ export class AgentRepositoryObservationService {
     }
     this.artifactPathsByRepo.set(repoKey, known);
   }
+}
+
+function canonicalExistingPath(value: string): string {
+  const resolved = path.resolve(value);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function validArtifactPathCandidate(value: string): boolean {
+  return value.trim() !== "" && value.length <= 4_096 && !value.includes("\0");
 }
 
 function readOrCreateSecret(path: string): string {

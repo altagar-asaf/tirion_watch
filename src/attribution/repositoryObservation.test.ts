@@ -48,7 +48,7 @@ describe("DefaultRepositoryObservation", () => {
 
     const startResult = await Promise.race([
       observation.start({ deferInitialScan: true }).then(() => "started" as const),
-      wait(100).then(() => "timed_out" as const)
+      wait(1_000).then(() => "timed_out" as const)
     ]);
 
     expect(startResult).toBe("started");

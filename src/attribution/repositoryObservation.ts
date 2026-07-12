@@ -604,6 +604,7 @@ export class DefaultRepositoryObservation implements RepositoryObservation {
         observedSequence,
         dirty: snapshot.dirty,
         dirtyKnown: snapshot.dirtyKnown,
+        artifactCoverage: snapshot.artifactCoverage,
         artifactStates: snapshot.artifacts.map((artifact) => ({
           artifactKey: artifact.artifactKey,
           previousArtifactKey: artifact.previousArtifactKey,
@@ -631,6 +632,7 @@ export class DefaultRepositoryObservation implements RepositoryObservation {
           observedSequence,
           dirty: observation.dirty,
           dirtyKnown: observation.dirtyKnown,
+          artifactCoverage: observation.artifactCoverage ?? "complete",
           artifactCount: observation.artifactStates.length,
           refKey: observation.refKey ?? null
         }
@@ -759,6 +761,7 @@ function snapshotSignature(snapshot: GitWorktreeSnapshot): string {
     branch: snapshot.branch,
     dirty: snapshot.dirty,
     dirtyKnown: snapshot.dirtyKnown,
+    artifactCoverage: snapshot.artifactCoverage,
     artifacts: snapshot.artifacts.map((artifact) => [
       artifact.artifactKey,
       artifact.previousArtifactKey,

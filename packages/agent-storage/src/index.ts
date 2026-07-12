@@ -49,10 +49,76 @@ export type AgentDocument = {
   value: unknown;
 };
 
+export type WorkspaceEvidenceDocumentQuery = {
+  queryId?: string;
+  repoKey?: string;
+  status?: string;
+};
+
+export type WorkEpisodeDocumentQuery = {
+  episodeId?: string;
+  repoKey?: string;
+  commitHash?: string;
+  status?: string;
+  queryId?: string;
+  runId?: string;
+  chatSessionId?: string;
+  range?: { from: string; to: string };
+  limit?: number;
+};
+
+export type AttributionDocumentSummary = {
+  workspaceEvidence: {
+    totalCount: number;
+    statusCounts: Record<string, number>;
+  };
+  workEpisodes: {
+    totalCount: number;
+    statusCounts: Record<string, number>;
+    unboundCount: number;
+  };
+};
+
+export type AttributionDocumentSanitizationResult = {
+  workspaceEvidenceSanitized: number;
+  workEpisodesSanitized: number;
+};
+
+export type WebhookOutboxStatusSnapshot<T = unknown> = {
+  pendingCount: number;
+  retryCount: number;
+  blockedCount: number;
+  deliveredCount: number;
+  oldestQueuedAt?: string;
+  lastDeliveredAt?: string;
+  lastErrorCode?: string;
+  activeEntries: Array<Omit<AgentDocument, "value"> & { value: T }>;
+};
+
+export type WebhookLifecycleDocumentIdentity = {
+  runId?: string;
+  traceId?: string;
+  sessionId?: string;
+};
+
 export type SafeObservationRetentionResult = {
   removedByAge: number;
   removedByOverflow: number;
   retainedCount: number;
+};
+
+export type ExecutionNodeRetentionResult = {
+  removedByAge: number;
+  removedByOverflow: number;
+  retainedCount: number;
+};
+
+export type StorageCompactionResult = {
+  compacted: boolean;
+  pageCountBefore: number;
+  freePageCountBefore: number;
+  pageCountAfter: number;
+  freePageCountAfter: number;
 };
 
 export type AgentMetadata = {
@@ -169,6 +235,10 @@ export class AgentStorageClient {
     return await this.post<SafeUsageAtomV1[]>("listSafeUsageAtoms", {});
   }
 
+  async listSafeUsageAtomsForQueryIds(queryIds: string[]): Promise<SafeUsageAtomV1[]> {
+    return await this.post<SafeUsageAtomV1[]>("listSafeUsageAtomsForQueryIds", { queryIds });
+  }
+
   async listSafeUsageAtomsSince(startedAt: string): Promise<SafeUsageAtomV1[]> {
     return await this.post<SafeUsageAtomV1[]>("listSafeUsageAtomsSince", { startedAt });
   }
@@ -177,12 +247,20 @@ export class AgentStorageClient {
     return await this.post<SafeActivityAtomV1[]>("listSafeActivityAtoms", {});
   }
 
+  async listSafeActivityAtomsForQueryIds(queryIds: string[]): Promise<SafeActivityAtomV1[]> {
+    return await this.post<SafeActivityAtomV1[]>("listSafeActivityAtomsForQueryIds", { queryIds });
+  }
+
   async listSafeActivityAtomsSince(startedAt: string): Promise<SafeActivityAtomV1[]> {
     return await this.post<SafeActivityAtomV1[]>("listSafeActivityAtomsSince", { startedAt });
   }
 
   async listQueryOccurrences(): Promise<QueryOccurrenceV1[]> {
     return await this.post<QueryOccurrenceV1[]>("listQueryOccurrences", {});
+  }
+
+  async readQueryOccurrence(queryId: string): Promise<QueryOccurrenceV1 | undefined> {
+    return await this.post<QueryOccurrenceV1 | undefined>("readQueryOccurrence", { queryId });
   }
 
   async listQueryOccurrencesSince(startedAt: string): Promise<QueryOccurrenceV1[]> {
@@ -219,6 +297,10 @@ export class AgentStorageClient {
 
   async replaceProductionRuns(runs: ProductionRunV1[]): Promise<void> {
     await this.post("replaceProductionRuns", { runs });
+  }
+
+  async upsertProductionRuns(runs: ProductionRunV1[]): Promise<void> {
+    await this.post("upsertProductionRuns", { runs });
   }
 
   async listProductionRuns(): Promise<ProductionRunV1[]> {
@@ -281,8 +363,70 @@ export class AgentStorageClient {
     return await this.post<Array<Omit<AgentDocument, "value"> & { value: T }>>("listAgentDocuments", { collection });
   }
 
+  async listWorkspaceEvidenceDocuments<T = unknown>(
+    query: WorkspaceEvidenceDocumentQuery = {}
+  ): Promise<Array<Omit<AgentDocument, "value"> & { value: T }>> {
+    return await this.post<Array<Omit<AgentDocument, "value"> & { value: T }>>("listWorkspaceEvidenceDocuments", { query });
+  }
+
+  async listWorkEpisodeDocuments<T = unknown>(
+    query: WorkEpisodeDocumentQuery = {}
+  ): Promise<Array<Omit<AgentDocument, "value"> & { value: T }>> {
+    return await this.post<Array<Omit<AgentDocument, "value"> & { value: T }>>("listWorkEpisodeDocuments", { query });
+  }
+
+  async attributionDocumentSummary(): Promise<AttributionDocumentSummary> {
+    return await this.post<AttributionDocumentSummary>("attributionDocumentSummary", {});
+  }
+
+  async sanitizeOversizedAttributionDocuments(maxArtifactStates: number): Promise<AttributionDocumentSanitizationResult> {
+    return await this.post<AttributionDocumentSanitizationResult>("sanitizeOversizedAttributionDocuments", { maxArtifactStates });
+  }
+
   async trimAgentDocuments(collection: AgentDocumentCollection, maxDocuments: number): Promise<number> {
     return await this.post<number>("trimAgentDocuments", { collection, maxDocuments });
+  }
+
+  async readAgentDocument<T = unknown>(collection: AgentDocumentCollection, key: string): Promise<(Omit<AgentDocument, "value"> & { value: T }) | undefined> {
+    return await this.post<(Omit<AgentDocument, "value"> & { value: T }) | undefined>("readAgentDocument", { collection, key });
+  }
+
+  async listWebhookOutboxDueDocuments<T = unknown>(now: string, force = false): Promise<Array<Omit<AgentDocument, "value"> & { value: T }>> {
+    return await this.post<Array<Omit<AgentDocument, "value"> & { value: T }>>("listWebhookOutboxDueDocuments", { now, force });
+  }
+
+  async webhookOutboxStatus<T = unknown>(): Promise<WebhookOutboxStatusSnapshot<T>> {
+    return await this.post<WebhookOutboxStatusSnapshot<T>>("webhookOutboxStatus", {});
+  }
+
+  async listWebhookLifecycleDocuments<T = unknown>(
+    identity: WebhookLifecycleDocumentIdentity
+  ): Promise<Array<Omit<AgentDocument, "value"> & { value: T }>> {
+    return await this.post<Array<Omit<AgentDocument, "value"> & { value: T }>>("listWebhookLifecycleDocuments", { identity });
+  }
+
+  async listDeliveredWritingLifecycleRunIds(): Promise<string[]> {
+    return await this.post<string[]>("listDeliveredWritingLifecycleRunIds", {});
+  }
+
+  async nextWebhookOutboxAttemptAt(): Promise<string | undefined> {
+    return await this.post<string | undefined>("nextWebhookOutboxAttemptAt", {});
+  }
+
+  async listExecutionNodeDocumentsForQuery<T = unknown>(queryId: string): Promise<Array<Omit<AgentDocument, "value"> & { value: T }>> {
+    return await this.post<Array<Omit<AgentDocument, "value"> & { value: T }>>("listExecutionNodeDocumentsForQuery", { queryId });
+  }
+
+  async applyExecutionNodeRetention(retainAfter: string, maxNodes: number): Promise<ExecutionNodeRetentionResult> {
+    return await this.post<ExecutionNodeRetentionResult>("applyExecutionNodeRetention", { retainAfter, maxNodes });
+  }
+
+  async compactIfFragmented(): Promise<StorageCompactionResult> {
+    return await this.post<StorageCompactionResult>("compactIfFragmented", {});
+  }
+
+  async pruneRepositorySnapshotDocuments(maxArtifactStates: number): Promise<number> {
+    return await this.post<number>("pruneRepositorySnapshotDocuments", { maxArtifactStates });
   }
 
   async removeAgentDocument(collection: AgentDocumentCollection, key: string): Promise<boolean> {
@@ -353,10 +497,13 @@ type WorkerCommandName =
   | "safeObservationCount"
   | "applySafeObservationRetention"
   | "listSafeUsageAtoms"
+  | "listSafeUsageAtomsForQueryIds"
   | "listSafeUsageAtomsSince"
   | "listSafeActivityAtoms"
+  | "listSafeActivityAtomsForQueryIds"
   | "listSafeActivityAtomsSince"
   | "listQueryOccurrences"
+  | "readQueryOccurrence"
   | "listQueryOccurrencesSince"
   | "applyQueryOccurrenceRetention"
   | "clearQueryOccurrences"
@@ -366,6 +513,7 @@ type WorkerCommandName =
   | "beginProductionUsageEpoch"
   | "productionUsageEpoch"
   | "replaceProductionRuns"
+  | "upsertProductionRuns"
   | "listProductionRuns"
   | "clearProductionRuns"
   | "upsertRepositoryScope"
@@ -381,7 +529,21 @@ type WorkerCommandName =
   | "upsertAgentDocument"
   | "replaceAgentDocuments"
   | "listAgentDocuments"
+  | "listWorkspaceEvidenceDocuments"
+  | "listWorkEpisodeDocuments"
+  | "attributionDocumentSummary"
+  | "sanitizeOversizedAttributionDocuments"
   | "trimAgentDocuments"
+  | "readAgentDocument"
+  | "listWebhookOutboxDueDocuments"
+  | "webhookOutboxStatus"
+  | "listWebhookLifecycleDocuments"
+  | "listDeliveredWritingLifecycleRunIds"
+  | "nextWebhookOutboxAttemptAt"
+  | "listExecutionNodeDocumentsForQuery"
+  | "applyExecutionNodeRetention"
+  | "compactIfFragmented"
+  | "pruneRepositorySnapshotDocuments"
   | "removeAgentDocument"
   | "clearAgentDocuments"
   | "clearAllAgentData"

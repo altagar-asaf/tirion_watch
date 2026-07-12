@@ -44,10 +44,12 @@ export class DefaultWorkspaceChangeTracker implements WorkspaceChangeTracker {
       return;
     }
     this.running = true;
-    const stored = await this.ledger.listEvidence({});
-    for (const evidence of stored.filter((item) =>
-      item.status === "active" || item.status === "settling" || item.status === "completed"
-    )) {
+    const stored = (await Promise.all([
+      this.ledger.listEvidence({ status: "active" }),
+      this.ledger.listEvidence({ status: "settling" }),
+      this.ledger.listEvidence({ status: "completed" })
+    ])).flat();
+    for (const evidence of stored) {
       this.evidenceByQueryRepo.set(evidenceKey(evidence.queryId, evidence.repoKey), activeEvidence(evidence));
     }
     await this.finalizeEvidenceLifecycle();
@@ -410,6 +412,9 @@ export class DefaultWorkspaceChangeTracker implements WorkspaceChangeTracker {
     snapshots: RepositorySnapshotObservation[],
     snapshotSource: "current" | "refreshed"
   ): Promise<void> {
+    snapshots = run.repoKey
+      ? snapshots.filter((snapshot) => snapshot.repoKey === run.repoKey)
+      : snapshots;
     if (snapshots.length === 0) {
       this.recordLifecycle("observe_run", "no_repository_snapshots", "observe_run_without_repository_snapshots", {
         queryId: run.queryId,
@@ -710,7 +715,8 @@ export class DefaultWorkspaceChangeTracker implements WorkspaceChangeTracker {
 
 function evidenceFromBaseline(run: PartialAgenticQueryRun, snapshot: RepositorySnapshotObservation): ActiveEvidence {
   const baselineArtifactStates = snapshot.artifactStates.map((state) => ({ ...state }));
-  const baselineTrusted = snapshot.dirtyKnown;
+  const artifactCoverageComplete = snapshot.artifactCoverage !== "partial";
+  const baselineTrusted = snapshot.dirtyKnown && artifactCoverageComplete;
   const evidence: QueryWorkEvidence = {
     queryId: run.queryId!,
     runIds: [run.id],
@@ -718,9 +724,12 @@ function evidenceFromBaseline(run: PartialAgenticQueryRun, snapshot: RepositoryS
     epochId: snapshot.epochId,
     startedAt: run.queryStartedAt ?? run.startedAt ?? new Date().toISOString(),
     baselineTrusted,
-    baselineReasons: snapshot.dirtyKnown
-      ? snapshot.dirty ? ["dirty_baseline_known"] : ["clean_baseline"]
-      : ["dirty_state_unknown"],
+    baselineReasons: [
+      ...(snapshot.dirtyKnown
+        ? snapshot.dirty ? ["dirty_baseline_known"] : ["clean_baseline"]
+        : ["dirty_state_unknown"]),
+      ...(artifactCoverageComplete ? [] : ["artifact_state_coverage_partial"])
+    ],
     headCommitAtStart: snapshot.headCommit,
     baselineSequence: snapshot.observedSequence,
     dirtyAtStart: snapshot.dirty,

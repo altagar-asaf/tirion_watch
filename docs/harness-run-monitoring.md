@@ -39,6 +39,11 @@ run still has `codingHarness: "github-copilot"`.
    - `POST /v1/provider-hooks/cursor`
    - configured GitHub Copilot SQLite span DB replay
 3. `PrivacyGuard` drops raw payloads and content before durable storage.
+   Before that discard, an allowlisted workspace path and structured successful
+   write target may be resolved to an opaque watched-repository key and HMAC
+   artifact key. Managed command relays attach their configured lifecycle event
+   and session working directory only for this transient resolution. The raw
+   values are never stored.
 4. `TelemetryClassification` creates a `SafeObservationV1` with:
    - `queryOccurrences`
    - `usageAtoms`
@@ -49,6 +54,14 @@ run still has `codingHarness: "github-copilot"`.
 6. Completed production runs are written to the local run ledger.
 7. Live and completed run facts are projected as webhook lifecycle events after
    binding to exactly one watched repository.
+
+Empty accepted envelopes do not enter live webhook, repository-observation, or
+usage-projection work. Execution-node evidence is retained only in a bounded
+local journal and read by query identity, so high-volume harness diagnostics
+cannot delay an unrelated lifecycle event. Lifecycle reconciliation likewise
+reads usage atoms, workspace evidence, work episodes, and delivered webhook
+state by the relevant query, run, trace, or session instead of deserializing
+other harnesses' historical records.
 
 No prompt text, response text, tool arguments, tool outputs, raw telemetry,
 file contents, diffs, credentials, or absolute paths should leave the privacy
@@ -94,6 +107,11 @@ Usage authority prevents double counting:
 When traces and logs overlap, Tirion prefers the stronger/provider-specific
 surface and keeps lower-authority overlap out of run totals.
 
+Activity hooks and traces use a stable safe request identity. Corroborating
+records revise one logical call, preserving failure evidence and descendant
+usage without incrementing counts twice. Provider-reported child-session
+identity links subagent runs to one parent; ambiguous links fail closed.
+
 ## Claude Code
 
 ### Source Configuration
@@ -132,8 +150,9 @@ Tirion configures these Claude hook names:
 | Hook | Accepted? | Run-monitoring role |
 | --- | --- | --- |
 | `UserPromptSubmit` | Yes | Creates a safe query occurrence and prompt execution node with evidence `submission_hook`. |
-| `Stop` | Received but ignored | Currently does not create stored run facts. Terminal run delivery comes from completed usage projection. |
-| `SubagentStop` | Yes | Creates a `subagent` activity and execution node. |
+| `Stop` | Yes | Completes the remembered query with explicit `stop_hook` authority. Model responses alone do not end the run. |
+| `SubagentStart` | Yes | Opens one child-linked `subagent` activity. |
+| `SubagentStop` | Yes | Revises that child activity with terminal timing and outcome. |
 | `PreToolUse` | Configured when tool hooks are enabled, but ignored by sanitizer | No stored run fact today. |
 | `PostToolUse` | Yes | Creates tool/skill/MCP/subagent activity and execution node. |
 | `PostToolUseFailure` | Yes | Creates failed or rejected tool activity and execution node. |
@@ -184,8 +203,8 @@ Token fields:
 - `gen_ai.usage.cache_creation.input_tokens`, `cache_creation_input_tokens`
 - `gen_ai.usage.reasoning.output_tokens`, `reasoning_output_tokens`
 
-Claude usage usually completes by inactivity settling. The projection waits for
-the inactivity window before treating incomplete/inactivity-mode atoms as final.
+Claude `Stop` is the preferred completion authority. Inactivity remains a
+documented fallback only when the harness does not expose a matching Stop.
 
 ## Codex
 
@@ -202,8 +221,20 @@ Configured OTLP surfaces:
 | `otel.metrics_exporter."otlp-http".endpoint=<agent>/v1/metrics` | Sends metrics to Tirion. |
 | `protocol = "json"` | Uses OTLP JSON. |
 | `otel.log_user_prompt = false` by default | Keeps prompt capture off. |
+| `features.hooks = true` | Activates Codex lifecycle and activity hooks. Hook entries without this gate are inactive. |
 | `hooks.UserPromptSubmit` | Sends prompt lifecycle hook through `codex-hook-relay.cjs`. |
-| `hooks.PostToolUse` | Sends tool hook through `codex-hook-relay.cjs`. |
+| `hooks.Stop` | Sends explicit turn completion. |
+| `hooks.SubagentStart` / `hooks.SubagentStop` | Sends child-session lifecycle linkage. |
+| `hooks.PostToolUse` | Sends metadata-only tool outcome through `codex-hook-relay.cjs`. |
+
+Codex reviews hook commands before it runs them. Tirion probes the Codex hook
+registry through `codex app-server` and does not equate written TOML with an
+active source. Repository activation returns `attention_required` with
+`hook_trust_required` until the user approves the exact managed commands in
+Codex `/hooks`. `hooks_disabled` and `hook_trust_status_unavailable` remain
+separate diagnostics. Trust bypass is permitted only inside Tirion's isolated,
+vetted automation harness, never in normal product configuration. See the
+[Codex hook trust documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks).
 
 Source IDs:
 
@@ -221,6 +252,8 @@ Source IDs:
 | --- | --- | --- |
 | `UserPromptSubmit` | Yes | Creates a safe query occurrence and prompt node with evidence `submission_hook`. |
 | `PostToolUse` | Yes | Creates safe tool/skill/MCP/subagent activity and execution node. |
+| `SubagentStart` / `SubagentStop` | Yes | Creates one child-linked subagent activity with terminal outcome and timing. |
+| `Stop` | Yes | Completes the matching turn with explicit `stop_hook` authority. |
 
 Hook payload fields used:
 
@@ -233,6 +266,19 @@ Hook payload fields used:
 - `tool_response.success`, `tool_response.interrupted`, `exit_code`, or
   `status` for outcome
 
+Codex 0.142 may return an unstructured `tool_response` string for shell commands,
+while `codex.tool_result.success` reports tool-protocol completion rather than
+the child process exit status. Tirion merges the hook and call-ID-bearing OTLP
+record by opaque request ID and reports one call, but leaves the shell outcome
+`unknown` unless a native structured exit code or status is present. Explicit
+dispatch failures remain failures. A tool result without `call_id` is ignored,
+and Tirion never infers an outcome from response text. Arguments and output are
+never retained.
+
+For `apply_patch`, Codex places the transient patch text in
+`tool_input.command`. Tirion extracts only repo-relative target paths, resolves
+them immediately to opaque artifact keys, and discards the command and patch.
+
 Codex hook relay reads the hook JSON from stdin and posts it to
 `/v1/provider-hooks/codex`. Raw hook payload content is not persisted.
 
@@ -243,10 +289,10 @@ Tirion listens for these Codex shapes:
 | Shape | Signal | Safe output | Notes |
 | --- | --- | --- | --- |
 | `event.name = "codex.user_prompt"` | logs | `QueryOccurrenceV1`, prompt node, remembered active query | Evidence `provider_user_prompt_event`. |
-| `event.name = "codex.sse_event"` plus `event.kind = "response.completed"` | logs | turn usage atom | Requires a remembered prompt or matching turn/session identity. |
-| names containing `turn` | traces or logs | turn usage atom / execution node | Example fixture: `codex.turn`. |
-| `name = "codex.tool_result"` | logs or traces | tool/skill/MCP/subagent activity | Uses safe activity naming rules. |
-| names containing `dispatch_tool_call` | traces or logs | tool/skill/MCP/subagent activity | Used for tool activity attribution. |
+| `event.name = "codex.sse_event"` plus `event.kind = "response.completed"` | logs | request usage atom | One slice per completed model response; requires a remembered prompt or matching turn/session identity and does not complete the run. |
+| names containing `turn` | traces or logs | cumulative turn usage atom / execution node | A closed `codex.turn` is authoritative over corroborating response slices. |
+| `name = "codex.tool_result"` | logs or traces | safe request/protocol corroboration | Requires `call_id`; merges with managed `PostToolUse` by request identity, preserves the hook's semantic name/timing, and never becomes a second tool row. Unified-exec protocol success remains `unknown` as a shell outcome; explicit protocol failure remains `failure`. Raw arguments/output are discarded. |
+| names containing `dispatch_tool_call` | traces or logs | internal corroboration only | Dispatch plumbing is not customer-visible work and cannot inflate activity counts. |
 | metric name matching `(^|[._])skill[._]injected$` | metrics | skill activity | Example: `codex.skill.injected`; requires an active remembered prompt in the last 15 minutes. |
 
 Identity fields:
@@ -254,12 +300,15 @@ Identity fields:
 - Explicit turn: `turn.id` or `gen_ai.turn.id`.
 - Session: `thread.id`, `conversation.id`, `gen_ai.conversation.id`,
   `session.id`, then trace ID.
-- Request: `request.id`, then span ID, trace ID, or `query|event.sequence`.
+- Request: tool `call_id` when present, then `request.id`, span ID, trace ID, or
+  `query|event.sequence`.
 
 Codex completion logs are intentionally fail-closed. A `codex.sse_event`
-`response.completed` usage snapshot is ignored unless Tirion can correlate it
+`response.completed` usage slice is ignored unless Tirion can correlate it
 to an earlier `codex.user_prompt` or explicit turn/session identity. This keeps
-completion snapshots from being attached to the wrong run.
+request usage from being attached to the wrong run. Stable response identity
+deduplicates replay; distinct responses are summed exactly once. A closed turn
+trace supersedes the sum when available, and explicit `Stop` is terminal.
 
 Token fields:
 
@@ -287,8 +336,11 @@ Billing context:
   still be reported when model pricing matches.
 
 Codex run-level webhook subjects may aggregate multiple underlying production
-runs from one Codex episode so one user-visible Codex invocation is not split
-into misleading webhook fragments.
+runs only when provider child-session linkage proves they belong to one root.
+Linked child usage and activity are folded into the root exactly once; the same
+child is not also emitted as a standalone total. A same-name child aggregate is
+marked complete only when every represented child instance has an exact link;
+partial or ambiguous linkage remains explicitly unavailable.
 
 ## Cursor
 
@@ -465,7 +517,7 @@ Tirion emits the same webhook event family for every harness:
 | --- | --- |
 | `run.start` | A privacy-safe run identity started in one watched repository. |
 | `run.update` | Activity or partial usage changed before terminal completion. |
-| `run.ended` | Authoritative terminal event for a completed run. |
+| `run.ended` | Terminal snapshot for a completed run; it can be a timely provisional snapshot or a finalized correction. |
 | `commit.attributed` | A real git commit was conservatively linked to one or more writing runs. |
 
 Live `run.start` anchors:
@@ -474,29 +526,55 @@ Live `run.start` anchors:
 | --- | --- |
 | Claude Code | `submission_hook`, `provider_user_prompt_event`, `provider_prompt_id` |
 | Codex | `submission_hook` only |
+| Cursor | `submission_hook` from `beforeSubmitPrompt` |
 | GitHub Copilot | `provider_root_span`, `provider_user_message_event`, span DB replay of either |
 
 `run.update` can be projected from activity atoms, execution nodes, or usage
-atoms. `run.ended` is authoritative only after completed-run projection and
-repository binding. `run.ended` includes token totals, model list, estimated
-cost/value fields when available, and repo-relative `filesChanged`.
+atoms. A high-confidence explicit completion can produce a repository-bound,
+provisional `run.ended` from the live lane. It contains only accumulated safe
+live activity and usage and is marked with non-final coverage. Completed-run
+projection later publishes the authoritative final terminal version. Every
+`run.ended` includes the safe token totals, model list, estimated cost/value
+fields when available, and repo-relative `filesChanged` known at that version.
+
+The first accepted prompt anchor fixes public `startedAt` for the lifecycle.
+Delayed provider logs or traces may enrich identity and usage but cannot rewind
+that timestamp after `run.start` has been published.
 
 Repository binding is provider-neutral. A live lifecycle event requires exactly
-one watched repository. Completed run lifecycle delivery also fails closed when
-repo binding is missing or ambiguous.
+one exact opaque repository binding, or the legacy unambiguous single-watched-
+repository fallback. Completed delivery fails closed when binding is missing or
+ambiguous. Snapshot timing alone does not establish run-level file ownership;
+`filesChanged` requires causal successful-write keys or later commit proof.
 
 ## Completion And Settling
 
 Tirion treats completed production runs as authoritative:
 
-- Completed runs require safe usage with end timing.
-- Inactivity-mode sources wait for the inactivity window before finalization.
-- Codex completion snapshots can be explicit when `response.completed` is
-  safely correlated to a prompt or turn.
+- Submission-hook runs require a matching explicit Stop/session hook or closed
+  authoritative root/turn span. An individual model response never ends them.
+  A trusted explicit completion can trigger a provisional terminal snapshot;
+  completed-run projection remains the final usage authority.
+- Inactivity-mode sources wait for the inactivity window only when the harness
+  lacks stronger terminal evidence.
+- Codex request slices accumulate for live usage, while the closed cumulative
+  turn trace is final usage authority and `Stop` is final lifecycle authority.
 - Copilot root `invoke_agent` spans become completed when the root span has an
   end time or terminal error status.
-- `run.ended` delivery has a grace window so late file-write evidence can
-  populate `filesChanged` before the first terminal webhook is delivered.
+- Running updates remain immediate. Completed-run `settling` projections share
+  one replaceable outbox slot until the terminal deadline, allowing a root/turn
+  authority to supersede provisional request slices before publication.
+- Background usage reconciliation waits for five seconds of quiet after live
+  telemetry. This prevents periodic or event-triggered rebuilds from competing
+  with durable lifecycle delivery during the three-second terminal grace period.
+- The first terminal deadline is fixed from explicit trusted completion when
+  available, otherwise authoritative completion (three seconds by default);
+  delayed telemetry cannot slide it. A live terminal snapshot contains the safe
+  evidence received by that deadline and uses non-final coverage. Later
+  authoritative semantic enrichment is a higher final `run.ended` version.
+- Each deadline wake re-reads the durable outbox and schedules the next earliest
+  entry, preserving `run.start -> run.update -> run.ended` even for deadlines a
+  few milliseconds apart.
 
 `commit.attributed` is separate from run completion. It fires only when git
 attribution has proof connecting writing runs to a real commit.

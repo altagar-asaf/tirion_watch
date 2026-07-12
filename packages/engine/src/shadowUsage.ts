@@ -104,10 +104,15 @@ export class DefaultShadowUsagePipeline {
     occurrences: QueryOccurrenceV1[] = [],
     activities: SafeActivityAtomV1[] = []
   ): ShadowRunV1[] {
-    const deduped = [...new Map(atoms.map((atom) => [atom.atomId, atom])).values()];
+    const internalQueryIds = new Set(occurrences
+      .filter((occurrence) => occurrence.lifecycleVisibility === "internal")
+      .map((occurrence) => occurrence.queryId));
+    const visibleAtoms = atoms.filter((atom) => !internalQueryIds.has(atom.queryId ?? atom.correlationId));
+    const visibleActivities = activities.filter((activity) => !internalQueryIds.has(activity.queryId));
+    const deduped = [...new Map(visibleAtoms.map((atom) => [atom.atomId, atom])).values()];
     const groups = new Map<string, SafeUsageAtomV1[]>();
     const contextGroups = new Map<string, SafeUsageAtomV1[]>();
-    for (const atom of atoms) {
+    for (const atom of visibleAtoms) {
       const queryId = atom.queryId ?? atom.correlationId;
       contextGroups.set(queryId, [...(contextGroups.get(queryId) ?? []), atom]);
     }
@@ -116,11 +121,12 @@ export class DefaultShadowUsagePipeline {
       groups.set(queryId, [...(groups.get(queryId) ?? []), atom]);
     }
     const occurrenceByQuery = new Map(occurrences.map((occurrence) => [occurrence.queryId, occurrence]));
+    const preferredActivityAtoms = preferredSafeActivities(visibleActivities);
     const activitiesByQuery = new Map<string, SafeActivityAtomV1[]>();
-    for (const activity of activities) {
+    for (const activity of preferredActivityAtoms) {
       activitiesByQuery.set(activity.queryId, [...(activitiesByQuery.get(activity.queryId) ?? []), activity]);
     }
-    return [...groups.entries()].map(([queryId, group]) =>
+    const projected = [...groups.entries()].map(([queryId, group]) =>
       projectGroup(
         queryId,
         group,
@@ -128,7 +134,8 @@ export class DefaultShadowUsagePipeline {
         occurrenceByQuery.get(queryId),
         activitiesByQuery.get(queryId) ?? [],
         contextGroups.get(queryId) ?? group
-      ))
+      ));
+    return aggregateLinkedSubagentRuns(projected, preferredActivityAtoms)
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
   }
 
@@ -172,6 +179,348 @@ export class DefaultShadowUsagePipeline {
       reasonCodes
     };
   }
+}
+
+type LinkedSubagentRun = {
+  parentQueryId: string;
+  childQueryId: string;
+  activity: SafeActivityAtomV1;
+};
+
+function aggregateLinkedSubagentRuns(runs: ShadowRunV1[], activities: SafeActivityAtomV1[]): ShadowRunV1[] {
+  const runsByQuery = new Map(runs.map((run) => [run.queryId ?? run.correlationId, run]));
+  const runsBySession = new Map<string, ShadowRunV1[]>();
+  for (const run of runs) {
+    if (run.sessionId) {
+      runsBySession.set(run.sessionId, [...(runsBySession.get(run.sessionId) ?? []), run]);
+    }
+  }
+  const completedActivities = preferredSafeActivities(activities);
+  const candidates = completedActivities.flatMap<LinkedSubagentRun>((activity) => {
+    if (activity.kind !== "subagent" || !activity.childSessionId) {
+      return [];
+    }
+    const children = runsBySession.get(activity.childSessionId) ?? [];
+    if (children.length !== 1) {
+      return [];
+    }
+    const childQueryId = children[0].queryId ?? children[0].correlationId;
+    if (childQueryId === activity.queryId) {
+      return [];
+    }
+    const parent = runsByQuery.get(activity.queryId);
+    if (!parent || (parent.repositoryKey && children[0].repositoryKey && parent.repositoryKey !== children[0].repositoryKey)) {
+      return [];
+    }
+    return [{ parentQueryId: activity.queryId, childQueryId, activity }];
+  });
+  const parentsByChild = new Map<string, Set<string>>();
+  for (const link of candidates) {
+    const parents = parentsByChild.get(link.childQueryId) ?? new Set<string>();
+    parents.add(link.parentQueryId);
+    parentsByChild.set(link.childQueryId, parents);
+  }
+  const links = candidates.filter((link) => parentsByChild.get(link.childQueryId)?.size === 1);
+  const linksByParent = new Map<string, LinkedSubagentRun[]>();
+  for (const link of links) {
+    linksByParent.set(link.parentQueryId, [...(linksByParent.get(link.parentQueryId) ?? []), link]);
+  }
+  const linkedChildren = new Set(links.map((link) => link.childQueryId));
+  const merge = (run: ShadowRunV1, visiting: Set<string>): ShadowRunV1 => {
+    const queryId = run.queryId ?? run.correlationId;
+    if (visiting.has(queryId)) {
+      return run;
+    }
+    const nextVisiting = new Set(visiting).add(queryId);
+    const directLinks = linksByParent.get(queryId) ?? [];
+    const merged = directLinks.reduce((parent, link) => {
+      const child = runsByQuery.get(link.childQueryId);
+      return child ? mergeLinkedSubagentRun(parent, merge(child, nextVisiting), link.activity) : parent;
+    }, run);
+    return finalizeLinkedSubagentBreakdown(merged, directLinks);
+  };
+  return runs
+    .filter((run) => !linkedChildren.has(run.queryId ?? run.correlationId))
+    .map((run) => merge(run, new Set()));
+}
+
+function finalizeLinkedSubagentBreakdown(
+  run: ShadowRunV1,
+  links: LinkedSubagentRun[]
+): ShadowRunV1 {
+  if (links.length === 0 || !run.breakdown) {
+    return run;
+  }
+  const linkedCountByName = new Map<string, number>();
+  for (const link of links) {
+    linkedCountByName.set(link.activity.name, (linkedCountByName.get(link.activity.name) ?? 0) + 1);
+  }
+  return {
+    ...run,
+    breakdown: run.breakdown.map((row) => {
+      if (
+        row.kind !== "subagent"
+        || row.parentBreakdownId
+        || linkedCountByName.get(row.name) !== row.count
+        || !hasTokenTotals(tokenTotalsFromBreakdown(row))
+      ) {
+        return row;
+      }
+      return {
+        ...row,
+        attributionBasis: "trace_descendant",
+        coverage: "complete"
+      };
+    })
+  };
+}
+
+export function preferredSafeActivities(activities: SafeActivityAtomV1[]): SafeActivityAtomV1[] {
+  const parents = activities.map((_activity, index) => index);
+  const owners = new Map<string, number>();
+  const find = (index: number): number => {
+    while (parents[index] !== index) {
+      parents[index] = parents[parents[index]];
+      index = parents[index];
+    }
+    return index;
+  };
+  const union = (left: number, right: number): void => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) {
+      parents[rightRoot] = leftRoot;
+    }
+  };
+  for (const [index, activity] of activities.entries()) {
+    const scope = `${activity.provider}|${activity.queryId}`;
+    const keys = [
+      `${scope}|activity|${activity.activityId}`,
+      ...(activity.requestId ? [`${scope}|request|${activity.requestId}`] : []),
+      ...(activity.childSessionId ? [`${scope}|child|${activity.childSessionId}`] : [])
+    ];
+    for (const key of keys) {
+      const owner = owners.get(key);
+      if (owner != null) {
+        union(index, owner);
+      }
+      owners.set(key, index);
+    }
+  }
+  const preferred = new Map<number, SafeActivityAtomV1>();
+  for (const [index, activity] of activities.entries()) {
+    const root = find(index);
+    const existing = preferred.get(root);
+    preferred.set(root, existing ? mergeActivityEvidence(existing, activity) : activity);
+  }
+  return [...preferred.values()];
+}
+
+function mergeActivityEvidence(left: SafeActivityAtomV1, right: SafeActivityAtomV1): SafeActivityAtomV1 {
+  const preferred = activityPreference(right) >= activityPreference(left) ? right : left;
+  const trace = [left, right].find((activity) => activity.evidenceBasis === "trace_span");
+  const canonical = trace ?? preferred;
+  const failed = [left, right].find((activity) => activity.outcome === "failure" || activity.outcome === "rejected");
+  const outcome = failed?.outcome
+    ?? ([left, right].some((activity) => activity.outcome === "success") ? "success" : "unknown");
+  return {
+    ...canonical,
+    name: preferred.name,
+    kind: preferred.kind,
+    outcome,
+    requestId: preferred.requestId ?? canonical.requestId,
+    childSessionId: preferred.childSessionId ?? canonical.childSessionId,
+    startedAt: left.startedAt < right.startedAt ? left.startedAt : right.startedAt,
+    endedAt: [left.endedAt, right.endedAt].filter((value): value is string => Boolean(value)).sort().at(-1),
+    durationMs: Math.max(left.durationMs ?? 0, right.durationMs ?? 0) || undefined,
+    resultSizeBytes: Math.max(left.resultSizeBytes ?? 0, right.resultSizeBytes ?? 0) || undefined,
+    providerReportedResultTokens: Math.max(
+      left.providerReportedResultTokens ?? 0,
+      right.providerReportedResultTokens ?? 0
+    ) || undefined
+  };
+}
+
+function activityPreference(activity: SafeActivityAtomV1): number {
+  const basis = activity.evidenceBasis === "subagent_hook"
+    ? 16
+    : activity.evidenceBasis === "tool_hook"
+      ? 12
+      : activity.evidenceBasis === "trace_span"
+        ? 8
+        : 0;
+  return basis
+    + (activity.endedAt ? 4 : 0)
+    + (activity.outcome === "failure" || activity.outcome === "rejected" ? 2 : activity.outcome === "success" ? 1 : 0);
+}
+
+function mergeLinkedSubagentRun(
+  parent: ShadowRunV1,
+  child: ShadowRunV1,
+  activity: SafeActivityAtomV1
+): ShadowRunV1 {
+  const models = [...new Set([...(parent.models ?? (parent.model ? [parent.model] : [])), ...(child.models ?? (child.model ? [child.model] : []))])];
+  const modelProviders = new Set([parent.modelProvider, child.modelProvider].filter(Boolean));
+  const estimatedNanoUsd = optionalPairSum(parent.estimatedNanoUsd, child.estimatedNanoUsd);
+  const usageValueNanoUsd = optionalPairSum(parent.usageValueNanoUsd, child.usageValueNanoUsd);
+  return {
+    ...parent,
+    model: models.length === 1 ? models[0] : undefined,
+    ...(models.length > 0 ? { models } : {}),
+    modelProvider: modelProviders.size === 1 ? [...modelProviders][0] : "unknown",
+    modelProviderBasis: modelProviders.size === 1 ? parent.modelProviderBasis : "conflict",
+    inputTokens: parent.inputTokens + child.inputTokens,
+    outputTokens: parent.outputTokens + child.outputTokens,
+    cacheReadInputTokens: parent.cacheReadInputTokens + child.cacheReadInputTokens,
+    cacheCreationInputTokens: parent.cacheCreationInputTokens + child.cacheCreationInputTokens,
+    reasoningOutputTokens: parent.reasoningOutputTokens + child.reasoningOutputTokens,
+    totalTokens: parent.totalTokens + child.totalTokens,
+    estimatedNanoUsd,
+    usageValueNanoUsd,
+    costCoverage: combinedCostCoverage(parent.costCoverage, child.costCoverage),
+    toolCallCount: (parent.toolCallCount ?? 0) + (child.toolCallCount ?? 0),
+    breakdown: mergeSubagentBreakdown(parent, child, activity),
+    startedAt: parent.startedAt < child.startedAt ? parent.startedAt : child.startedAt,
+    endedAt: parent.endedAt && child.endedAt
+      ? (parent.endedAt > child.endedAt ? parent.endedAt : child.endedAt)
+      : undefined,
+    warnings: [...new Set([...parent.warnings, ...child.warnings])]
+  };
+}
+
+function mergeSubagentBreakdown(
+  parent: ShadowRunV1,
+  child: ShadowRunV1,
+  activity: SafeActivityAtomV1
+): RunBreakdownV1[] {
+  const parentQueryId = parent.queryId ?? parent.correlationId;
+  const rows = (parent.breakdown ?? []).map((row) => ({ ...row }));
+  let subagentIndex = rows.findIndex((row) => row.kind === "subagent" && row.name === activity.name);
+  if (subagentIndex < 0) {
+    rows.push({
+      schemaVersion: 1,
+      breakdownId: breakdownId(parentQueryId, `subagent:${activity.name}`),
+      kind: "subagent",
+      name: activity.name,
+      count: 1,
+      failureCount: activity.outcome === "failure" || activity.outcome === "rejected" ? 1 : 0,
+      unknownCount: activity.outcome === "unknown" ? 1 : 0,
+      attributionBasis: "activity_only",
+      coverage: "unavailable"
+    });
+    subagentIndex = rows.length - 1;
+  }
+  const subagent = rows[subagentIndex];
+  const childTotals = tokenTotalsFromRun(child);
+  const allocated = emptyTokenTotals();
+  for (const childRow of child.breakdown ?? []) {
+    const usage = tokenTotalsFromBreakdown(childRow);
+    if (childRow.kind === "unallocated") {
+      addTokenTotalsToBreakdown(subagent, usage);
+      addTokenTotals(allocated, usage);
+      continue;
+    }
+    addTokenTotals(allocated, usage);
+    rows.push({
+      ...childRow,
+      breakdownId: breakdownId(parentQueryId, `${activity.activityId}|${childRow.breakdownId}`),
+      parentBreakdownId: subagent.breakdownId
+    });
+  }
+  const residual = subtractTokenTotals(childTotals, allocated);
+  if (hasTokenTotals(residual)) {
+    addTokenTotalsToBreakdown(subagent, residual);
+  }
+  if (hasTokenTotals(tokenTotalsFromBreakdown(subagent))) {
+    subagent.attributionBasis = "unavailable";
+    subagent.coverage = (child.breakdown ?? []).some((row) => row.kind !== "unallocated" && hasTokenTotals(tokenTotalsFromBreakdown(row)))
+      ? "partial"
+      : "unavailable";
+  }
+  rows[subagentIndex] = subagent;
+  return rows;
+}
+
+type MutableTokenTotals = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+};
+
+function emptyTokenTotals(): MutableTokenTotals {
+  return { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
+}
+
+function tokenTotalsFromRun(run: ShadowRunV1): MutableTokenTotals {
+  return {
+    inputTokens: run.inputTokens,
+    outputTokens: run.outputTokens,
+    cacheReadInputTokens: run.cacheReadInputTokens,
+    cacheCreationInputTokens: run.cacheCreationInputTokens,
+    reasoningOutputTokens: run.reasoningOutputTokens,
+    totalTokens: run.totalTokens
+  };
+}
+
+function tokenTotalsFromBreakdown(row: RunBreakdownV1): MutableTokenTotals {
+  return {
+    inputTokens: row.inputTokens ?? 0,
+    outputTokens: row.outputTokens ?? 0,
+    cacheReadInputTokens: row.cacheReadInputTokens ?? 0,
+    cacheCreationInputTokens: row.cacheCreationInputTokens ?? 0,
+    reasoningOutputTokens: row.reasoningOutputTokens ?? 0,
+    totalTokens: row.totalTokens ?? ((row.inputTokens ?? 0) + (row.outputTokens ?? 0))
+  };
+}
+
+function addTokenTotals(target: MutableTokenTotals, value: MutableTokenTotals): void {
+  target.inputTokens += value.inputTokens;
+  target.outputTokens += value.outputTokens;
+  target.cacheReadInputTokens += value.cacheReadInputTokens;
+  target.cacheCreationInputTokens += value.cacheCreationInputTokens;
+  target.reasoningOutputTokens += value.reasoningOutputTokens;
+  target.totalTokens = target.inputTokens + target.outputTokens;
+}
+
+function addTokenTotalsToBreakdown(target: RunBreakdownV1, value: MutableTokenTotals): void {
+  target.inputTokens = (target.inputTokens ?? 0) + value.inputTokens;
+  target.outputTokens = (target.outputTokens ?? 0) + value.outputTokens;
+  target.cacheReadInputTokens = (target.cacheReadInputTokens ?? 0) + value.cacheReadInputTokens;
+  target.cacheCreationInputTokens = (target.cacheCreationInputTokens ?? 0) + value.cacheCreationInputTokens;
+  target.reasoningOutputTokens = (target.reasoningOutputTokens ?? 0) + value.reasoningOutputTokens;
+  target.totalTokens = (target.inputTokens ?? 0) + (target.outputTokens ?? 0);
+}
+
+function subtractTokenTotals(total: MutableTokenTotals, allocated: MutableTokenTotals): MutableTokenTotals {
+  return {
+    inputTokens: Math.max(0, total.inputTokens - allocated.inputTokens),
+    outputTokens: Math.max(0, total.outputTokens - allocated.outputTokens),
+    cacheReadInputTokens: Math.max(0, total.cacheReadInputTokens - allocated.cacheReadInputTokens),
+    cacheCreationInputTokens: Math.max(0, total.cacheCreationInputTokens - allocated.cacheCreationInputTokens),
+    reasoningOutputTokens: Math.max(0, total.reasoningOutputTokens - allocated.reasoningOutputTokens),
+    totalTokens: Math.max(0, total.inputTokens - allocated.inputTokens) + Math.max(0, total.outputTokens - allocated.outputTokens)
+  };
+}
+
+function hasTokenTotals(value: MutableTokenTotals): boolean {
+  return value.inputTokens > 0
+    || value.outputTokens > 0
+    || value.cacheReadInputTokens > 0
+    || value.cacheCreationInputTokens > 0
+    || value.reasoningOutputTokens > 0;
+}
+
+function optionalPairSum(left?: number, right?: number): number | undefined {
+  return left == null && right == null ? undefined : (left ?? 0) + (right ?? 0);
+}
+
+function combinedCostCoverage(left: ShadowRunV1["costCoverage"], right: ShadowRunV1["costCoverage"]): ShadowRunV1["costCoverage"] {
+  if (left === "complete" && right === "complete") return "complete";
+  if (left === "unavailable" && right === "unavailable") return "unavailable";
+  return "partial";
 }
 
 export class DefaultProductionUsagePipeline {
@@ -251,11 +600,18 @@ function projectGroup(
   if (!price.complete && resolvedBillingContext !== "unknown" && resolvedBillingContext !== "subscription") {
     warnings.push("pricing_unavailable");
   }
-  const startedAt = atoms.map((atom) => atom.startedAt).sort()[0];
+  const startedAt = [occurrence?.startedAt, ...atoms.map((atom) => atom.startedAt)]
+    .filter((value): value is string => Boolean(value))
+    .sort()[0];
   const sessionIds = [...new Set(atoms.flatMap((atom) => atom.sessionId ? [atom.sessionId] : []))];
   const sessionId = occurrence?.sessionId ?? (sessionIds.length === 1 ? sessionIds[0] : queryId);
   if (sessionIds.length !== 1 && atoms.some((atom) => atom.queryId)) warnings.push("session_identity_unavailable");
-  const endedAt = completedAt(accountingAtoms.length > 0 ? accountingAtoms : atoms, now, accountingAtoms.length > 0);
+  const endedAt = completedAt(
+    accountingAtoms.length > 0 ? accountingAtoms : atoms,
+    now,
+    accountingAtoms.length > 0,
+    occurrence
+  );
   const breakdown = runBreakdown(queryId, provider, atoms, activities, {
     inputTokens,
     outputTokens,
@@ -277,6 +633,7 @@ function projectGroup(
     correlationId: queryId,
     queryId,
     sessionId,
+    ...(occurrence?.repositoryKey ? { repositoryKey: occurrence.repositoryKey } : {}),
     promptState: occurrence?.promptState ?? "unavailable",
     promptText: occurrence?.promptText,
     provider,
@@ -364,6 +721,7 @@ function runBreakdown(
       name: group[0].name,
       count: group.length,
       failureCount: group.filter((activity) => activity.outcome === "failure" || activity.outcome === "rejected").length,
+      unknownCount: group.filter((activity) => activity.outcome === "unknown").length,
       totalDurationMs: optionalSum(group.map((activity) => activity.durationMs)),
       resultSizeBytes: optionalSum(group.map((activity) => activity.resultSizeBytes)),
       providerReportedResultTokens: optionalSum(group.map((activity) => activity.providerReportedResultTokens)),
@@ -558,14 +916,35 @@ function priceAtomWithRate(atom: SafeUsageAtomV1, rate: Rate): {
   return { complete, estimatedNanoUsd };
 }
 
-function completedAt(atoms: SafeUsageAtomV1[], now: Date, hasAccounting: boolean): string | undefined {
+function completedAt(
+  atoms: SafeUsageAtomV1[],
+  now: Date,
+  hasAccounting: boolean,
+  occurrence?: QueryOccurrenceV1
+): string | undefined {
   if (!hasAccounting) {
     return undefined;
   }
-  if (!atoms.every((atom) => atom.endedAt)) {
+  const closedBoundaries = atoms.filter(isClosedAuthoritativeRunBoundaryAtom);
+  const latestClosedBoundary = closedBoundaries.map((atom) => atom.endedAt!).sort().at(-1);
+  const allAccountingEnded = atoms.every((atom) => atom.endedAt);
+  const latest = atoms.flatMap((atom) => atom.endedAt ? [atom.endedAt] : []).sort().at(-1);
+  if (occurrence?.completedAt) {
+    if (!allAccountingEnded || !latest) {
+      return undefined;
+    }
+    return occurrence.completedAt > latest ? occurrence.completedAt : latest;
+  }
+  // Submission hooks prove that a harness lifecycle surface is active. Individual
+  // model responses are revisions of that turn, not terminal evidence. A closed
+  // provider-authoritative turn/run boundary is terminal even when the harness
+  // omits its stop hook.
+  if (occurrence?.evidence === "submission_hook") {
+    return latestClosedBoundary;
+  }
+  if (!allAccountingEnded || !latest) {
     return undefined;
   }
-  const latest = atoms.map((atom) => atom.endedAt!).sort().at(-1)!;
   if (
     (
       atoms.some((atom) => atom.completionMode === "inactivity")
@@ -576,6 +955,29 @@ function completedAt(atoms: SafeUsageAtomV1[], now: Date, hasAccounting: boolean
     return undefined;
   }
   return latest;
+}
+
+export function isClosedAuthoritativeRunBoundaryAtom(atom: SafeUsageAtomV1): atom is SafeUsageAtomV1 & { endedAt: string } {
+  if (atom.completionMode !== "explicit" || !atom.endedAt || !isTraceUsageSurface(atom)) {
+    return false;
+  }
+  if (atom.provider === "github-copilot") {
+    return atom.authority === "run";
+  }
+  if (atom.provider === "codex" || atom.provider === "cursor") {
+    return atom.authority === "turn";
+  }
+  return false;
+}
+
+function isTraceUsageSurface(atom: SafeUsageAtomV1): boolean {
+  return atom.signal === "traces"
+    || atom.sourceId === "otlp_codex_traces"
+    || atom.sourceId === "otlp_github_copilot_traces"
+    || atom.sourceId === "otlp_cursor_traces"
+    || atom.profileVersion === "codex-otel-traces-v1"
+    || atom.profileVersion === "copilot-otlp-traces-v1"
+    || atom.profileVersion === "cursor-otel-traces-v1";
 }
 
 function requiresRunLevelSettling(atoms: SafeUsageAtomV1[]): boolean {

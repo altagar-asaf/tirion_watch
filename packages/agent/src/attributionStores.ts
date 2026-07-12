@@ -18,6 +18,14 @@ export type CompletedRunTrackingState = {
   lastExplicitReconcileAt?: string;
 };
 
+export type CompletedRunTrackingRecord = {
+  runId: string;
+  queryId: string;
+  completedAt: string;
+  processedAt: string;
+  outcome?: "processed" | "identity_deferred";
+};
+
 export class SqliteCommitAttributionLedger extends StateBackedCommitAttributionLedger {
   constructor(storage: AgentStorageClient, now: () => number = Date.now) {
     const privacy = new DefaultPrivacyGuard();
@@ -57,11 +65,8 @@ export class SqliteWorkspaceEvidenceLedger implements WorkspaceEvidenceLedger {
     repoKey?: string;
     status?: QueryWorkEvidence["status"];
   } = {}): Promise<QueryWorkEvidence[]> {
-    return (await this.storage.listAgentDocuments<QueryWorkEvidence>("workspace_evidence"))
+    return (await this.storage.listWorkspaceEvidenceDocuments<QueryWorkEvidence>(query))
       .map((document) => normalizeEvidence(document.value))
-      .filter((item) => !query.queryId || item.queryId === query.queryId)
-      .filter((item) => !query.repoKey || item.repoKey === query.repoKey)
-      .filter((item) => !query.status || item.status === query.status)
       .map((item) => structuredClone(item));
   }
 
@@ -111,7 +116,7 @@ export class SqliteWorkEpisodeLedger implements WorkEpisodeLedger {
   }
 
   async listEpisodes(query: WorkEpisodeQuery = {}): Promise<AgenticWorkEpisode[]> {
-    const episodes = (await this.storage.listAgentDocuments<AgenticWorkEpisode>("work_episode"))
+    const episodes = (await this.storage.listWorkEpisodeDocuments<AgenticWorkEpisode>(query))
       .map((document) => normalizeEpisode(document.value))
       .filter((episode) => matchesEpisode(episode, query))
       .sort((a, b) => b.lastAgentActivityAt.localeCompare(a.lastAgentActivityAt))
@@ -176,17 +181,15 @@ export class SqliteCompletedRunTrackingStore {
     }]);
   }
 
-  async listProcessedRuns(): Promise<{ runId: string; queryId: string; completedAt: string; processedAt: string }[]> {
-    return (await this.storage.listAgentDocuments<{
-      runId: string;
-      queryId: string;
-      completedAt: string;
-      processedAt: string;
-    }>("completed_run_tracking")).map((document) => document.value);
+  async listProcessedRuns(): Promise<CompletedRunTrackingRecord[]> {
+    return (await this.storage.listAgentDocuments<CompletedRunTrackingRecord>("completed_run_tracking"))
+      .map((document) => document.value);
   }
 
   async listProcessedRunIds(): Promise<Set<string>> {
-    return new Set((await this.listProcessedRuns()).map((item) => item.runId));
+    return new Set((await this.listProcessedRuns())
+      .filter((item) => item.outcome !== "identity_deferred")
+      .map((item) => item.runId));
   }
 
   async markProcessed(run: { runId: string; queryId: string; completedAt: string }, processedAt: string): Promise<void> {
@@ -197,8 +200,23 @@ export class SqliteCompletedRunTrackingStore {
         runId: run.runId,
         queryId: run.queryId,
         completedAt: run.completedAt,
-        processedAt
+        processedAt,
+        outcome: "processed"
       }
+    });
+  }
+
+  async markIdentityDeferred(run: { runId: string; queryId: string; completedAt: string }, deferredAt: string): Promise<void> {
+    await this.storage.upsertAgentDocument("completed_run_tracking", {
+      key: run.runId,
+      sortAt: deferredAt,
+      value: {
+        runId: run.runId,
+        queryId: run.queryId,
+        completedAt: run.completedAt,
+        processedAt: deferredAt,
+        outcome: "identity_deferred"
+      } satisfies CompletedRunTrackingRecord
     });
   }
 
@@ -240,6 +258,7 @@ function normalizeEvidence(evidence: QueryWorkEvidence): QueryWorkEvidence {
     runIds: uniqueStrings(evidence.runIds),
     baselineReasons: uniqueStrings(evidence.baselineReasons),
     artifactKeys: uniqueStrings(evidence.artifactKeys),
+    causalArtifactKeys: evidence.causalArtifactKeys ? uniqueStrings(evidence.causalArtifactKeys) : undefined,
     baselineArtifactStates: evidence.baselineArtifactStates?.map((item) => ({ ...item })),
     artifactStates: evidence.artifactStates?.map((item) => ({ ...item }))
   };
@@ -270,6 +289,15 @@ function matchesEpisode(episode: AgenticWorkEpisode, query: WorkEpisodeQuery): b
     return false;
   }
   if (query.status && episode.status !== query.status) {
+    return false;
+  }
+  if (query.queryId && !episode.queryIds.includes(query.queryId)) {
+    return false;
+  }
+  if (query.runId && !episode.runIds.includes(query.runId)) {
+    return false;
+  }
+  if (query.chatSessionId && episode.chatSessionId !== query.chatSessionId) {
     return false;
   }
   return !query.range

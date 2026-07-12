@@ -33,7 +33,11 @@ import type {
   WebhookUrlConfigurationV1
 } from "@tirion/agent-contract";
 import type { AgentStorageClient } from "@tirion/agent-storage";
-import { DefaultProductionUsagePipeline } from "@tirion/engine";
+import {
+  DefaultProductionUsagePipeline,
+  isClosedAuthoritativeRunBoundaryAtom,
+  preferredSafeActivities
+} from "@tirion/engine";
 import {
   type AgenticWorkEpisode,
   DefaultPrivacyGuard,
@@ -47,15 +51,17 @@ import type { AgentRepositoryObservationService } from "./repositoryObservationS
 
 const RETRY_INTERVAL_MS = 30_000;
 const MAX_RETRY_DELAY_MS = 10 * 60 * 1000;
-// Grace window after run completion to allow async file writes (e.g. Codex apply_patch)
-// to complete before the first webhook delivery. The reprocessing mechanism replaces the
-// outbox entry with correct filesChanged once evidence arrives; this delay prevents an
-// early empty-filesChanged delivery from racing ahead.
-const RUN_ENDED_GRACE_MS = 15_000;
+const WEBHOOK_REQUEST_TIMEOUT_MS = 5_000;
+// Keep first terminal delivery inside the five-second lifecycle target. Later workspace
+// evidence can still improve the same run through a versioned run.ended event.
+const RUN_ENDED_GRACE_MS = 3_000;
+const LIVE_TERMINAL_CORRECTION_RETENTION_MS = 15_000;
+const TERMINAL_ACTIVITY_CORRECTION_COALESCE_MS = 250;
 // Grace window for commit.attributed to allow all episode claims (which fire in rapid
 // succession as each episode is attributed) to settle before delivery. This also ensures
 // the runIds are fully populated from all contributing runs before the event fires.
 const COMMIT_ATTRIBUTED_GRACE_MS = 4_000;
+const LIVE_USAGE_CORROBORATION_MS = 250;
 const LIVE_UPDATE_USAGE_PIPELINE = new DefaultProductionUsagePipeline();
 
 type StoredWebhookConfiguration = {
@@ -121,6 +127,34 @@ type LiveLifecycleSubject = {
   runtime: string;
 };
 
+type LiveRunSources = {
+  usageAtoms: Map<string, SafeUsageAtomV1>;
+  activityAtoms: Map<string, SafeActivityAtomV1>;
+  executionNodes: Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>;
+};
+
+type LiveTerminalAnchor = {
+  queryId: string;
+  completedAt: string;
+  completionEvidence: NonNullable<QueryOccurrenceV1["completionEvidence"]>;
+  profileVersion: string;
+};
+
+type LiveTerminalProjection = {
+  subject: LiveLifecycleSubject;
+  anchor: LiveTerminalAnchor;
+};
+
+type LiveObservationRoute = {
+  observation: SafeObservationV1;
+  repository: WebhookRepositoryV1;
+};
+
+type LiveRepositoryResolution =
+  | { state: "bound"; repositoryKey: string }
+  | { state: "missing" }
+  | { state: "conflict" };
+
 type LiveStartedProjection = {
   queryId: string;
   event: RunStartedWebhookEventV1;
@@ -138,6 +172,12 @@ type RunEndedWebhookEventDraft = Omit<RunEndedWebhookEventV1, "eventId" | "versi
 
 type QueueEventOptions = {
   allowFilesChangedAfterReadOnly?: boolean;
+};
+
+type WebhookDispatchTimingOptions = {
+  runEndedGraceMs?: number;
+  requestTimeoutMs?: number;
+  terminalActivityCorrectionCoalesceMs?: number;
 };
 
 type RunTokenTotals = Pick<
@@ -158,16 +198,27 @@ export class ExternalWebhookDispatchService {
   private readonly outbox: SqliteWebhookOutbox;
   private readonly subjects: SqliteWebhookSubjectStateStore;
   private retryTimer?: NodeJS.Timeout;
+  private retryTimerDueAt?: number;
   private running = false;
   private deliveryRunning = false;
   private deliveryRerunRequested = false;
   private deliveryRerunForce = false;
   private readonly liveRunStarts = new Map<string, string>();
   private readonly liveRunRepositories = new Map<string, WebhookRepositoryV1>();
-  private readonly liveRunUpdates = new Map<string, RunUpdatedWebhookEventV1>();
+  private readonly liveRunSources = new Map<string, LiveRunSources>();
   private readonly liveRunSubjects = new Map<string, LiveLifecycleSubject>();
   private readonly liveQuerySubjects = new Map<string, string>();
   private readonly liveSessionSubjects = new Map<string, string>();
+  private readonly repositoryKeysByQuery = new Map<string, Set<string>>();
+  private readonly repositoryKeysBySession = new Map<string, Set<string>>();
+  private durableRepositoryHintsLoaded = false;
+  private durableRepositoryHintsLoading?: Promise<void>;
+  private readonly liveTerminalAnchors = new Map<string, LiveTerminalAnchor>();
+  private readonly liveSubjectReleaseTimers = new Map<string, NodeJS.Timeout>();
+  private readonly runEndedQueueTails = new Map<string, Promise<void>>();
+  private readonly runEndedGraceMs: number;
+  private readonly requestTimeoutMs: number;
+  private readonly terminalActivityCorrectionCoalesceMs: number;
 
   constructor(
     storage: AgentStorageClient,
@@ -176,11 +227,18 @@ export class ExternalWebhookDispatchService {
     private readonly repositories: AgentRepositoryObservationService,
     private readonly now: () => number = Date.now,
     private readonly recordEvent: (event: DiagnosticEvent) => void = () => undefined,
-    private readonly installationId = "installation_local"
+    private readonly installationId = "installation_local",
+    timing: WebhookDispatchTimingOptions = {}
   ) {
     this.configuration = new FileWebhookConfigurationStore(paths.configurationPath);
     this.outbox = new SqliteWebhookOutbox(storage, this.privacy);
     this.subjects = new SqliteWebhookSubjectStateStore(storage);
+    this.runEndedGraceMs = positiveDurationMs(timing.runEndedGraceMs, RUN_ENDED_GRACE_MS);
+    this.requestTimeoutMs = positiveDurationMs(timing.requestTimeoutMs, WEBHOOK_REQUEST_TIMEOUT_MS);
+    this.terminalActivityCorrectionCoalesceMs = positiveDurationMs(
+      timing.terminalActivityCorrectionCoalesceMs,
+      TERMINAL_ACTIVITY_CORRECTION_COALESCE_MS
+    );
   }
 
   async start(): Promise<void> {
@@ -189,6 +247,7 @@ export class ExternalWebhookDispatchService {
     }
     this.running = true;
     this.scheduleRetry();
+    void this.resumePendingDeliveries().catch(() => undefined);
     void this.reconcileCommitEvents().catch(() => undefined);
   }
 
@@ -197,7 +256,12 @@ export class ExternalWebhookDispatchService {
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = undefined;
+      this.retryTimerDueAt = undefined;
     }
+    for (const timer of this.liveSubjectReleaseTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.liveSubjectReleaseTimers.clear();
     while (this.deliveryRunning) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -205,24 +269,21 @@ export class ExternalWebhookDispatchService {
 
   async status(): Promise<AgentWebhookStatusV1> {
     const configuration = this.configuration.read();
-    const entries = await this.outbox.list();
-    const queued = entries.filter((entry) => entry.deliveryState === "pending" || entry.deliveryState === "retry");
-    const blocked = entries.filter((entry) => entry.deliveryState === "blocked");
-    const delivered = entries.filter((entry) => entry.deliveryState === "delivered");
+    const snapshot = await this.outbox.status();
+    const queued = snapshot.activeEntries.filter((entry) => entry.deliveryState === "pending" || entry.deliveryState === "retry");
+    const blocked = snapshot.activeEntries.filter((entry) => entry.deliveryState === "blocked");
+    const queuedCount = snapshot.pendingCount + snapshot.retryCount;
     return {
       ...configuration,
-      queuedCount: queued.length,
-      blockedCount: blocked.length,
-      deliveredCount: delivered.length,
-      oldestQueuedAt: queued.map((entry) => entry.queuedAt).sort().at(0),
-      maxQueueAgeMs: queued.length > 0
+      queuedCount,
+      blockedCount: snapshot.blockedCount,
+      deliveredCount: snapshot.deliveredCount,
+      oldestQueuedAt: snapshot.oldestQueuedAt,
+      maxQueueAgeMs: queuedCount > 0 && snapshot.oldestQueuedAt
         ? Math.max(...queued.map((entry) => queueAgeMs(entry, this.now()) ?? 0))
         : undefined,
-      lastDeliveredAt: delivered.map((entry) => entry.deliveredAt ?? entry.updatedAt).sort().at(-1),
-      lastErrorCode: [...entries]
-        .filter((entry) => typeof entry.lastErrorCode === "string")
-        .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
-        .at(-1)?.lastErrorCode,
+      lastDeliveredAt: snapshot.lastDeliveredAt,
+      lastErrorCode: snapshot.lastErrorCode,
       ...(blocked.length > 0 ? { blockedItems: blocked.map(statusItemFromEntry) } : {}),
       ...(queued.length > 0 ? { queuedItems: queued.map(statusItemFromEntry) } : {})
     };
@@ -319,6 +380,7 @@ export class ExternalWebhookDispatchService {
       estimatedNanoUsd: 0,
       costEstimateBasis: "unavailable",
       costCoverage: "unavailable",
+      activity: [],
       state: "completed"
     };
     const queued = await this.queueRunEndedEvent(event, `run.ended:${runId}`);
@@ -331,6 +393,19 @@ export class ExternalWebhookDispatchService {
 
   async observeCompletedRuns(runs: ProductionRunV1[]): Promise<void> {
     for (const run of runs.filter((candidate) => candidate.endedAt && candidate.endedAt >= candidate.startedAt)) {
+      if (!await this.isCustomerVisibleCompletedRun(run)) {
+        this.recordEvent({
+          kind: "constructLifecycle",
+          construct: "ExternalWebhookDispatch",
+          operation: "projection",
+          state: "blocked",
+          reason: "run_lifecycle_internal_harness_session",
+          runId: run.runId,
+          queryId: run.queryId ?? run.correlationId,
+          details: { provider: run.provider }
+        });
+        continue;
+      }
       const events = await this.projectRunLifecycleEvents(run);
       if (!events) {
         continue;
@@ -345,10 +420,18 @@ export class ExternalWebhookDispatchService {
   }
 
   async observeSafeObservation(observation: SafeObservationV1): Promise<void> {
-    const repository = await this.bindLiveObservationToRepository(observation);
-    if (!repository) {
-      return;
+    const visibleObservation = await this.customerVisibleObservation(observation);
+    const routes = await this.routeLiveObservation(visibleObservation);
+    for (const route of routes) {
+      await this.observeRepositoryBoundSafeObservation(route.observation, route.repository);
     }
+  }
+
+  private async observeRepositoryBoundSafeObservation(
+    observation: SafeObservationV1,
+    repository: WebhookRepositoryV1
+  ): Promise<void> {
+    this.rememberObservationRepositoryHints(observation, repository.repoKey);
     const sender = this.webhookSender();
     let queued = false;
     await this.rememberLiveOccurrences(observation, repository);
@@ -363,6 +446,20 @@ export class ExternalWebhookDispatchService {
       this.liveRunRepositories.set(event.runId, event.repository);
       queued = (await this.queueEvent(event, `run.start:${event.runId}`)) || queued;
     }
+    const terminalSubjects = new Map<string, LiveTerminalProjection>();
+    for (const occurrence of (observation.queryOccurrences ?? []).filter(isExplicitLiveTerminalOccurrence)) {
+      const subject = await this.liveSubjectForQuery(observation, occurrence.queryId, repository);
+      if (
+        !subject
+        || runIdForQuery(occurrence.queryId) !== subject.subjectRunId
+        || await this.deliveredRunEndedForSubject(subject.subjectRunId)
+      ) {
+        continue;
+      }
+      const anchor = this.rememberLiveTerminalAnchor(subject, occurrence, observation);
+      terminalSubjects.set(subject.subjectRunId, { subject, anchor });
+    }
+    const updateSubjects = new Map<string, LiveLifecycleSubject>();
     for (const projection of projectLiveRunUpdatedEvents(observation, repository, sender)) {
       const subject = await this.liveSubjectForQuery(observation, projection.queryId, repository);
       if (!subject) {
@@ -378,8 +475,63 @@ export class ExternalWebhookDispatchService {
         );
         continue;
       }
-      let event = canonicalizeLiveUpdatedEvent(projection.event, projection.queryId, subject);
-      const startedAt = this.liveRunStarts.get(event.runId);
+      const deliveredTerminal = await this.deliveredRunEndedForSubject(subject.subjectRunId);
+      const isAuthoritativeRootCorrection = deliveredTerminal
+        && observation.usageAtoms.some((atom) => {
+          const queryId = atom.queryId ?? atom.correlationId;
+          return queryId === projection.queryId
+            && runIdForQuery(queryId) === subject.subjectRunId
+            && isClosedAuthoritativeRunBoundaryAtom(atom);
+        });
+      if (deliveredTerminal && !isAuthoritativeRootCorrection) {
+        this.recordQueueLifecycle(
+          canonicalizeLiveUpdatedEvent(projection.event, projection.queryId, subject),
+          `run.update:${subject.subjectRunId}`,
+          "suppressed",
+          "run_update_after_run_ended_suppressed"
+        );
+        continue;
+      }
+      this.accumulateLiveRunSources(subject, projection.queryId, observation);
+      if (deliveredTerminal) {
+        continue;
+      }
+      updateSubjects.set(subject.subjectRunId, subject);
+      const terminalAnchor = this.liveTerminalAnchors.get(subject.subjectRunId);
+      if (terminalAnchor) {
+        terminalSubjects.set(subject.subjectRunId, { subject, anchor: terminalAnchor });
+      }
+    }
+    for (const atom of observation.usageAtoms.filter(isClosedAuthoritativeRunBoundaryAtom)) {
+      const queryId = atom.queryId ?? atom.correlationId;
+      const subject = await this.liveSubjectForQuery(observation, queryId, repository);
+      if (
+        !subject
+        || runIdForQuery(queryId) !== subject.subjectRunId
+      ) {
+        continue;
+      }
+      const anchor = this.rememberLiveTerminalAnchor(subject, {
+        schemaVersion: 1,
+        queryId,
+        sessionId: subject.sessionId,
+        provider: observation.provider,
+        runtime: observation.runtime,
+        startedAt: subject.startedAt,
+        completedAt: atom.endedAt,
+        completionEvidence: "closed_root_span",
+        promptState: "disabled",
+        evidence: "provider_root_span"
+      }, observation);
+      terminalSubjects.set(subject.subjectRunId, { subject, anchor });
+    }
+    for (const subject of updateSubjects.values()) {
+      const accumulatedObservation = this.accumulatedLiveObservation(subject, observation);
+      let event = projectLiveSubjectRunUpdatedEvent(accumulatedObservation, repository, sender, subject);
+      if (!event) {
+        continue;
+      }
+      const startedAt = await this.publicLiveStartedAt(event.runId);
       if (!startedAt) {
         this.recordQueueLifecycle(
           event,
@@ -393,11 +545,31 @@ export class ExternalWebhookDispatchService {
         );
         continue;
       }
-      if (startedAt && startedAt <= event.startedAt) {
-        event.startedAt = startedAt;
-      }
-      event = this.mergeLiveRunUpdate(event);
+      event.startedAt = startedAt;
+      event.eventId = liveRunUpdateEventId(event);
       queued = (await this.queueEvent(event, `run.update:${event.runId}`)) || queued;
+    }
+    for (const { subject, anchor } of terminalSubjects.values()) {
+      const terminal = await this.projectLiveRunEndedEvent(subject, anchor, observation, sender);
+      if (!terminal) {
+        continue;
+      }
+      if (!await this.publicLiveStartedAt(subject.subjectRunId)) {
+        this.recordQueueLifecycle(
+          terminal.event as RunEndedWebhookEventV1,
+          `run.ended:${subject.subjectRunId}`,
+          "blocked",
+          "run_ended_waiting_for_start",
+          {
+            provider: observation.provider,
+            sourceId: observation.sourceId
+          }
+        );
+        continue;
+      }
+      queued = (await this.queueRunEndedEvent(terminal.event, `run.ended:${subject.subjectRunId}`, {
+        allowFilesChangedAfterReadOnly: terminal.allowFilesChangedAfterReadOnly
+      })) || queued;
     }
     if (queued) {
       await this.processDueEntries();
@@ -421,21 +593,46 @@ export class ExternalWebhookDispatchService {
     const existingSubjectId = this.liveQuerySubjects.get(occurrence.queryId);
     const existingSubject = existingSubjectId ? this.liveRunSubjects.get(existingSubjectId) : undefined;
     if (existingSubject) {
+      const linkedParentSubjectId = occurrence.parentSessionId
+        ? this.liveSessionSubjects.get(occurrence.parentSessionId)
+        : undefined;
+      const linkedParentSubject = linkedParentSubjectId
+        ? this.liveRunSubjects.get(linkedParentSubjectId)
+        : undefined;
+      if (
+        linkedParentSubject
+        && linkedParentSubject.subjectRunId !== existingSubject.subjectRunId
+        && !(await this.deliveredRunEndedForSubject(linkedParentSubject.subjectRunId))
+      ) {
+        return this.reparentLiveSubject(existingSubject, linkedParentSubject, observation, occurrence);
+      }
       return this.upsertLiveSubject(existingSubject.subjectRunId, observation, occurrence, repository);
     }
 
-    const activeSubjectId = this.liveSessionSubjects.get(occurrence.sessionId);
+    const parentSubjectId = occurrence.parentSessionId
+      ? this.liveSessionSubjects.get(occurrence.parentSessionId)
+      : undefined;
+    const activeSubjectId = parentSubjectId ?? this.liveSessionSubjects.get(occurrence.sessionId);
     const activeSubject = activeSubjectId ? this.liveRunSubjects.get(activeSubjectId) : undefined;
     const activeTerminal = activeSubject
       ? await this.deliveredRunEndedForSubject(activeSubject.subjectRunId)
       : undefined;
-    const startsNewSubject = observation.provider !== "codex"
-      || occurrence.evidence === "submission_hook"
-      || occurrence.evidence === "provider_user_prompt_event"
-      || occurrence.evidence === "provider_user_message_event"
-      || !activeSubject
-      || Boolean(activeTerminal);
-    const subjectRunId = startsNewSubject ? runIdForQuery(occurrence.queryId) : activeSubject.subjectRunId;
+    const joinsLinkedChild = Boolean(
+      activeSubject
+      && (occurrence.parentSessionId || activeSubject.sessionId !== occurrence.sessionId)
+      && !activeTerminal
+    );
+    const startsNewSubject = !joinsLinkedChild && (
+      observation.provider !== "codex"
+        || occurrence.evidence === "submission_hook"
+        || occurrence.evidence === "provider_user_prompt_event"
+        || occurrence.evidence === "provider_user_message_event"
+        || !activeSubject
+        || Boolean(activeTerminal)
+    );
+    const subjectRunId = startsNewSubject || !activeSubject
+      ? runIdForQuery(occurrence.queryId)
+      : activeSubject.subjectRunId;
     return this.upsertLiveSubject(subjectRunId, observation, occurrence, repository);
   }
 
@@ -447,7 +644,7 @@ export class ExternalWebhookDispatchService {
     const existingSubjectId = this.liveQuerySubjects.get(queryId);
     const existingSubject = existingSubjectId ? this.liveRunSubjects.get(existingSubjectId) : undefined;
     if (existingSubject) {
-      return existingSubject;
+      return this.extendLiveSubject(existingSubject, queryId, observation.observedAt, repository);
     }
 
     const sessionId = liveSessionId(observation, queryId);
@@ -464,10 +661,10 @@ export class ExternalWebhookDispatchService {
     if (observation.provider === "codex") {
       const occurrence = await this.latestPromptOccurrenceForSession(observation.provider, sessionId, observation.observedAt);
       if (occurrence) {
-        return this.upsertLiveSubject(runIdForQuery(occurrence.queryId), observation, {
-          ...occurrence,
-          queryId
-        }, repository);
+        const subject = await this.rememberLiveOccurrence(observation, occurrence, repository);
+        return occurrence.queryId === queryId
+          ? subject
+          : this.extendLiveSubject(subject, queryId, observation.observedAt, repository);
       }
     }
 
@@ -483,9 +680,11 @@ export class ExternalWebhookDispatchService {
     const existing = this.liveRunSubjects.get(subjectRunId);
     const subject: LiveLifecycleSubject = {
       subjectRunId,
-      sessionId: occurrence.sessionId,
+      sessionId: existing?.sessionId ?? occurrence.sessionId,
       queryIds: uniqueStrings([...(existing?.queryIds ?? []), occurrence.queryId]),
-      startedAt: earliestIso([existing?.startedAt, occurrence.startedAt].filter((value): value is string => Boolean(value))),
+      // The first accepted prompt anchor is the public lifecycle identity. Delayed
+      // provider evidence may improve detail, but it must not rewind run.startedAt.
+      startedAt: existing?.startedAt ?? occurrence.startedAt,
       lastObservedAt: latestIso([existing?.lastObservedAt, observation.observedAt].filter((value): value is string => Boolean(value))),
       repository,
       provider: observation.provider,
@@ -493,6 +692,7 @@ export class ExternalWebhookDispatchService {
     };
     this.liveRunSubjects.set(subjectRunId, subject);
     this.liveQuerySubjects.set(occurrence.queryId, subjectRunId);
+    this.liveSessionSubjects.set(subject.sessionId, subjectRunId);
     this.liveSessionSubjects.set(occurrence.sessionId, subjectRunId);
     this.liveRunStarts.set(subjectRunId, subject.startedAt);
     this.liveRunRepositories.set(subjectRunId, repository);
@@ -515,6 +715,60 @@ export class ExternalWebhookDispatchService {
     this.liveQuerySubjects.set(queryId, next.subjectRunId);
     this.liveRunRepositories.set(next.subjectRunId, repository);
     return next;
+  }
+
+  private reparentLiveSubject(
+    child: LiveLifecycleSubject,
+    parent: LiveLifecycleSubject,
+    observation: SafeObservationV1,
+    occurrence: QueryOccurrenceV1
+  ): LiveLifecycleSubject {
+    const merged: LiveLifecycleSubject = {
+      ...parent,
+      queryIds: uniqueStrings([...parent.queryIds, ...child.queryIds, occurrence.queryId]),
+      lastObservedAt: latestIso([parent.lastObservedAt, child.lastObservedAt, observation.observedAt])
+    };
+    const childSources = this.liveRunSources.get(child.subjectRunId);
+    const parentSources = this.liveRunSources.get(parent.subjectRunId);
+    if (childSources || parentSources) {
+      const mergedSources: LiveRunSources = parentSources ?? {
+        usageAtoms: new Map<string, SafeUsageAtomV1>(),
+        activityAtoms: new Map<string, SafeActivityAtomV1>(),
+        executionNodes: new Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>()
+      };
+      for (const [atomId, atom] of childSources?.usageAtoms ?? []) {
+        mergedSources.usageAtoms.set(atomId, atom);
+      }
+      for (const [activityId, atom] of childSources?.activityAtoms ?? []) {
+        mergedSources.activityAtoms.set(activityId, atom);
+      }
+      for (const [nodeId, node] of childSources?.executionNodes ?? []) {
+        mergedSources.executionNodes.set(nodeId, node);
+      }
+      this.liveRunSources.set(parent.subjectRunId, mergedSources);
+    }
+    this.liveRunSources.delete(child.subjectRunId);
+    this.liveRunSubjects.delete(child.subjectRunId);
+    this.liveRunStarts.delete(child.subjectRunId);
+    this.liveRunRepositories.delete(child.subjectRunId);
+    this.liveTerminalAnchors.delete(child.subjectRunId);
+    this.liveRunSubjects.set(parent.subjectRunId, merged);
+    this.liveRunRepositories.set(parent.subjectRunId, parent.repository);
+    for (const queryId of merged.queryIds) {
+      this.liveQuerySubjects.set(queryId, parent.subjectRunId);
+    }
+    for (const [sessionId, subjectRunId] of this.liveSessionSubjects) {
+      if (subjectRunId === child.subjectRunId) {
+        this.liveSessionSubjects.set(sessionId, parent.subjectRunId);
+      }
+    }
+    this.liveSessionSubjects.set(occurrence.sessionId, parent.subjectRunId);
+    return merged;
+  }
+
+  private async publicLiveStartedAt(subjectRunId: string): Promise<string | undefined> {
+    const start = await this.outbox.read(eventIdFor("run.start", subjectRunId));
+    return start?.event.eventType === "run.start" ? start.event.startedAt : undefined;
   }
 
   private async latestPromptOccurrenceForSession(
@@ -544,6 +798,161 @@ export class ExternalWebhookDispatchService {
     return undefined;
   }
 
+  private accumulateLiveRunSources(
+    subject: LiveLifecycleSubject,
+    sourceQueryId: string,
+    observation: SafeObservationV1
+  ): void {
+    const sources = this.liveRunSources.get(subject.subjectRunId) ?? {
+      usageAtoms: new Map<string, SafeUsageAtomV1>(),
+      activityAtoms: new Map<string, SafeActivityAtomV1>(),
+      executionNodes: new Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>()
+    };
+    for (const atom of observation.usageAtoms) {
+      if (
+        (atom.queryId ?? atom.correlationId) === sourceQueryId
+        && liveSourceOverlapsSubject(atom, subject)
+      ) {
+        sources.usageAtoms.set(atom.atomId, canonicalLiveUsageAtom(atom, subject));
+      }
+    }
+    for (const atom of observation.activityAtoms ?? []) {
+      if (atom.queryId === sourceQueryId && liveSourceOverlapsSubject(atom, subject)) {
+        sources.activityAtoms.set(atom.activityId, canonicalLiveActivityAtom(atom, subject));
+        if (atom.kind === "subagent" && atom.childSessionId) {
+          this.liveSessionSubjects.set(atom.childSessionId, subject.subjectRunId);
+        }
+      }
+    }
+    for (const node of observation.executionNodes ?? []) {
+      if (
+        node.queryId === sourceQueryId
+        && node.nodeKind !== "prompt"
+        && liveSourceOverlapsSubject(node, subject)
+      ) {
+        sources.executionNodes.set(node.nodeId, canonicalLiveExecutionNode(node, subject));
+      }
+    }
+    this.liveRunSources.set(subject.subjectRunId, sources);
+  }
+
+  private rememberLiveTerminalAnchor(
+    subject: LiveLifecycleSubject,
+    occurrence: QueryOccurrenceV1,
+    observation: SafeObservationV1
+  ): LiveTerminalAnchor {
+    const anchor: LiveTerminalAnchor = {
+      queryId: occurrence.queryId,
+      completedAt: occurrence.completedAt!,
+      completionEvidence: occurrence.completionEvidence!,
+      profileVersion: observation.profileVersion
+    };
+    const existing = this.liveTerminalAnchors.get(subject.subjectRunId);
+    if (!existing || anchor.completedAt >= existing.completedAt) {
+      this.liveTerminalAnchors.set(subject.subjectRunId, anchor);
+      return anchor;
+    }
+    return existing;
+  }
+
+  private async projectLiveRunEndedEvent(
+    subject: LiveLifecycleSubject,
+    anchor: LiveTerminalAnchor,
+    latestObservation: SafeObservationV1,
+    sender: WebhookSenderV1
+  ): Promise<{ event: RunEndedWebhookEventDraft; allowFilesChangedAfterReadOnly: boolean } | undefined> {
+    if (Date.parse(anchor.completedAt) < Date.parse(subject.startedAt)) {
+      return undefined;
+    }
+    const queryId = queryIdForRunId(subject.subjectRunId);
+    const observation = this.accumulatedLiveObservation(subject, latestObservation);
+    const update = projectLiveSubjectRunUpdatedEvent(observation, subject.repository, sender, subject);
+    const sources = this.liveRunSources.get(subject.subjectRunId);
+    const artifactKeys = uniqueStrings([
+      ...(sources?.executionNodes.values() ?? [])
+    ].flatMap((node) => node.artifactKeys ?? []));
+    const filesChanged = await this.filesChangedFor(subject.repository.repoKey, artifactKeys);
+    const activity = update?.activity ?? [];
+    const cost = update
+      ? {
+          estimatedNanoUsd: update.estimatedNanoUsd,
+          ...(typeof update.usageValueNanoUsd === "number" ? { usageValueNanoUsd: update.usageValueNanoUsd } : {}),
+          costEstimateBasis: update.costEstimateBasis,
+          costCoverage: update.costCoverage
+        }
+      : unavailableLiveRunUpdateCost();
+    const usageCoverage = liveTerminalUsageCoverage(observation, update?.totalTokens ?? 0);
+    return {
+      event: {
+        schemaVersion: 1,
+        eventType: "run.ended",
+        runId: subject.subjectRunId,
+        sessionId: subject.sessionId,
+        traceIds: uniqueStrings([
+          ...liveTraceIds(observation, queryId),
+          anchor.queryId,
+          ...subject.queryIds
+        ]),
+        sender,
+        repository: subject.repository,
+        codingHarness: subject.provider,
+        runtime: subject.runtime,
+        startedAt: subject.startedAt,
+        evidence: webhookEvidence(
+          liveTerminalEvidenceBasis(anchor.completionEvidence, latestObservation.signal),
+          anchor.queryId,
+          anchor.completedAt,
+          false,
+          anchor.profileVersion
+        ),
+        coverage: webhookCoverage(
+          usageCoverage,
+          activity.length > 0 ? "partial" : "none",
+          cost.costCoverage
+        ),
+        endedAt: anchor.completedAt,
+        inputTokens: update?.inputTokens ?? 0,
+        outputTokens: update?.outputTokens ?? 0,
+        cacheReadInputTokens: update?.cacheReadInputTokens ?? 0,
+        cacheCreationInputTokens: update?.cacheCreationInputTokens ?? 0,
+        reasoningOutputTokens: update?.reasoningOutputTokens ?? 0,
+        totalTokens: update?.totalTokens ?? 0,
+        llmModels: update?.llmModels ?? [],
+        filesChanged,
+        ...cost,
+        ...(update?.context ? { context: { ...update.context, coverage: usageCoverage } } : {}),
+        activity,
+        state: "completed"
+      },
+      allowFilesChangedAfterReadOnly: artifactKeys.length > 0 || hasWriteCapableActivity(activity)
+    };
+  }
+
+  private accumulatedLiveObservation(
+    subject: LiveLifecycleSubject,
+    latest: SafeObservationV1
+  ): SafeObservationV1 {
+    const sources = this.liveRunSources.get(subject.subjectRunId);
+    const usageAtoms = [...(sources?.usageAtoms.values() ?? [])];
+    const activityAtoms = [...(sources?.activityAtoms.values() ?? [])];
+    const executionNodes = [...(sources?.executionNodes.values() ?? [])];
+    const observedAt = latestIso([
+      subject.startedAt,
+      ...usageAtoms.flatMap((atom) => [atom.endedAt, atom.startedAt]).filter((value): value is string => Boolean(value)),
+      ...activityAtoms.flatMap((atom) => [atom.endedAt, atom.startedAt]).filter((value): value is string => Boolean(value)),
+      ...executionNodes.flatMap((node) => [node.endedAt, node.startedAt]).filter((value): value is string => Boolean(value))
+    ]);
+    return {
+      ...latest,
+      observationId: `obs_live_${contentHash({ runId: subject.subjectRunId, observedAt }).slice(0, 32)}`,
+      observedAt,
+      queryOccurrences: [],
+      usageAtoms,
+      activityAtoms: preferredSafeActivities(activityAtoms),
+      executionNodes
+    };
+  }
+
   async reconcileCommitEvents(commitHash?: string): Promise<void> {
     const [summaries, snapshots, workEpisodes] = await Promise.all([
       this.attribution.listCommitAttributions(commitHash ? { commitHash } : {}),
@@ -552,10 +961,7 @@ export class ExternalWebhookDispatchService {
     ]);
     const snapshotByCommit = new Map(snapshots.map((snapshot) => [commitSubject(snapshot.repoKey, snapshot.commitHash), snapshot]));
     const runsById = new Map((await this.productionRuns()).map((run) => [run.runId, run]));
-    const atomsByQuery = groupAtomsByQuery(await this.safeUsageAtoms());
-    const outboxEntries = await this.outbox.list();
-    const subjectStates = await this.subjects.list();
-    const deliveredWritingSubjectRunIds = writingRunIdsFromDeliveredLifecycle(outboxEntries, subjectStates);
+    const deliveredWritingSubjectRunIds = new Set(await this.outbox.deliveredWritingRunIds());
     for (const summary of summaries) {
       const subjectId = commitSubject(summary.repoKey, summary.commitHash);
       const snapshot = snapshotByCommit.get(subjectId);
@@ -567,6 +973,9 @@ export class ExternalWebhookDispatchService {
       const candidateRuns = candidateRunIds
         .map((runId) => runsById.get(runId))
         .filter((run): run is ProductionRunV1 => Boolean(run));
+      const atomsByQuery = groupAtomsByQuery(await this.safeUsageAtomsForQueryIds(candidateRuns.map((run) =>
+        run.queryId ?? run.correlationId
+      )));
       const writingSubjectByProductionRunId = new Map<string, string>();
       for (const run of candidateRuns) {
         const queryId = run.queryId ?? run.correlationId;
@@ -744,12 +1153,57 @@ export class ExternalWebhookDispatchService {
     subjectId: string,
     options: QueueEventOptions = {}
   ): Promise<boolean> {
+    return await this.withRunEndedSubjectLock(
+      subjectId,
+      () => this.queueRunEndedEventUnlocked(baseEvent, subjectId, options)
+    );
+  }
+
+  private async withRunEndedSubjectLock<T>(subjectId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.runEndedQueueTails.get(subjectId) ?? Promise.resolve();
+    const queued = previous.then(operation);
+    const tail = queued.then(() => undefined, () => undefined);
+    this.runEndedQueueTails.set(subjectId, tail);
+    try {
+      return await queued;
+    } finally {
+      if (this.runEndedQueueTails.get(subjectId) === tail) {
+        this.runEndedQueueTails.delete(subjectId);
+      }
+    }
+  }
+
+  private async queueRunEndedEventUnlocked(
+    baseEvent: RunEndedWebhookEventDraft,
+    subjectId: string,
+    options: QueueEventOptions
+  ): Promise<boolean> {
+    const normalizedBaseEvent = normalizeRunEndedDraft(baseEvent);
     const subjectState = await this.subjects.read(subjectId);
-    const meaningHash = runEndedMeaningHash(baseEvent);
+    const stateEntry = subjectState?.eventId ? await this.outbox.read(subjectState.eventId) : undefined;
+    const previousEvent = stateEntry?.event.eventType === "run.ended" ? stateEntry.event : undefined;
+    if (previousEvent && previousEvent.repository.repoKey !== normalizedBaseEvent.repository.repoKey) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "queue",
+        state: "blocked",
+        reason: "run_terminal_repository_identity_changed",
+        runId: normalizedBaseEvent.runId,
+        details: {
+          previousRepoKey: previousEvent.repository.repoKey,
+          nextRepoKey: normalizedBaseEvent.repository.repoKey
+        }
+      });
+      return false;
+    }
+    const monotonicBaseEvent = previousEvent
+      ? monotonicRunEndedRevision(previousEvent, normalizedBaseEvent)
+      : normalizedBaseEvent;
+    const meaningHash = runEndedMeaningHash(monotonicBaseEvent);
     if (subjectState?.payloadHash === meaningHash) {
       return false;
     }
-    const stateEntry = subjectState?.eventId ? await this.outbox.read(subjectState.eventId) : undefined;
     const stateEntryPending = Boolean(stateEntry && !stateEntry.deliveredAt && stateEntry.deliveryState !== "delivered");
     const version = stateEntryPending
       ? Math.max(1, subjectState?.version ?? 1)
@@ -760,7 +1214,7 @@ export class ExternalWebhookDispatchService {
       ? subjectState.eventId
       : eventIdFor("run.ended", `${subjectId}|v${version}`);
     const event: RunEndedWebhookEventV1 = {
-      ...baseEvent,
+      ...monotonicBaseEvent,
       eventId,
       version
     };
@@ -824,6 +1278,9 @@ export class ExternalWebhookDispatchService {
     if (existing?.deliveredAt && event.eventType === "run.start") {
       return false;
     }
+    if (existing?.deliveredAt && event.eventType === "run.update" && event.state === "settling") {
+      return false;
+    }
     const newFilesLen = event.eventType === "run.ended"
       ? ((event as RunEndedWebhookEventV1).filesChanged ?? []).length
       : -1;
@@ -837,28 +1294,34 @@ export class ExternalWebhookDispatchService {
       this.recordQueueLifecycle(event, subjectId, "blocked", "webhook_run_delivered_read_only_files_changed_without_write_activity");
       return false;
     }
-    // Once a run.ended event has been delivered, only re-deliver if filesChanged improved.
-    // This prevents spurious re-deliveries caused by advancing endedAt in each OTel batch.
-    if (existing?.deliveredAt && event.eventType === "run.ended") {
-      const existingLen = ((existing.event as RunEndedWebhookEventV1).filesChanged ?? []).length;
-      if (newFilesLen <= existingLen) {
-        return false;
-      }
-    }
-    // For run.ended events with no file changes yet, hold delivery until either:
-    // (a) a replacement arrives with filesChanged populated, or
-    // (b) the grace window expires, at which point we deliver with filesChanged=[].
-    // This prevents a premature empty-filesChanged delivery racing ahead of async file writes.
-    const terminalQuiescenceAt = event.eventType === "run.ended"
-      ? this.runEndedLiveQuiescenceAttemptAt(event, subjectId)
+    // A changed authoritative terminal projection is a new version. Identical meaning
+    // hashes are suppressed in queueRunEndedEvent; corrected usage, activity, timing,
+    // model, cost, or workspace evidence must remain deliverable after version 1.
+    // The terminal deadline is anchored to endedAt, never queue time. That one
+    // grace window lets final usage and causal file evidence catch up without
+    // making ingress or projection latency extend the customer-visible deadline.
+    const terminalDeadlineAt = event.eventType === "run.ended"
+      ? this.runEndedDeliveryDeadlineAt(event)
       : undefined;
+    const terminalActivityCorrectionDeadlineAt = event.eventType === "run.ended"
+      && subjectState?.deliveredAt
+      && shouldCoalesceTerminalActivityCorrection(event)
+      ? (existing?.nextAttemptAt
+          ?? new Date(this.now() + this.terminalActivityCorrectionCoalesceMs).toISOString())
+      : undefined;
+    const settlingDeadlineAt = event.eventType === "run.update" && event.state === "settling"
+      ? existing?.nextAttemptAt ?? this.runUpdateSettlingDeadlineAt(event)
+      : undefined;
+    const preservedRetryAt = existing?.deliveryState === "retry" ? existing.nextAttemptAt : undefined;
     const nextAttemptAt = configuration.url
       ? (event.eventType === "run.ended"
           ? latestIsoOptional([
-              existing?.nextAttemptAt,
-              terminalQuiescenceAt,
-              newFilesLen === 0 ? new Date(this.now() + RUN_ENDED_GRACE_MS).toISOString() : undefined
+              preservedRetryAt,
+              terminalDeadlineAt,
+              terminalActivityCorrectionDeadlineAt
             ])
+          : event.eventType === "run.update" && event.state === "settling"
+            ? latestIsoOptional([preservedRetryAt, settlingDeadlineAt])
           : event.eventType === "commit.attributed"
             // Hold commit.attributed until the grace window expires so that all episode
             // claims (which fire in rapid succession) settle before the first delivery.
@@ -884,6 +1347,7 @@ export class ExternalWebhookDispatchService {
       updatedAt: now
     };
     await this.outbox.upsert(entry);
+    this.scheduleRetry(nextAttemptAt);
     this.recordQueueLifecycle(
       event,
       subjectId,
@@ -894,7 +1358,13 @@ export class ExternalWebhookDispatchService {
   }
 
   private async projectRunLifecycleEvents(run: ProductionRunV1): Promise<RunLifecycleProjection | undefined> {
-    const binding = await this.bindRunToRepository(run);
+    const queryId = run.queryId ?? run.correlationId;
+    const byRun = await this.attribution.listWorkEpisodes({ runId: run.runId });
+    const byQuery = byRun.some((episode) => episode.queryIds.includes(queryId))
+      ? []
+      : await this.attribution.listWorkEpisodes({ queryId });
+    const episodes = [...new Map([...byRun, ...byQuery].map((episode) => [episode.episodeId, episode])).values()];
+    const binding = await this.bindRunToRepository(run, episodes);
     if (!binding || !run.endedAt) {
       return undefined;
     }
@@ -903,7 +1373,6 @@ export class ExternalWebhookDispatchService {
     // tracker groups all runs from the same exec under one episodeId. Use that as the
     // outbox discriminator and aggregate the episode's usage so the single webhook
     // event remains economically accurate.
-    const episodes = await this.attribution.listWorkEpisodes();
     return await this.projectRunLifecycleEventsFromBinding(run, binding, episodes);
   }
 
@@ -927,8 +1396,10 @@ export class ExternalWebhookDispatchService {
     const episodeRuns = aggregateEpisode && episode
       ? await this.runsForLifecycleSubject(episode, run, webhookRunId)
       : [run];
-    const projectedRun = aggregateEpisode ? aggregateWebhookRun(run, episodeRuns) : run;
-    const atomsByQuery = groupAtomsByQuery(await this.safeUsageAtoms());
+    const projectedRun = aggregateEpisode ? aggregateWebhookRun(run, episodeRuns, webhookRunId) : run;
+    const atomsByQuery = groupAtomsByQuery(await this.safeUsageAtomsForQueryIds(episodeRuns.map((candidate) =>
+      candidate.queryId ?? candidate.correlationId
+    )));
     const traceIds = uniqueStrings(episodeRuns.flatMap((candidate) => traceIdsForRun(candidate, atomsByQuery)));
     const llmModels = uniqueStrings(projectedRun.models ?? (projectedRun.model ? [projectedRun.model] : []));
     const sessionId = episode?.chatSessionId ?? sessionIdForRun(projectedRun);
@@ -944,13 +1415,15 @@ export class ExternalWebhookDispatchService {
           binding.artifactKeys
         );
     const filesChanged = await this.filesChangedFor(binding.repository.repoKey, artifactKeys);
-    const evidence = evidenceForRun(projectedRun, "prompt_hook");
+    const evidence = evidenceForRun(projectedRun, "usage_projection");
     const traceIdsForWebhook = traceIds.length > 0 ? traceIds : [`trace_${webhookRunId}`];
     const sender = this.webhookSender();
-    const activity = activityForRun(projectedRun, endedAt, evidence);
+    const startedAt = await this.lifecycleStartedAtFor(webhookRunId, run.runId, projectedRun.startedAt);
+    const updatedAt = latestIso([startedAt, endedAt]);
+    const activity = activityForRun(projectedRun, endedAt, evidence).map((item) =>
+      normalizeTerminalActivityBounds(item, startedAt, updatedAt)
+    );
     const activityCoverage = activityCoverageForRun(projectedRun, activity);
-    const startedAt = this.liveRunStarts.get(webhookRunId) ?? this.liveRunStarts.get(run.runId) ?? projectedRun.startedAt;
-    const updatedAt = updatedAtForLifecycle(startedAt, endedAt);
     const started: RunStartedWebhookEventV1 = {
       schemaVersion: 1,
       eventType: "run.start",
@@ -1001,6 +1474,10 @@ export class ExternalWebhookDispatchService {
       ...contextFootprintForWebhook(projectedRun.context, "complete_so_far"),
       activity
     };
+    // Completed projections can briefly alternate between request slices and a
+    // provider turn authority. Keep one replaceable settling slot until the fixed
+    // terminal deadline; running updates remain content-addressed and immediate.
+    updated.eventId = eventIdFor("run.update", `${webhookRunId}|settling`);
     const ended: RunEndedWebhookEventV1 = {
       schemaVersion: 1,
       eventType: "run.ended",
@@ -1013,7 +1490,7 @@ export class ExternalWebhookDispatchService {
       codingHarness: projectedRun.provider,
       runtime: projectedRun.runtime,
       startedAt,
-      evidence: evidenceForRun(projectedRun, "stop_hook"),
+      evidence: evidenceForRun(projectedRun, "usage_projection"),
       coverage: webhookCoverage("final", activityCoverage, projectedRun.costCoverage),
       endedAt,
       inputTokens: projectedRun.inputTokens,
@@ -1029,6 +1506,7 @@ export class ExternalWebhookDispatchService {
       costEstimateBasis: normalizeCostEstimateBasis(projectedRun.costEstimateBasis),
       costCoverage: projectedRun.costCoverage,
       ...contextFootprintForWebhook(projectedRun.context, "final"),
+      activity,
       state: "completed"
     };
     const endedPrivacy = this.privacy.validatePublication(ended);
@@ -1107,7 +1585,7 @@ export class ExternalWebhookDispatchService {
   private async lifecycleSubjectTraceQueryIds(episode: AgenticWorkEpisode, webhookRunId: string): Promise<string[]> {
     const episodeQueryIds = new Set(episode.queryIds);
     const queryIds = new Set<string>();
-    for (const entry of await this.outbox.list()) {
+    for (const entry of await this.outbox.lifecycle({ runId: webhookRunId })) {
       const lifecycle = lifecycleSortKey(entry);
       if (!lifecycle || lifecycle.runSubject !== webhookRunId) {
         continue;
@@ -1197,7 +1675,7 @@ export class ExternalWebhookDispatchService {
       return liveSubject;
     }
     const subjects = new Set<string>();
-    for (const entry of await this.outbox.list()) {
+    for (const entry of await this.outbox.lifecycle({ traceId: queryId })) {
       const lifecycle = lifecycleSortKey(entry);
       if (!lifecycle || (entry.eventType !== "run.start" && entry.eventType !== "run.update")) {
         continue;
@@ -1212,6 +1690,23 @@ export class ExternalWebhookDispatchService {
       }
     }
     return [...subjects].sort()[0];
+  }
+
+  private async lifecycleStartedAtFor(
+    subjectRunId: string,
+    sourceRunId: string,
+    fallback: string
+  ): Promise<string> {
+    const liveAnchor = this.liveRunStarts.get(subjectRunId) ?? this.liveRunStarts.get(sourceRunId);
+    if (liveAnchor) {
+      return liveAnchor;
+    }
+    const publishedStart = await this.outbox.read(eventIdFor("run.start", subjectRunId));
+    if (publishedStart?.event.eventType === "run.start") {
+      return publishedStart.event.startedAt;
+    }
+    const priorTerminal = await this.runEndedForSubject(subjectRunId);
+    return priorTerminal?.startedAt ?? fallback;
   }
 
   private async deliveredRunEndedForEpisodeSubjects(episode: AgenticWorkEpisode): Promise<RunEndedWebhookEventV1 | undefined> {
@@ -1249,7 +1744,12 @@ export class ExternalWebhookDispatchService {
       }
     }
     const subjects = new Set<string>();
-    for (const entry of await this.outbox.list()) {
+    const entries = await Promise.all([
+      ...(episode.chatSessionId ? [this.outbox.lifecycle({ sessionId: episode.chatSessionId })] : []),
+      ...episode.queryIds.map((queryId) => this.outbox.lifecycle({ traceId: queryId })),
+      ...episode.runIds.map((runId) => this.outbox.lifecycle({ runId }))
+    ]);
+    for (const entry of uniqueOutboxEntries(entries.flat())) {
       const lifecycle = lifecycleSortKey(entry);
       if (!lifecycle || (entry.eventType !== "run.start" && entry.eventType !== "run.update")) {
         continue;
@@ -1321,14 +1821,34 @@ export class ExternalWebhookDispatchService {
     return runs.length > 0 ? runs : [currentRun];
   }
 
-  private async bindRunToRepository(run: ProductionRunV1): Promise<{
+  private async bindRunToRepository(run: ProductionRunV1, episodes: AgenticWorkEpisode[]): Promise<{
     repository: WebhookRepositoryV1;
     artifactKeys: string[];
   } | undefined> {
     const queryId = run.queryId ?? run.correlationId;
-    const episodes = await this.attribution.listWorkEpisodes();
     const episode = episodes.find((candidate) =>
       candidate.runIds.includes(run.runId) || candidate.queryIds.includes(queryId));
+    if (run.repositoryKey) {
+      const repository = (await this.repositories.listRepositories())
+        .find((candidate) => candidate.repoKey === run.repositoryKey);
+      if (!repository) {
+        this.recordEvent({
+          kind: "constructLifecycle",
+          construct: "ExternalWebhookDispatch",
+          operation: "projection",
+          state: "blocked",
+          reason: "run_webhook_repository_binding_missing",
+          runId: run.runId,
+          queryId,
+          repoKey: run.repositoryKey
+        });
+        return undefined;
+      }
+      return {
+        repository: await this.describeRepository(repository.repoKey, repository.root),
+        artifactKeys: episode ? artifactKeysForRun([episode], repository.repoKey, run) : []
+      };
+    }
     if (!episode) {
       const liveBinding = this.bindCompletedRunToLiveRepository(run);
       if (liveBinding) {
@@ -1408,26 +1928,315 @@ export class ExternalWebhookDispatchService {
     };
   }
 
-  private async bindLiveObservationToRepository(observation: SafeObservationV1): Promise<WebhookRepositoryV1 | undefined> {
+  private async routeLiveObservation(observation: SafeObservationV1): Promise<LiveObservationRoute[]> {
     const repositories = await this.repositories.listRepositories();
-    if (repositories.length !== 1) {
+    const repositoriesByKey = new Map(repositories.map((repository) => [repository.repoKey, repository]));
+    if (observation.repositoryKey) {
+      const repository = repositoriesByKey.get(observation.repositoryKey);
+      if (repository) {
+        this.rememberObservationRepositoryHints(observation, repository.repoKey);
+        return [{
+          observation,
+          repository: await this.describeRepository(repository.repoKey, repository.root)
+        }];
+      }
       this.recordEvent({
         kind: "constructLifecycle",
         construct: "ExternalWebhookDispatch",
         operation: "projection",
         state: "blocked",
-        reason: repositories.length === 0
-          ? "run_lifecycle_repository_binding_missing"
-          : "run_lifecycle_repository_binding_ambiguous",
+        reason: "run_lifecycle_repository_binding_missing",
+        repoKey: observation.repositoryKey,
         details: {
           provider: observation.provider,
           sourceId: observation.sourceId,
           repositoryCount: repositories.length
         }
       });
-      return undefined;
+      return [];
     }
-    return await this.describeRepository(repositories[0].repoKey, repositories[0].root);
+
+    if (repositories.length === 1) {
+      this.rememberObservationRepositoryHints(observation, repositories[0].repoKey);
+      return [{
+        observation: { ...observation, repositoryKey: repositories[0].repoKey },
+        repository: await this.describeRepository(repositories[0].repoKey, repositories[0].root)
+      }];
+    }
+
+    if (repositories.length === 0) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "blocked",
+        reason: "run_lifecycle_repository_binding_missing",
+        details: {
+          provider: observation.provider,
+          sourceId: observation.sourceId,
+          repositoryCount: 0
+        }
+      });
+      return [];
+    }
+
+    this.rememberObservationRepositoryHints(observation);
+    try {
+      await this.ensureDurableRepositoryHints();
+    } catch {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "warning",
+        reason: "run_lifecycle_durable_repository_hints_unavailable",
+        details: {
+          provider: observation.provider,
+          sourceId: observation.sourceId,
+          repositoryCount: repositories.length
+        }
+      });
+    }
+
+    const partitions = new Map<string, SafeObservationV1>();
+    let missingRecordCount = 0;
+    let conflictingRecordCount = 0;
+    const partitionFor = (repositoryKey: string): SafeObservationV1 => {
+      const existing = partitions.get(repositoryKey);
+      if (existing) {
+        return existing;
+      }
+      const partition: SafeObservationV1 = {
+        ...observation,
+        repositoryKey,
+        queryOccurrences: [],
+        activityAtoms: [],
+        executionNodes: [],
+        usageAtoms: []
+      };
+      partitions.set(repositoryKey, partition);
+      return partition;
+    };
+    const routeRecord = (input: {
+      provider: SafeObservationV1["provider"];
+      queryId: string;
+      sessionId?: string;
+      parentSessionId?: string;
+      repositoryKey?: string;
+    }): string | undefined => {
+      if (input.provider !== observation.provider) {
+        conflictingRecordCount += 1;
+        return undefined;
+      }
+      const resolution = this.resolveLiveRecordRepository(input);
+      if (resolution.state === "conflict") {
+        conflictingRecordCount += 1;
+        return undefined;
+      }
+      if (resolution.state === "missing" || !repositoriesByKey.has(resolution.repositoryKey)) {
+        missingRecordCount += 1;
+        return undefined;
+      }
+      return resolution.repositoryKey;
+    };
+
+    for (const occurrence of observation.queryOccurrences ?? []) {
+      const repositoryKey = routeRecord(occurrence);
+      if (repositoryKey) {
+        partitionFor(repositoryKey).queryOccurrences!.push(occurrence);
+      }
+    }
+    for (const atom of observation.activityAtoms ?? []) {
+      const repositoryKey = routeRecord(atom);
+      if (repositoryKey) {
+        partitionFor(repositoryKey).activityAtoms!.push(atom);
+      }
+    }
+    for (const node of observation.executionNodes ?? []) {
+      const repositoryKey = routeRecord(node);
+      if (repositoryKey) {
+        partitionFor(repositoryKey).executionNodes!.push(node);
+      }
+    }
+    for (const atom of observation.usageAtoms) {
+      const repositoryKey = routeRecord({
+        ...atom,
+        queryId: atom.queryId ?? atom.correlationId
+      });
+      if (repositoryKey) {
+        partitionFor(repositoryKey).usageAtoms.push(atom);
+      }
+    }
+
+    if (missingRecordCount > 0) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "blocked",
+        reason: "run_lifecycle_record_repository_binding_missing",
+        details: {
+          provider: observation.provider,
+          sourceId: observation.sourceId,
+          recordCount: missingRecordCount,
+          repositoryCount: repositories.length
+        }
+      });
+    }
+    if (conflictingRecordCount > 0) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "blocked",
+        reason: "run_lifecycle_record_repository_binding_conflict",
+        details: {
+          provider: observation.provider,
+          sourceId: observation.sourceId,
+          recordCount: conflictingRecordCount,
+          repositoryCount: repositories.length
+        }
+      });
+    }
+    if (partitions.size === 0) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "blocked",
+        reason: "run_lifecycle_repository_binding_ambiguous",
+        details: {
+          provider: observation.provider,
+          sourceId: observation.sourceId,
+          repositoryCount: repositories.length
+        }
+      });
+      return [];
+    }
+
+    return await Promise.all([...partitions.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(async ([repositoryKey, partition]) => {
+        const repository = repositoriesByKey.get(repositoryKey)!;
+        return {
+          observation: partition,
+          repository: await this.describeRepository(repository.repoKey, repository.root)
+        };
+      }));
+  }
+
+  private resolveLiveRecordRepository(input: {
+    provider: SafeObservationV1["provider"];
+    queryId: string;
+    sessionId?: string;
+    parentSessionId?: string;
+    repositoryKey?: string;
+  }): LiveRepositoryResolution {
+    const queryKeys = new Set<string>();
+    if (input.repositoryKey) {
+      queryKeys.add(input.repositoryKey);
+    }
+    for (const repositoryKey of this.repositoryKeysByQuery.get(providerIdentityKey(input.provider, input.queryId)) ?? []) {
+      queryKeys.add(repositoryKey);
+    }
+    const querySubjectId = this.liveQuerySubjects.get(input.queryId);
+    const querySubject = querySubjectId ? this.liveRunSubjects.get(querySubjectId) : undefined;
+    if (querySubject?.provider === input.provider) {
+      queryKeys.add(querySubject.repository.repoKey);
+    }
+    if (queryKeys.size > 1) {
+      return { state: "conflict" };
+    }
+    if (queryKeys.size === 1) {
+      return { state: "bound", repositoryKey: [...queryKeys][0] };
+    }
+
+    const sessionKeys = new Set<string>();
+    for (const sessionId of uniqueStrings([input.sessionId, input.parentSessionId]
+      .filter((value): value is string => Boolean(value)))) {
+      for (const repositoryKey of this.repositoryKeysBySession.get(providerIdentityKey(input.provider, sessionId)) ?? []) {
+        sessionKeys.add(repositoryKey);
+      }
+      const sessionSubjectId = this.liveSessionSubjects.get(sessionId);
+      const sessionSubject = sessionSubjectId ? this.liveRunSubjects.get(sessionSubjectId) : undefined;
+      if (sessionSubject?.provider === input.provider) {
+        sessionKeys.add(sessionSubject.repository.repoKey);
+      }
+    }
+    if (sessionKeys.size > 1) {
+      return { state: "conflict" };
+    }
+    return sessionKeys.size === 1
+      ? { state: "bound", repositoryKey: [...sessionKeys][0] }
+      : { state: "missing" };
+  }
+
+  private rememberObservationRepositoryHints(observation: SafeObservationV1, fallbackRepositoryKey?: string): void {
+    const remember = (input: {
+      provider: SafeObservationV1["provider"];
+      queryId: string;
+      sessionId?: string;
+      parentSessionId?: string;
+      repositoryKey?: string;
+    }): void => {
+      if (input.provider !== observation.provider) {
+        return;
+      }
+      const repositoryKey = input.repositoryKey ?? fallbackRepositoryKey;
+      if (!repositoryKey) {
+        return;
+      }
+      addRepositoryHint(this.repositoryKeysByQuery, providerIdentityKey(input.provider, input.queryId), repositoryKey);
+      for (const sessionId of uniqueStrings([input.sessionId, input.parentSessionId]
+        .filter((value): value is string => Boolean(value)))) {
+        addRepositoryHint(this.repositoryKeysBySession, providerIdentityKey(input.provider, sessionId), repositoryKey);
+      }
+    };
+    for (const occurrence of observation.queryOccurrences ?? []) {
+      remember(occurrence);
+    }
+    for (const atom of observation.activityAtoms ?? []) {
+      remember(atom);
+    }
+    for (const node of observation.executionNodes ?? []) {
+      remember(node);
+    }
+    for (const atom of observation.usageAtoms) {
+      remember({ ...atom, queryId: atom.queryId ?? atom.correlationId });
+    }
+  }
+
+  private async ensureDurableRepositoryHints(): Promise<void> {
+    if (this.durableRepositoryHintsLoaded) {
+      return;
+    }
+    if (!this.durableRepositoryHintsLoading) {
+      this.durableRepositoryHintsLoading = (async () => {
+        const occurrences = await this.outbox.storage.listQueryOccurrences();
+        for (const occurrence of occurrences) {
+          if (!occurrence.repositoryKey) {
+            continue;
+          }
+          addRepositoryHint(
+            this.repositoryKeysByQuery,
+            providerIdentityKey(occurrence.provider, occurrence.queryId),
+            occurrence.repositoryKey
+          );
+          for (const sessionId of uniqueStrings([occurrence.sessionId, occurrence.parentSessionId]
+            .filter((value): value is string => Boolean(value)))) {
+            addRepositoryHint(
+              this.repositoryKeysBySession,
+              providerIdentityKey(occurrence.provider, sessionId),
+              occurrence.repositoryKey
+            );
+          }
+        }
+        this.durableRepositoryHintsLoaded = true;
+      })().finally(() => {
+        this.durableRepositoryHintsLoading = undefined;
+      });
+    }
+    await this.durableRepositoryHintsLoading;
   }
 
   private async describeRepository(repoKey: string, repositoryRoot?: string): Promise<WebhookRepositoryV1> {
@@ -1452,16 +2261,41 @@ export class ExternalWebhookDispatchService {
     };
   }
 
-  private scheduleRetry(): void {
+  private scheduleRetry(nextAttemptAt?: string): void {
     if (!this.running) {
       return;
     }
+    const now = this.now();
+    const requestedAt = nextAttemptAt ? Date.parse(nextAttemptAt) : Number.NaN;
+    const dueAt = Number.isFinite(requestedAt)
+      ? Math.min(now + RETRY_INTERVAL_MS, Math.max(now, requestedAt))
+      : now + RETRY_INTERVAL_MS;
+    if (this.retryTimer && this.retryTimerDueAt != null && this.retryTimerDueAt <= dueAt) {
+      return;
+    }
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+    }
+    this.retryTimerDueAt = dueAt;
     this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      this.retryTimerDueAt = undefined;
       void this.processDueEntries()
         .catch(() => undefined)
-        .finally(() => this.scheduleRetry());
-    }, RETRY_INTERVAL_MS);
+        .finally(() => {
+          void this.scheduleNextPendingDelivery().catch(() => this.scheduleRetry());
+        });
+    }, Math.max(0, dueAt - this.now()));
     this.retryTimer.unref?.();
+  }
+
+  private async resumePendingDeliveries(): Promise<void> {
+    await this.processDueEntries();
+    await this.scheduleNextPendingDelivery();
+  }
+
+  private async scheduleNextPendingDelivery(): Promise<void> {
+    this.scheduleRetry(await this.outbox.nextAttemptAt());
   }
 
   private async processDueEntries(force = false): Promise<void> {
@@ -1477,15 +2311,16 @@ export class ExternalWebhookDispatchService {
         this.deliveryRerunRequested = false;
         currentForce = currentForce || this.deliveryRerunForce;
         this.deliveryRerunForce = false;
-        const entries = await this.outbox.list();
-        for (const entry of entries) {
-          if (
-            (entry.deliveryState === "pending" && (!entry.nextAttemptAt || Date.parse(entry.nextAttemptAt) <= this.now()))
-            || (entry.deliveryState === "retry" && (currentForce || !entry.nextAttemptAt || Date.parse(entry.nextAttemptAt) <= this.now()))
-            || (currentForce && entry.deliveryState === "blocked")
-          ) {
-            await this.deliver(entry);
-          }
+        const entries = await this.outbox.due(new Date(this.now()).toISOString(), currentForce);
+        // Re-read priority after each ordinary delivery so a newly accepted start
+        // cannot sit behind a stale snapshot of update traffic. A forced operator
+        // retry still attempts its original snapshot once per row.
+        const batch = currentForce ? entries : entries.slice(0, 1);
+        for (const entry of batch) {
+          await this.deliver(entry, currentForce);
+        }
+        if (!currentForce && entries.length > batch.length) {
+          this.deliveryRerunRequested = true;
         }
         currentForce = false;
       } while (this.deliveryRerunRequested);
@@ -1494,7 +2329,23 @@ export class ExternalWebhookDispatchService {
     }
   }
 
-  private async deliver(entry: WebhookOutboxEntry): Promise<void> {
+  private async deliver(entry: WebhookOutboxEntry, force = false): Promise<void> {
+    if (entry.event.eventType === "run.ended") {
+      await this.withRunEndedSubjectLock(entry.subjectId, async () => {
+        // The outbox row may have been replaced while processDueEntries was waiting
+        // for the subject lock. Deliver the current projection, never the stale copy.
+        const current = await this.outbox.read(entry.event.eventId);
+        if (!current || !outboxEntryDue(current, this.now(), force)) {
+          return;
+        }
+        await this.deliverUnlocked(current);
+      });
+      return;
+    }
+    await this.deliverUnlocked(entry);
+  }
+
+  private async deliverUnlocked(entry: WebhookOutboxEntry): Promise<void> {
     const configuration = this.configuration.readStored();
     if (
       (entry.eventType === "run.start" || entry.eventType === "run.update")
@@ -1537,16 +2388,17 @@ export class ExternalWebhookDispatchService {
       return;
     }
     if (entry.event.eventType === "run.ended") {
-      const quiescenceAt = this.runEndedLiveQuiescenceAttemptAt(entry.event, entry.subjectId);
-      if (quiescenceAt && Date.parse(quiescenceAt) > this.now()) {
+      const terminalDeadlineAt = this.runEndedDeliveryDeadlineAt(entry.event);
+      if (terminalDeadlineAt && Date.parse(terminalDeadlineAt) > this.now()) {
         await this.outbox.upsert({
           ...entry,
           deliveryState: "pending",
-          nextAttemptAt: quiescenceAt,
+          nextAttemptAt: terminalDeadlineAt,
           updatedAt: new Date(this.now()).toISOString()
         });
-        this.recordDeliveryLifecycle(entry, "pending", "run_ended_waiting_for_live_quiescence", {
-          nextAttemptAt: quiescenceAt
+        this.scheduleRetry(terminalDeadlineAt);
+        this.recordDeliveryLifecycle(entry, "pending", "run_ended_waiting_for_terminal_deadline", {
+          nextAttemptAt: terminalDeadlineAt
         });
         return;
       }
@@ -1561,8 +2413,9 @@ export class ExternalWebhookDispatchService {
     await this.outbox.upsert(attempting);
     this.recordDeliveryLifecycle(entry, "attempt_started", "webhook_delivery_attempt_started");
     try {
-      const result = await postWebhook(configuration, entry.event, attemptAt);
-      const deliveredAt = new Date(this.now()).toISOString();
+      const result = await postWebhook(configuration, entry.event, attemptAt, this.requestTimeoutMs);
+      const deliveredAtMs = this.now();
+      const deliveredAt = new Date(deliveredAtMs).toISOString();
       const delivered: WebhookOutboxEntry = {
         ...attempting,
         deliveryState: "delivered",
@@ -1574,7 +2427,9 @@ export class ExternalWebhookDispatchService {
       await this.outbox.upsert(delivered);
       await this.recordDeliveredSubject(delivered, deliveredAt);
       this.recordDeliveryLifecycle(entry, "delivered", "webhook_delivery_succeeded", {
-        statusCode: result.statusCode
+        statusCode: result.statusCode,
+        queueLatencyMs: elapsedMs(entry.queuedAt, deliveredAtMs),
+        observationLatencyMs: webhookObservationLatencyMs(entry.event, deliveredAtMs)
       });
     } catch (error) {
       const failure = asWebhookFailure(error);
@@ -1592,6 +2447,7 @@ export class ExternalWebhookDispatchService {
         updatedAt
       };
       await this.outbox.upsert(next);
+      this.scheduleRetry(nextAttemptAt);
       this.recordDeliveryLifecycle(
         entry,
         failure.retryable ? "retry_scheduled" : "blocked",
@@ -1628,17 +2484,70 @@ export class ExternalWebhookDispatchService {
     deliveredAt: string
   ): Promise<void> {
     const existing = await this.subjects.read(subjectId);
+    const deliveredVersion = event.version ?? 1;
+    const existingVersion = existing?.version ?? 0;
+    if (existing && existingVersion > deliveredVersion) {
+      await this.subjects.write({
+        ...existing,
+        deliveredAt: existing.deliveredAt ?? deliveredAt,
+        filesChangedCount: Math.max(existing.filesChangedCount ?? 0, (event.filesChanged ?? []).length),
+        updatedAt: deliveredAt
+      });
+      this.finalizeLiveSubjectAfterDelivery(event);
+      return;
+    }
     await this.subjects.write({
       schemaVersion: 1,
       subjectId,
       eventType: entry.eventType,
-      payloadHash: existing?.payloadHash ?? runEndedMeaningHash(event),
+      payloadHash: runEndedMeaningHash(event),
       eventId: event.eventId,
-      version: event.version ?? existing?.version,
+      version: deliveredVersion,
       deliveredAt,
       filesChangedCount: (event.filesChanged ?? []).length,
       updatedAt: deliveredAt
     });
+    this.finalizeLiveSubjectAfterDelivery(event);
+  }
+
+  private finalizeLiveSubjectAfterDelivery(event: RunEndedWebhookEventV1): void {
+    if (event.coverage.usageCoverage === "final") {
+      this.releaseLiveSubject(event.runId);
+      return;
+    }
+    const existing = this.liveSubjectReleaseTimers.get(event.runId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    const timer = setTimeout(() => {
+      this.liveSubjectReleaseTimers.delete(event.runId);
+      this.releaseLiveSubject(event.runId);
+    }, LIVE_TERMINAL_CORRECTION_RETENTION_MS);
+    timer.unref();
+    this.liveSubjectReleaseTimers.set(event.runId, timer);
+  }
+
+  private releaseLiveSubject(subjectRunId: string): void {
+    const releaseTimer = this.liveSubjectReleaseTimers.get(subjectRunId);
+    if (releaseTimer) {
+      clearTimeout(releaseTimer);
+      this.liveSubjectReleaseTimers.delete(subjectRunId);
+    }
+    this.liveRunStarts.delete(subjectRunId);
+    this.liveRunRepositories.delete(subjectRunId);
+    this.liveRunSources.delete(subjectRunId);
+    this.liveRunSubjects.delete(subjectRunId);
+    this.liveTerminalAnchors.delete(subjectRunId);
+    for (const [queryId, mappedSubjectRunId] of this.liveQuerySubjects) {
+      if (mappedSubjectRunId === subjectRunId) {
+        this.liveQuerySubjects.delete(queryId);
+      }
+    }
+    for (const [sessionId, mappedSubjectRunId] of this.liveSessionSubjects) {
+      if (mappedSubjectRunId === subjectRunId) {
+        this.liveSessionSubjects.delete(sessionId);
+      }
+    }
   }
 
   private async runEndedDeliveredForLifecycleSubject(
@@ -1671,36 +2580,68 @@ export class ExternalWebhookDispatchService {
     return entry?.event.eventType === "run.ended" ? entry.event : undefined;
   }
 
-  private runEndedLiveQuiescenceAttemptAt(event: RunEndedWebhookEventV1, subjectId: string): string | undefined {
-    const runSubject = runSubjectFromLifecycleSubject("run.ended", subjectId);
-    const subject = runSubject ? this.liveRunSubjects.get(runSubject) : undefined;
-    if (!subject) {
-      return undefined;
-    }
-    const lastObservedMs = Date.parse(subject.lastObservedAt);
+  private runEndedDeliveryDeadlineAt(event: RunEndedWebhookEventV1): string | undefined {
     const endedMs = Date.parse(event.endedAt);
-    if (!Number.isFinite(lastObservedMs) || !Number.isFinite(endedMs)) {
+    if (!Number.isFinite(endedMs)) {
       return undefined;
     }
-    if (lastObservedMs <= endedMs && this.now() - lastObservedMs >= RUN_ENDED_GRACE_MS) {
+    const deadlineMs = endedMs + this.runEndedGraceMs;
+    if (deadlineMs <= this.now()) {
       return undefined;
     }
-    return new Date(Math.max(lastObservedMs + RUN_ENDED_GRACE_MS, this.now())).toISOString();
+    return new Date(deadlineMs).toISOString();
   }
 
-  private async safeUsageAtoms(): Promise<SafeUsageAtomV1[]> {
-    return await this.outbox.storage.listSafeUsageAtoms();
+  private runUpdateSettlingDeadlineAt(event: RunUpdatedWebhookEventV1): string | undefined {
+    const updatedMs = Date.parse(event.updatedAt);
+    if (!Number.isFinite(updatedMs)) {
+      return undefined;
+    }
+    const deadlineMs = updatedMs + this.runEndedGraceMs;
+    return deadlineMs > this.now() ? new Date(deadlineMs).toISOString() : undefined;
   }
 
-  private mergeLiveRunUpdate(event: RunUpdatedWebhookEventV1): RunUpdatedWebhookEventV1 {
-    const previous = this.liveRunUpdates.get(event.runId);
-    const merged = previous ? mergeRunUpdatedWebhookEvents(previous, event) : event;
-    const versioned = {
-      ...merged,
-      eventId: liveRunUpdateEventId(merged)
+  private async safeUsageAtomsForQueryIds(queryIds: string[]): Promise<SafeUsageAtomV1[]> {
+    return await this.outbox.storage.listSafeUsageAtomsForQueryIds(queryIds);
+  }
+
+  private async isCustomerVisibleCompletedRun(run: ProductionRunV1): Promise<boolean> {
+    if (run.provider !== "codex") {
+      return true;
+    }
+    const occurrence = await this.outbox.storage.readQueryOccurrence(run.queryId ?? run.correlationId);
+    return occurrence?.lifecycleVisibility !== "internal";
+  }
+
+  private async customerVisibleObservation(observation: SafeObservationV1): Promise<SafeObservationV1> {
+    if (observation.provider !== "codex") {
+      return observation;
+    }
+    const queryIds = observationQueryIds(observation);
+    const internalQueryIds = new Set((observation.queryOccurrences ?? [])
+      .filter((occurrence) => occurrence.lifecycleVisibility === "internal")
+      .map((occurrence) => occurrence.queryId));
+    const durableOccurrences = await Promise.all(queryIds.map((queryId) =>
+      this.outbox.storage.readQueryOccurrence(queryId)));
+    for (const occurrence of durableOccurrences) {
+      if (occurrence?.lifecycleVisibility === "internal") {
+        internalQueryIds.add(occurrence.queryId);
+      }
+    }
+    if (internalQueryIds.size === 0) {
+      return observation;
+    }
+    return {
+      ...observation,
+      queryOccurrences: (observation.queryOccurrences ?? [])
+        .filter((occurrence) => !internalQueryIds.has(occurrence.queryId)),
+      activityAtoms: (observation.activityAtoms ?? [])
+        .filter((atom) => !internalQueryIds.has(atom.queryId)),
+      executionNodes: (observation.executionNodes ?? [])
+        .filter((node) => !internalQueryIds.has(node.queryId)),
+      usageAtoms: observation.usageAtoms
+        .filter((atom) => !internalQueryIds.has(atom.queryId ?? atom.correlationId))
     };
-    this.liveRunUpdates.set(event.runId, versioned);
-    return versioned;
   }
 
   private webhookSender(): WebhookSenderV1 {
@@ -1899,8 +2840,47 @@ class SqliteWebhookOutbox {
       .sort(compareWebhookOutboxEntries);
   }
 
+  async status(): Promise<{
+    pendingCount: number;
+    retryCount: number;
+    blockedCount: number;
+    deliveredCount: number;
+    oldestQueuedAt?: string;
+    lastDeliveredAt?: string;
+    lastErrorCode?: string;
+    activeEntries: WebhookOutboxEntry[];
+  }> {
+    const snapshot = await this.storage.webhookOutboxStatus<WebhookOutboxEntry>();
+    return {
+      ...snapshot,
+      activeEntries: snapshot.activeEntries
+        .map((document) => document.value)
+        .sort(compareWebhookOutboxEntries)
+    };
+  }
+
+  async lifecycle(identity: { runId?: string; traceId?: string; sessionId?: string }): Promise<WebhookOutboxEntry[]> {
+    return (await this.storage.listWebhookLifecycleDocuments<WebhookOutboxEntry>(identity))
+      .map((document) => document.value)
+      .sort(compareWebhookOutboxEntries);
+  }
+
+  async deliveredWritingRunIds(): Promise<string[]> {
+    return await this.storage.listDeliveredWritingLifecycleRunIds();
+  }
+
   async read(key: string): Promise<WebhookOutboxEntry | undefined> {
-    return (await this.list()).find((entry) => entry.key === key);
+    return (await this.storage.readAgentDocument<WebhookOutboxEntry>("webhook_outbox", key))?.value;
+  }
+
+  async due(now: string, force: boolean): Promise<WebhookOutboxEntry[]> {
+    return (await this.storage.listWebhookOutboxDueDocuments<WebhookOutboxEntry>(now, force))
+      .map((document) => document.value)
+      .sort(compareWebhookOutboxEntries);
+  }
+
+  async nextAttemptAt(): Promise<string | undefined> {
+    return await this.storage.nextWebhookOutboxAttemptAt();
   }
 
   async upsert(entry: WebhookOutboxEntry): Promise<void> {
@@ -1951,9 +2931,7 @@ class SqliteWebhookSubjectStateStore {
   constructor(private readonly storage: AgentStorageClient) {}
 
   async read(subjectId: string): Promise<WebhookSubjectState | undefined> {
-    return (await this.storage.listAgentDocuments<WebhookSubjectState>("webhook_delivery_state"))
-      .map((document) => document.value)
-      .find((entry) => entry.subjectId === subjectId);
+    return (await this.storage.readAgentDocument<WebhookSubjectState>("webhook_delivery_state", subjectId))?.value;
   }
 
   async list(): Promise<WebhookSubjectState[]> {
@@ -1988,6 +2966,14 @@ function blockedEntry(
   };
 }
 
+function outboxEntryDue(entry: WebhookOutboxEntry, now: number, force: boolean): boolean {
+  const nextAttemptAt = entry.nextAttemptAt ? Date.parse(entry.nextAttemptAt) : Number.NaN;
+  const dueByTime = !Number.isFinite(nextAttemptAt) || nextAttemptAt <= now;
+  return (entry.deliveryState === "pending" && dueByTime)
+    || (entry.deliveryState === "retry" && (force || dueByTime))
+    || (force && entry.deliveryState === "blocked");
+}
+
 function statusItemFromEntry(entry: WebhookOutboxEntry): AgentWebhookDeliveryItemV1 {
   return {
     schemaVersion: 1,
@@ -2014,11 +3000,38 @@ function compareWebhookOutboxEntries(left: WebhookOutboxEntry, right: WebhookOut
       || left.updatedAt.localeCompare(right.updatedAt)
       || left.key.localeCompare(right.key);
   }
+  const priorityOrder = webhookDeliveryPriority(left) - webhookDeliveryPriority(right);
+  if (priorityOrder !== 0) {
+    return priorityOrder;
+  }
   const updatedAtOrder = left.updatedAt.localeCompare(right.updatedAt);
   if (updatedAtOrder !== 0) {
     return updatedAtOrder;
   }
   return left.key.localeCompare(right.key);
+}
+
+function webhookDeliveryPriority(entry: WebhookOutboxEntry): number {
+  if (entry.deliveryState === "delivered") {
+    return 20;
+  }
+  const lifecycle = lifecycleSortKey(entry);
+  if (lifecycle) {
+    const eventPriority = entry.eventType === "run.start"
+      ? 0
+      : entry.eventType === "run.update"
+        ? 1
+        : 2;
+    const statePriority = entry.deliveryState === "pending" && entry.attempts === 0
+      ? 0
+      : entry.deliveryState === "pending"
+        ? 3
+        : entry.deliveryState === "retry"
+          ? 6
+          : 9;
+    return statePriority + eventPriority;
+  }
+  return entry.deliveryState === "pending" || entry.deliveryState === "retry" ? 12 : 13;
 }
 
 function lifecycleSortKey(entry: WebhookOutboxEntry): { runSubject: string; order: number } | undefined {
@@ -2072,6 +3085,15 @@ function queueAgeMs(entry: Pick<WebhookOutboxEntry, "queuedAt">, now: number): n
   return Number.isFinite(queuedAt) ? Math.max(0, now - queuedAt) : undefined;
 }
 
+function elapsedMs(startedAt: string, now: number): number | null {
+  const startedAtMs = Date.parse(startedAt);
+  return Number.isFinite(startedAtMs) ? Math.max(0, now - startedAtMs) : null;
+}
+
+function webhookObservationLatencyMs(event: WebhookEventV1, now: number): number | null {
+  return event.eventType === "commit.attributed" ? null : elapsedMs(event.evidence.observedAt, now);
+}
+
 function normalizeCostEstimateBasis(value?: CostEstimateBasis): CostEstimateBasis {
   return value ?? "unavailable";
 }
@@ -2104,14 +3126,14 @@ function webhookEvidence(
 }
 
 function evidenceForRun(run: ProductionRunV1, basis: WebhookEvidenceV1["basis"]): WebhookEvidenceV1 {
-  const observedAt = basis === "stop_hook"
+  const observedAt = basis === "stop_hook" || basis === "usage_projection"
     ? (run.endedAt ?? run.startedAt)
     : run.startedAt;
   return webhookEvidence(
     basis,
     run.queryId ?? run.correlationId ?? run.runId,
     observedAt,
-    false
+    basis === "usage_projection"
   );
 }
 
@@ -2148,80 +3170,216 @@ function activityCoverageForRun(
   return (run.breakdown?.length ?? 0) > 0 ? "complete_for_reported_surface" : "partial";
 }
 
-function updatedAtForLifecycle(startedAt: string, endedAt: string): string {
-  const startedMs = Date.parse(startedAt);
-  const endedMs = Date.parse(endedAt);
-  if (!Number.isFinite(startedMs) || !Number.isFinite(endedMs) || endedMs <= startedMs) {
-    return endedAt;
-  }
-  return new Date(Math.floor((startedMs + endedMs) / 2)).toISOString();
-}
-
 function activityForRun(
   run: ProductionRunV1,
   endedAt: string,
   runEvidence: WebhookEvidenceV1
 ): RunLifecycleActivityWebhookV1[] {
-  const breakdown = (run.breakdown ?? []).filter((item) => item.kind !== "unallocated");
-  if (breakdown.length === 0) {
-    return [fallbackRunActivity(run, endedAt, runEvidence)];
-  }
-  return breakdown.map((item, index) => activityFromBreakdown(run, endedAt, item, index));
+  const breakdown = conservingRunBreakdown(run);
+  const indexByBreakdownId = new Map(breakdown.map((item, index) => [item.breakdownId, index]));
+  return breakdown.map((item, index) => activityFromBreakdown(
+    run,
+    endedAt,
+    item,
+    index,
+    runEvidence,
+    item.parentBreakdownId
+      ? breakdownActivityId(run, item.parentBreakdownId, indexByBreakdownId.get(item.parentBreakdownId))
+      : undefined
+  ));
 }
 
-function fallbackRunActivity(
-  run: ProductionRunV1,
-  endedAt: string,
-  evidence: WebhookEvidenceV1
-): RunLifecycleActivityWebhookV1 {
-  return {
-    activityId: `activity_${contentHash({ runId: run.runId, kind: "llm_request" }).slice(0, 24)}`,
-    kind: "llm_request",
-    name: run.model ?? run.models?.[0] ?? "llm_request",
-    outcome: "success",
-    startedAt: run.startedAt,
-    endedAt,
-    durationMs: durationMs(run.startedAt, endedAt),
-    inputTokens: run.inputTokens,
-    outputTokens: run.outputTokens,
-    cacheReadInputTokens: run.cacheReadInputTokens,
-    cacheCreationInputTokens: run.cacheCreationInputTokens,
-    reasoningOutputTokens: run.reasoningOutputTokens,
-    totalTokens: run.totalTokens,
-    evidence
-  };
+function conservingRunBreakdown(run: ProductionRunV1): RunBreakdownV1[] {
+  if ((run.breakdown?.length ?? 0) === 0) {
+    return [{
+      schemaVersion: 1,
+      breakdownId: `brk_${contentHash({ runId: run.runId, kind: "run_usage" })}`,
+      kind: "request",
+      name: run.model ?? run.models?.[0] ?? "llm_request",
+      count: Math.max(1, run.context?.observedLlmRequestCount ?? 1),
+      failureCount: 0,
+      totalDurationMs: durationMs(run.startedAt, run.endedAt ?? run.startedAt),
+      inputTokens: run.inputTokens,
+      outputTokens: run.outputTokens,
+      cacheReadInputTokens: run.cacheReadInputTokens,
+      cacheCreationInputTokens: run.cacheCreationInputTokens,
+      reasoningOutputTokens: run.reasoningOutputTokens,
+      totalTokens: run.inputTokens + run.outputTokens,
+      attributionBasis: "unavailable",
+      coverage: "unavailable"
+    }];
+  }
+
+  const remaining = tokenTotalsForRun(run);
+  const normalized = run.breakdown!.map((item) => {
+    const usage = breakdownTokenTotals(item);
+    if (!usage.present) {
+      return item;
+    }
+    const conserves = usage.valid
+      && usage.inputTokens <= remaining.inputTokens
+      && usage.outputTokens <= remaining.outputTokens
+      && usage.cacheReadInputTokens <= remaining.cacheReadInputTokens
+      && usage.cacheCreationInputTokens <= remaining.cacheCreationInputTokens
+      && usage.reasoningOutputTokens <= remaining.reasoningOutputTokens;
+    if (!conserves) {
+      return withoutBreakdownUsage(item);
+    }
+    remaining.inputTokens -= usage.inputTokens;
+    remaining.outputTokens -= usage.outputTokens;
+    remaining.cacheReadInputTokens -= usage.cacheReadInputTokens;
+    remaining.cacheCreationInputTokens -= usage.cacheCreationInputTokens;
+    remaining.reasoningOutputTokens -= usage.reasoningOutputTokens;
+    remaining.totalTokens = remaining.inputTokens + remaining.outputTokens;
+    return {
+      ...item,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      reasoningOutputTokens: usage.reasoningOutputTokens,
+      totalTokens: usage.totalTokens
+    };
+  });
+  if (!hasTokenUsage(remaining)) {
+    return normalized;
+  }
+  const hasAttributedUsage = normalized.some((item) => hasTokenUsage(breakdownTokenTotals(item)));
+  return [...normalized, {
+    schemaVersion: 1,
+    breakdownId: `brk_${contentHash({ runId: run.runId, kind: "unallocated" })}`,
+    kind: "unallocated",
+    name: "Unallocated run usage",
+    count: 1,
+    failureCount: 0,
+    ...remaining,
+    attributionBasis: "unavailable",
+    coverage: hasAttributedUsage ? "partial" : "unavailable"
+  }];
 }
 
 function activityFromBreakdown(
   run: ProductionRunV1,
   endedAt: string,
   breakdown: RunBreakdownV1,
-  index: number
+  index: number,
+  runEvidence: WebhookEvidenceV1,
+  parentActivityId?: string
 ): RunLifecycleActivityWebhookV1 {
   const activityEndedAt = breakdown.totalDurationMs
     ? new Date(Math.min(Date.parse(endedAt), Date.parse(run.startedAt) + breakdown.totalDurationMs)).toISOString()
     : endedAt;
   return {
-    activityId: `activity_${contentHash({ runId: run.runId, breakdownId: breakdown.breakdownId, index }).slice(0, 24)}`,
+    activityId: breakdownActivityId(run, breakdown.breakdownId, index),
+    ...(parentActivityId ? { parentActivityId } : {}),
     kind: webhookActivityKind(breakdown.kind),
     name: safeActivityName(breakdown.name || breakdown.kind),
-    outcome: breakdown.failureCount > 0 && breakdown.failureCount >= breakdown.count ? "failure" : "success",
+    outcome: webhookActivityOutcome(breakdown),
+    count: breakdown.count,
+    failureCount: breakdown.failureCount,
+    ...(breakdown.unknownCount != null ? { unknownCount: breakdown.unknownCount } : {}),
     startedAt: run.startedAt,
     endedAt: activityEndedAt,
     durationMs: breakdown.totalDurationMs,
+    resultSizeBytes: breakdown.resultSizeBytes,
+    providerReportedResultTokens: breakdown.providerReportedResultTokens,
     inputTokens: breakdown.inputTokens,
     outputTokens: breakdown.outputTokens,
     cacheReadInputTokens: breakdown.cacheReadInputTokens,
     cacheCreationInputTokens: breakdown.cacheCreationInputTokens,
     reasoningOutputTokens: breakdown.reasoningOutputTokens,
     totalTokens: breakdown.totalTokens,
-    evidence: webhookEvidence(
-      breakdown.attributionBasis === "provider_reported" ? "provider_metric" : "trace_span",
-      breakdown.breakdownId,
-      run.startedAt,
-      breakdown.attributionBasis !== "provider_reported"
-    )
+    usageAttributionBasis: breakdown.attributionBasis,
+    usageCoverage: breakdown.coverage,
+    evidence: runEvidence
   };
+}
+
+function breakdownActivityId(run: ProductionRunV1, breakdownId: string, index?: number): string {
+  return `activity_${contentHash({ runId: run.runId, breakdownId, index: index ?? -1 }).slice(0, 24)}`;
+}
+
+function webhookActivityOutcome(breakdown: RunBreakdownV1): RunLifecycleActivityWebhookV1["outcome"] {
+  if (
+    breakdown.kind === "unallocated"
+    || ((breakdown.kind === "model" || breakdown.kind === "request") && breakdown.attributionBasis === "unavailable")
+  ) {
+    return "unknown";
+  }
+  const unknownCount = breakdown.unknownCount ?? 0;
+  if (breakdown.failureCount === 0 && unknownCount === 0) {
+    return "success";
+  }
+  return breakdown.failureCount >= breakdown.count && unknownCount === 0 ? "failure" : "unknown";
+}
+
+function breakdownTokenTotals(breakdown: RunBreakdownV1): RunTokenTotals & { present: boolean; valid: boolean } {
+  const present = breakdown.inputTokens != null
+    || breakdown.outputTokens != null
+    || breakdown.cacheReadInputTokens != null
+    || breakdown.cacheCreationInputTokens != null
+    || breakdown.reasoningOutputTokens != null;
+  const inputTokens = nonNegativeToken(breakdown.inputTokens);
+  const outputTokens = nonNegativeToken(breakdown.outputTokens);
+  const valid = [
+    breakdown.inputTokens,
+    breakdown.outputTokens,
+    breakdown.cacheReadInputTokens,
+    breakdown.cacheCreationInputTokens,
+    breakdown.reasoningOutputTokens
+  ].every((value) => value == null || isNonNegativeSafeInteger(value))
+    && (breakdown.totalTokens == null
+      || (isNonNegativeSafeInteger(breakdown.totalTokens) && breakdown.totalTokens === inputTokens + outputTokens));
+  return {
+    present,
+    valid,
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens: nonNegativeToken(breakdown.cacheReadInputTokens),
+    cacheCreationInputTokens: nonNegativeToken(breakdown.cacheCreationInputTokens),
+    reasoningOutputTokens: nonNegativeToken(breakdown.reasoningOutputTokens),
+    totalTokens: inputTokens + outputTokens
+  };
+}
+
+function tokenTotalsForRun(run: ProductionRunV1): RunTokenTotals {
+  return {
+    inputTokens: nonNegativeToken(run.inputTokens),
+    outputTokens: nonNegativeToken(run.outputTokens),
+    cacheReadInputTokens: nonNegativeToken(run.cacheReadInputTokens),
+    cacheCreationInputTokens: nonNegativeToken(run.cacheCreationInputTokens),
+    reasoningOutputTokens: nonNegativeToken(run.reasoningOutputTokens),
+    totalTokens: nonNegativeToken(run.inputTokens) + nonNegativeToken(run.outputTokens)
+  };
+}
+
+function withoutBreakdownUsage(breakdown: RunBreakdownV1): RunBreakdownV1 {
+  const {
+    inputTokens: _inputTokens,
+    outputTokens: _outputTokens,
+    cacheReadInputTokens: _cacheReadInputTokens,
+    cacheCreationInputTokens: _cacheCreationInputTokens,
+    reasoningOutputTokens: _reasoningOutputTokens,
+    totalTokens: _totalTokens,
+    ...metadata
+  } = breakdown;
+  return {
+    ...metadata,
+    attributionBasis: breakdown.kind === "unallocated" ? "unavailable" : "activity_only",
+    coverage: "unavailable"
+  };
+}
+
+function hasTokenUsage(totals: RunTokenTotals): boolean {
+  return totals.inputTokens > 0
+    || totals.outputTokens > 0
+    || totals.cacheReadInputTokens > 0
+    || totals.cacheCreationInputTokens > 0
+    || totals.reasoningOutputTokens > 0;
+}
+
+function nonNegativeToken(value: number | undefined): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 function webhookActivityKind(kind: RunBreakdownV1["kind"]): RunLifecycleActivityWebhookV1["kind"] {
@@ -2287,6 +3445,9 @@ function isLiveLifecycleAnchorOccurrence(
   provider: SafeObservationV1["provider"],
   occurrence: QueryOccurrenceV1
 ): boolean {
+  if (occurrence.lifecycleVisibility === "internal") {
+    return false;
+  }
   if (provider === "codex") {
     return occurrence.evidence === "submission_hook";
   }
@@ -2294,6 +3455,36 @@ function isLiveLifecycleAnchorOccurrence(
     return occurrence.evidence === "provider_root_span" || occurrence.evidence === "provider_user_message_event";
   }
   return isPromptStartOccurrence(occurrence);
+}
+
+function isExplicitLiveTerminalOccurrence(
+  occurrence: QueryOccurrenceV1
+): occurrence is QueryOccurrenceV1 & {
+  completedAt: string;
+  completionEvidence: NonNullable<QueryOccurrenceV1["completionEvidence"]>;
+} {
+  return typeof occurrence.completedAt === "string"
+    && occurrence.completedAt.trim() !== ""
+    && occurrence.completionEvidence != null
+    && occurrence.completionEvidence !== "inactivity";
+}
+
+function liveTerminalEvidenceBasis(
+  completionEvidence: NonNullable<QueryOccurrenceV1["completionEvidence"]>,
+  signal: SafeObservationV1["signal"]
+): WebhookEvidenceV1["basis"] {
+  switch (completionEvidence) {
+    case "stop_hook":
+      return "stop_hook";
+    case "session_hook":
+      return "session_hook";
+    case "closed_root_span":
+      return "root_span";
+    case "provider_completed_event":
+      return signal === "traces" ? "root_span" : "otel_event";
+    case "inactivity":
+      return "inactivity";
+  }
 }
 
 function liveStartEvidenceBasis(
@@ -2347,7 +3538,7 @@ function canonicalizeLiveUpdatedEvent(
     sessionId: subject.sessionId,
     traceIds: uniqueStrings([...event.traceIds, queryId, ...subject.queryIds]),
     repository: subject.repository,
-    startedAt: earliestIso([subject.startedAt, event.startedAt]),
+    startedAt: subject.startedAt,
     updatedAt: latestIso([subject.lastObservedAt, event.updatedAt])
   };
 }
@@ -2426,6 +3617,152 @@ function projectLiveRunUpdatedEvents(
   });
 }
 
+function projectLiveSubjectRunUpdatedEvent(
+  observation: SafeObservationV1,
+  repository: WebhookRepositoryV1,
+  sender: WebhookSenderV1,
+  subject: LiveLifecycleSubject
+): RunUpdatedWebhookEventV1 | undefined {
+  const corroboratedObservation = suppressCorroboratingLiveUsageDuplicates(observation);
+  const subjectQueryIds = new Set(subject.queryIds);
+  const events = projectLiveRunUpdatedEvents(corroboratedObservation, repository, sender)
+    .filter((projection) => subjectQueryIds.has(projection.queryId))
+    .map((projection) => projection.event)
+    .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.runId.localeCompare(right.runId));
+  const latest = events.at(-1);
+  if (!latest) {
+    return undefined;
+  }
+  const activity = mergeLifecycleActivity([], events.flatMap((event) => event.activity));
+  const tokenTotals = tokenTotalsFromLifecycleActivity(activity);
+  const cost = aggregateLiveRunUpdateCost(events);
+  let context = events[0]?.context;
+  for (const event of events.slice(1)) {
+    context = mergeRunUpdateContextFootprint(context, event.context, tokenTotals, activity);
+  }
+  return {
+    ...latest,
+    eventId: eventIdFor("run.update", subject.subjectRunId),
+    runId: subject.subjectRunId,
+    sessionId: subject.sessionId,
+    traceIds: uniqueStrings(events.flatMap((event) => event.traceIds)),
+    repository: subject.repository,
+    codingHarness: subject.provider,
+    runtime: subject.runtime,
+    startedAt: subject.startedAt,
+    coverage: webhookCoverage(
+      tokenTotals.totalTokens > 0 ? "complete_so_far" : "none",
+      activity.length > 0 ? "partial" : "none",
+      cost.costCoverage
+    ),
+    sequence: 2,
+    updatedAt: latestIso(events.map((event) => event.updatedAt)),
+    state: "running",
+    ...tokenTotals,
+    llmModels: uniqueStrings(events.flatMap((event) => event.llmModels)),
+    ...cost,
+    ...(context ? { context } : {}),
+    activity
+  };
+}
+
+function liveTerminalUsageCoverage(
+  observation: SafeObservationV1,
+  totalTokens: number
+): WebhookCoverageV1["usageCoverage"] {
+  if (totalTokens <= 0) {
+    return "none";
+  }
+  const corroborated = suppressCorroboratingLiveUsageDuplicates(observation);
+  const usageByQuery = groupByQueryId(corroborated.usageAtoms);
+  if (usageByQuery.size === 0) {
+    return "complete_so_far";
+  }
+  return [...usageByQuery.values()].every((atoms) =>
+    atoms.some(isClosedAuthoritativeRunBoundaryAtom)
+  )
+    ? "final"
+    : "complete_so_far";
+}
+
+function suppressCorroboratingLiveUsageDuplicates(observation: SafeObservationV1): SafeObservationV1 {
+  const requestEvidence = observation.usageAtoms.filter((atom) =>
+    atom.authority === "request" || atom.authority === "model"
+  );
+  if (requestEvidence.length === 0) {
+    return observation;
+  }
+  const duplicateAtomIds = new Set<string>();
+  for (const atom of observation.usageAtoms) {
+    if (atom.authority !== "event") {
+      continue;
+    }
+    const candidates = requestEvidence.filter((candidate) =>
+      corroboratesLiveUsageAtom(atom, candidate)
+    );
+    if (candidates.length === 1) {
+      duplicateAtomIds.add(atom.atomId);
+    }
+  }
+  if (duplicateAtomIds.size === 0) {
+    return observation;
+  }
+  const usageByQuery = groupByQueryId(observation.usageAtoms);
+  const fullyCorroboratedQueryIds = new Set<string>();
+  for (const [queryId, atoms] of usageByQuery) {
+    if (atoms.length > 0 && atoms.every((atom) => duplicateAtomIds.has(atom.atomId))) {
+      fullyCorroboratedQueryIds.add(queryId);
+    }
+  }
+  return {
+    ...observation,
+    usageAtoms: observation.usageAtoms.filter((atom) => !duplicateAtomIds.has(atom.atomId)),
+    executionNodes: (observation.executionNodes ?? []).filter((node) =>
+      node.nodeKind !== "llm_request" || !fullyCorroboratedQueryIds.has(node.queryId)
+    )
+  };
+}
+
+function corroboratesLiveUsageAtom(event: SafeUsageAtomV1, request: SafeUsageAtomV1): boolean {
+  if (
+    event.provider !== request.provider
+    || event.signal === request.signal
+    || event.sourceId === request.sourceId
+    || (event.queryId ?? event.correlationId) === (request.queryId ?? request.correlationId)
+    || event.billingContext !== request.billingContext
+    || (event.model && request.model && event.model !== request.model)
+  ) {
+    return false;
+  }
+  const eventCompletedMs = Date.parse(event.endedAt ?? event.startedAt);
+  const requestCompletedMs = Date.parse(request.endedAt ?? request.startedAt);
+  if (
+    !Number.isFinite(eventCompletedMs)
+    || !Number.isFinite(requestCompletedMs)
+    || Math.abs(eventCompletedMs - requestCompletedMs) > LIVE_USAGE_CORROBORATION_MS
+  ) {
+    return false;
+  }
+  return tokenDimensionsEqual(event, request);
+}
+
+function groupByQueryId(atoms: SafeUsageAtomV1[]): Map<string, SafeUsageAtomV1[]> {
+  const grouped = new Map<string, SafeUsageAtomV1[]>();
+  for (const atom of atoms) {
+    const queryId = atom.queryId ?? atom.correlationId;
+    grouped.set(queryId, [...(grouped.get(queryId) ?? []), atom]);
+  }
+  return grouped;
+}
+
+function tokenDimensionsEqual(left: SafeUsageAtomV1, right: SafeUsageAtomV1): boolean {
+  return nonNegativeToken(left.inputTokens) === nonNegativeToken(right.inputTokens)
+    && nonNegativeToken(left.outputTokens) === nonNegativeToken(right.outputTokens)
+    && nonNegativeToken(left.cacheReadInputTokens) === nonNegativeToken(right.cacheReadInputTokens)
+    && nonNegativeToken(left.cacheCreationInputTokens) === nonNegativeToken(right.cacheCreationInputTokens)
+    && nonNegativeToken(left.reasoningOutputTokens) === nonNegativeToken(right.reasoningOutputTokens);
+}
+
 function liveUpdateQueryIds(observation: SafeObservationV1): string[] {
   return uniqueStrings([
     ...observation.usageAtoms.map((atom) => atom.queryId ?? atom.correlationId),
@@ -2433,6 +3770,15 @@ function liveUpdateQueryIds(observation: SafeObservationV1): string[] {
     ...(observation.executionNodes ?? [])
       .filter((node) => node.nodeKind !== "prompt")
       .map((node) => node.queryId)
+  ]);
+}
+
+function observationQueryIds(observation: SafeObservationV1): string[] {
+  return uniqueStrings([
+    ...(observation.queryOccurrences ?? []).map((occurrence) => occurrence.queryId),
+    ...observation.usageAtoms.map((atom) => atom.queryId ?? atom.correlationId),
+    ...(observation.activityAtoms ?? []).map((atom) => atom.queryId),
+    ...(observation.executionNodes ?? []).map((node) => node.queryId)
   ]);
 }
 
@@ -2445,7 +3791,9 @@ function mergeRunUpdatedWebhookEvents(
   const context = mergeRunUpdateContextFootprint(previous.context, next.context, tokenTotals, activity);
   const merged: RunUpdatedWebhookEventV1 = {
     ...next,
-    startedAt: earliestIso([previous.startedAt, next.startedAt]),
+    // The first delivered lifecycle anchor is public identity. A later usage
+    // projection can improve terminal facts, but never move the run's start.
+    startedAt: previous.startedAt,
     traceIds: uniqueStrings([...previous.traceIds, ...next.traceIds]),
     evidence: next.evidence,
     coverage: next.coverage,
@@ -2537,6 +3885,31 @@ function unavailableLiveRunUpdateCost(): LiveRunUpdateCost {
     estimatedNanoUsd: 0,
     costEstimateBasis: "unavailable",
     costCoverage: "unavailable"
+  };
+}
+
+function aggregateLiveRunUpdateCost(events: RunUpdatedWebhookEventV1[]): LiveRunUpdateCost {
+  const usageEvents = events.filter((event) => event.totalTokens > 0);
+  const costs = usageEvents.map(liveRunUpdateCostFromEvent);
+  const priced = costs.filter((cost) => cost.costCoverage !== "unavailable");
+  if (priced.length === 0) {
+    return unavailableLiveRunUpdateCost();
+  }
+  const bases = uniqueStrings(priced.map((cost) => cost.costEstimateBasis)
+    .filter((basis) => basis !== "unavailable"));
+  const usageValues = priced
+    .map((cost) => cost.usageValueNanoUsd)
+    .filter((value): value is number => typeof value === "number");
+  return {
+    estimatedNanoUsd: sumOptionalNumbers(priced.map((cost) => cost.estimatedNanoUsd)),
+    ...(usageValues.length > 0 ? { usageValueNanoUsd: sumOptionalNumbers(usageValues) } : {}),
+    costEstimateBasis: bases.length === 1
+      ? bases[0] as CostEstimateBasis
+      : "unavailable",
+    costCoverage: priced.length === usageEvents.length
+      && priced.every((cost) => cost.costCoverage === "complete")
+      ? "complete"
+      : "partial"
   };
 }
 
@@ -2705,18 +4078,20 @@ function mergeRunUpdateContextFootprint(
 }
 
 function observedLlmRequestActivityCount(activity: RunLifecycleActivityWebhookV1[]): number {
-  return activity.filter((item) =>
-    item.kind === "llm_request"
-    && (
-      (item.inputTokens ?? 0) > 0
-      || (item.cacheReadInputTokens ?? 0) > 0
-      || (item.cacheCreationInputTokens ?? 0) > 0
-    )
-  ).length;
+  return activity.reduce((count, item) =>
+    count + (item.kind === "llm_request"
+      && (
+        (item.inputTokens ?? 0) > 0
+        || (item.cacheReadInputTokens ?? 0) > 0
+        || (item.cacheCreationInputTokens ?? 0) > 0
+      )
+      ? (item.count ?? 1)
+      : 0), 0);
 }
 
 function liveRunUpdateEventId(event: RunUpdatedWebhookEventV1): string {
-  return eventIdFor("run.update", `${event.runId}|${event.updatedAt}|${event.activity.map((item) => item.activityId).join(",")}`);
+  const { eventId: _eventId, ...meaning } = event;
+  return eventIdFor("run.update", contentHash(meaning));
 }
 
 function liveSessionId(observation: SafeObservationV1, queryId: string): string {
@@ -2749,47 +4124,209 @@ function liveWebhookActivity(
     kind: atom.kind,
     name: atom.name,
     outcome: atom.outcome,
+    count: 1,
+    failureCount: atom.outcome === "failure" || atom.outcome === "rejected" ? 1 : 0,
+    unknownCount: atom.outcome === "unknown" ? 1 : 0,
     startedAt: atom.startedAt,
     endedAt: atom.endedAt,
     durationMs: atom.durationMs,
+    resultSizeBytes: atom.resultSizeBytes,
+    providerReportedResultTokens: atom.providerReportedResultTokens,
+    usageAttributionBasis: "activity_only",
+    usageCoverage: "unavailable",
     evidence: webhookEvidenceForActivityAtom(atom, observation)
   }));
-  if (fromActivities.length > 0) {
-    return fromActivities;
-  }
-  const llmNode = executionNodes.find((node) => node.nodeKind === "llm_request");
-  if (llmNode) {
-    return [{
-      activityId: `activity_${contentHash({ queryId, nodeId: llmNode.nodeId }).slice(0, 24)}`,
+  const llmNodes = executionNodes.filter((node) => node.nodeKind === "llm_request");
+  const activityScopeId = liveActivityAuthorityScopeId(queryId, usageAtoms, llmNodes);
+  if (llmNodes.length > 0 && usageAtoms.length > 0) {
+    const llmNode = llmNodes[0];
+    const requestCount = liveLlmRequestCount(usageAtoms, llmNodes);
+    const failureCount = Math.min(
+      requestCount,
+      llmNodes.filter((node) => node.outcome === "failure" || node.outcome === "rejected").length
+    );
+    return conserveLiveActivityUsage([...fromActivities, {
+      activityId: liveLlmActivityId(activityScopeId),
       kind: "llm_request",
-      name: safeActivityName(llmNode.model ?? llmNode.name),
-      outcome: llmNode.outcome,
-      startedAt: llmNode.startedAt,
-      endedAt: llmNode.endedAt,
-      durationMs: llmNode.durationMs,
-      inputTokens: llmNode.inputTokens,
-      outputTokens: llmNode.outputTokens,
-      cacheReadInputTokens: llmNode.cacheReadInputTokens,
-      cacheCreationInputTokens: llmNode.cacheCreationInputTokens,
-      reasoningOutputTokens: llmNode.reasoningOutputTokens,
-      totalTokens: (llmNode.inputTokens ?? 0) + (llmNode.outputTokens ?? 0),
+      name: safeActivityName(uniqueStrings(llmNodes.flatMap((node) => node.model ? [node.model] : [])).at(0) ?? llmNode.name),
+      outcome: failureCount === 0
+        ? (llmNodes.every((node) => node.outcome === "success") ? "success" : "unknown")
+        : failureCount === llmNodes.length
+          ? "failure"
+          : "unknown",
+      count: requestCount,
+      failureCount,
+      startedAt: earliestIso(llmNodes.map((node) => node.startedAt)),
+      endedAt: latestIso(llmNodes.flatMap((node) => [node.endedAt, node.startedAt]).filter((value): value is string => Boolean(value))),
+      ...usageTokenTotals(usageAtoms, executionNodes),
+      usageAttributionBasis: "provider_reported",
+      usageCoverage: "complete",
       evidence: webhookEvidence("trace_span", llmNode.nodeId, observation.observedAt, false)
-    }];
+    }], usageTokenTotals(usageAtoms, executionNodes), queryId, observation, executionNodes, activityScopeId);
+  }
+  if (llmNodes.length > 0) {
+    const llmNode = llmNodes[0];
+    const requestCount = liveLlmRequestCount(usageAtoms, llmNodes);
+    const failureCount = Math.min(
+      requestCount,
+      llmNodes.filter((node) => node.outcome === "failure" || node.outcome === "rejected").length
+    );
+    return conserveLiveActivityUsage([...fromActivities, {
+      activityId: liveLlmActivityId(activityScopeId),
+      kind: "llm_request",
+      name: safeActivityName(uniqueStrings(llmNodes.flatMap((node) => node.model ? [node.model] : [])).at(0) ?? llmNode.name),
+      outcome: failureCount === 0
+        ? (llmNodes.every((node) => node.outcome === "success") ? "success" : "unknown")
+        : failureCount === requestCount ? "failure" : "unknown",
+      count: requestCount,
+      failureCount,
+      startedAt: earliestIso(llmNodes.map((node) => node.startedAt)),
+      endedAt: latestIsoOptional(llmNodes.flatMap((node) => [node.endedAt, node.startedAt])),
+      usageAttributionBasis: "provider_reported",
+      usageCoverage: "complete",
+      evidence: webhookEvidence("trace_span", llmNode.nodeId, observation.observedAt, false)
+    }], usageTokenTotals(usageAtoms, executionNodes), queryId, observation, executionNodes, activityScopeId);
   }
   if (usageAtoms.length === 0) {
-    return [];
+    return conserveLiveActivityUsage(
+      fromActivities,
+      usageTokenTotals(usageAtoms, executionNodes),
+      queryId,
+      observation,
+      executionNodes,
+      activityScopeId
+    );
   }
   const totals = usageTokenTotals(usageAtoms, executionNodes);
-  return [{
-    activityId: `activity_${contentHash({ queryId, sourceId: observation.sourceId, observedAt: observation.observedAt }).slice(0, 24)}`,
+  return conserveLiveActivityUsage([...fromActivities, {
+    activityId: liveLlmActivityId(activityScopeId),
     kind: "llm_request",
     name: usageAtoms.find((atom) => atom.model)?.model ?? "llm_request",
     outcome: "unknown",
+    count: Math.max(1, new Set(usageAtoms.map((atom) => atom.requestId ?? atom.atomId)).size),
+    failureCount: 0,
     startedAt: earliestIso(usageAtoms.map((atom) => atom.startedAt)),
     endedAt: latestIso(usageAtoms.flatMap((atom) => [atom.endedAt, atom.startedAt]).filter((value): value is string => Boolean(value))),
     ...totals,
+    usageAttributionBasis: "provider_reported",
+    usageCoverage: "complete",
     evidence: webhookEvidence("provider_metric", queryId, observation.observedAt, false)
+  }], totals, queryId, observation, executionNodes, activityScopeId);
+}
+
+function liveLlmRequestCount(
+  usageAtoms: SafeUsageAtomV1[],
+  llmNodes: NonNullable<SafeObservationV1["executionNodes"]>
+): number {
+  const requestAuthorities = usageAtoms.filter((atom) => atom.authority === "request" || atom.authority === "model");
+  if (requestAuthorities.length > 0) {
+    return Math.max(1, new Set(requestAuthorities.map((atom) => atom.requestId ?? atom.atomId)).size);
+  }
+  if (usageAtoms.length > 0) {
+    return Math.max(1, new Set(usageAtoms.map((atom) => atom.requestId ?? atom.atomId)).size);
+  }
+  return Math.max(1, new Set(llmNodes.map((node) => node.requestId ?? node.nodeId)).size);
+}
+
+function conserveLiveActivityUsage(
+  activity: RunLifecycleActivityWebhookV1[],
+  totals: RunTokenTotals,
+  queryId: string,
+  observation: SafeObservationV1,
+  executionNodes: NonNullable<SafeObservationV1["executionNodes"]>,
+  activityScopeId: string
+): RunLifecycleActivityWebhookV1[] {
+  const allocated = tokenTotalsFromLifecycleActivity(activity);
+  const overAllocated = allocated.inputTokens > totals.inputTokens
+    || allocated.outputTokens > totals.outputTokens
+    || allocated.cacheReadInputTokens > totals.cacheReadInputTokens
+    || allocated.cacheCreationInputTokens > totals.cacheCreationInputTokens
+    || allocated.reasoningOutputTokens > totals.reasoningOutputTokens;
+  const normalized = overAllocated ? activity.map(withoutLifecycleActivityUsage) : activity;
+  const normalizedAllocated = overAllocated ? tokenTotalsFromLifecycleActivity(normalized) : allocated;
+  const remaining: RunTokenTotals = {
+    inputTokens: Math.max(0, totals.inputTokens - normalizedAllocated.inputTokens),
+    outputTokens: Math.max(0, totals.outputTokens - normalizedAllocated.outputTokens),
+    cacheReadInputTokens: Math.max(0, totals.cacheReadInputTokens - normalizedAllocated.cacheReadInputTokens),
+    cacheCreationInputTokens: Math.max(0, totals.cacheCreationInputTokens - normalizedAllocated.cacheCreationInputTokens),
+    reasoningOutputTokens: Math.max(0, totals.reasoningOutputTokens - normalizedAllocated.reasoningOutputTokens),
+    totalTokens: Math.max(0, totals.inputTokens - normalizedAllocated.inputTokens)
+      + Math.max(0, totals.outputTokens - normalizedAllocated.outputTokens)
+  };
+  if (!hasTokenUsage(remaining)) {
+    return normalized;
+  }
+  const startedAt = earliestIso([
+    ...normalized.map((item) => item.startedAt),
+    ...executionNodes.map((node) => node.startedAt),
+    observation.observedAt
+  ]);
+  return [...normalized, {
+    activityId: liveUnallocatedActivityId(activityScopeId),
+    kind: "unknown",
+    name: "Unallocated run usage",
+    outcome: "unknown",
+    count: 1,
+    failureCount: 0,
+    startedAt,
+    endedAt: latestIso([
+      ...normalized.flatMap((item) => [item.endedAt, item.startedAt]).filter((value): value is string => Boolean(value)),
+      ...executionNodes.flatMap((node) => [node.endedAt, node.startedAt]).filter((value): value is string => Boolean(value)),
+      observation.observedAt
+    ]),
+    ...remaining,
+    usageAttributionBasis: "unavailable",
+    usageCoverage: normalized.some(hasLiveActivityUsage) ? "partial" : "unavailable",
+    evidence: webhookEvidence(
+      observation.signal === "traces" ? "trace_span" : observation.signal === "metrics" ? "provider_metric" : "otel_event",
+      queryId,
+      observation.observedAt,
+      false,
+      observation.profileVersion
+    )
   }];
+}
+
+function liveActivityAuthorityScopeId(
+  queryId: string,
+  usageAtoms: SafeUsageAtomV1[],
+  executionNodes: NonNullable<SafeObservationV1["executionNodes"]>
+): string {
+  const usageSessions = uniqueStrings(usageAtoms.flatMap((atom) => atom.sessionId ? [atom.sessionId] : []));
+  const nodeSessions = uniqueStrings(executionNodes.flatMap((node) => node.sessionId ? [node.sessionId] : []));
+  const sessionId = usageSessions.length === 1
+    ? usageSessions[0]
+    : usageSessions.length === 0 && nodeSessions.length === 1
+      ? nodeSessions[0]
+      : undefined;
+  return sessionId ? `${queryId}|${sessionId}` : queryId;
+}
+
+function liveLlmActivityId(activityScopeId: string): string {
+  return `activity_${contentHash({ activityScopeId, kind: "llm_request" }).slice(0, 24)}`;
+}
+
+function liveUnallocatedActivityId(activityScopeId: string): string {
+  return `activity_${contentHash({ activityScopeId, kind: "unallocated_live_usage" }).slice(0, 24)}`;
+}
+
+function withoutLifecycleActivityUsage(
+  activity: RunLifecycleActivityWebhookV1
+): RunLifecycleActivityWebhookV1 {
+  const {
+    inputTokens: _inputTokens,
+    outputTokens: _outputTokens,
+    cacheReadInputTokens: _cacheReadInputTokens,
+    cacheCreationInputTokens: _cacheCreationInputTokens,
+    reasoningOutputTokens: _reasoningOutputTokens,
+    totalTokens: _totalTokens,
+    ...metadata
+  } = activity;
+  return {
+    ...metadata,
+    usageAttributionBasis: activity.kind === "unknown" ? "unavailable" : "activity_only",
+    usageCoverage: "unavailable"
+  };
 }
 
 function webhookEvidenceForActivityAtom(
@@ -2815,6 +4352,15 @@ function usageTokenTotals(
   usageAtoms: SafeUsageAtomV1[],
   executionNodes: NonNullable<SafeObservationV1["executionNodes"]>
 ): RunTokenTotals {
+  if (usageAtoms.length > 0) {
+    const projected = LIVE_UPDATE_USAGE_PIPELINE.project(
+      usageAtoms,
+      new Date(latestIso(usageAtoms.flatMap((atom) => [atom.endedAt, atom.startedAt]).filter((value): value is string => Boolean(value))))
+    )[0];
+    if (projected) {
+      return tokenTotalsForRun(projected);
+    }
+  }
   const sources = usageAtoms.length > 0
     ? usageAtoms
     : executionNodes;
@@ -2840,6 +4386,15 @@ function contextFootprintFromLiveSources(
   coverage: RunContextFootprintV1["coverage"]
 ): RunContextFootprintV1 | undefined {
   const usingUsageAtoms = usageAtoms.length > 0;
+  if (usingUsageAtoms) {
+    const projected = LIVE_UPDATE_USAGE_PIPELINE.project(
+      usageAtoms,
+      new Date(latestIso(usageAtoms.flatMap((atom) => [atom.endedAt, atom.startedAt]).filter((value): value is string => Boolean(value))))
+    )[0];
+    if (projected?.context) {
+      return { ...projected.context, coverage };
+    }
+  }
   const sources = usingUsageAtoms
     ? usageAtoms
     : executionNodes;
@@ -2896,6 +4451,52 @@ function hasReportedInputContext(source: SafeUsageAtomV1 | NonNullable<SafeObser
     || isNonNegativeSafeInteger(source.cacheCreationInputTokens);
 }
 
+function liveSourceOverlapsSubject(
+  source: Pick<SafeUsageAtomV1, "startedAt" | "endedAt">,
+  subject: LiveLifecycleSubject
+): boolean {
+  const subjectStart = Date.parse(subject.startedAt);
+  const sourceEnd = Date.parse(source.endedAt ?? source.startedAt);
+  return Number.isFinite(subjectStart) && Number.isFinite(sourceEnd) && sourceEnd >= subjectStart;
+}
+
+function canonicalLiveUsageAtom(atom: SafeUsageAtomV1, subject: LiveLifecycleSubject): SafeUsageAtomV1 {
+  return {
+    ...atom,
+    startedAt: clampLiveSourceStart(atom.startedAt, subject.startedAt),
+    endedAt: atom.endedAt ? clampLiveSourceStart(atom.endedAt, subject.startedAt) : undefined
+  };
+}
+
+function canonicalLiveActivityAtom(atom: SafeActivityAtomV1, subject: LiveLifecycleSubject): SafeActivityAtomV1 {
+  const startedAt = clampLiveSourceStart(atom.startedAt, subject.startedAt);
+  const endedAt = atom.endedAt ? clampLiveSourceStart(atom.endedAt, startedAt) : undefined;
+  return {
+    ...atom,
+    startedAt,
+    endedAt,
+    durationMs: endedAt ? durationMs(startedAt, endedAt) : atom.durationMs
+  };
+}
+
+function canonicalLiveExecutionNode(
+  node: NonNullable<SafeObservationV1["executionNodes"]>[number],
+  subject: LiveLifecycleSubject
+): NonNullable<SafeObservationV1["executionNodes"]>[number] {
+  const startedAt = clampLiveSourceStart(node.startedAt, subject.startedAt);
+  const endedAt = node.endedAt ? clampLiveSourceStart(node.endedAt, startedAt) : undefined;
+  return {
+    ...node,
+    startedAt,
+    endedAt,
+    durationMs: endedAt ? durationMs(startedAt, endedAt) : node.durationMs
+  };
+}
+
+function clampLiveSourceStart(value: string, lowerBound: string): string {
+  return Date.parse(value) >= Date.parse(lowerBound) ? value : lowerBound;
+}
+
 function liveTraceIds(observation: SafeObservationV1, queryId: string): string[] {
   return uniqueStrings([
     queryId,
@@ -2936,7 +4537,11 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function aggregateWebhookRun(currentRun: ProductionRunV1, runs: ProductionRunV1[]): ProductionRunV1 {
+function aggregateWebhookRun(
+  currentRun: ProductionRunV1,
+  runs: ProductionRunV1[],
+  subjectRunId = currentRun.runId
+): ProductionRunV1 {
   const completed = runs.filter((run) => run.endedAt && run.endedAt >= run.startedAt);
   if (completed.length <= 1) {
     return currentRun;
@@ -2956,23 +4561,106 @@ function aggregateWebhookRun(currentRun: ProductionRunV1, runs: ProductionRunV1[
   const completeCost = pricedRuns.length === ordered.length && ordered.every((run) => run.costCoverage === "complete");
   const costCoverage = completeCost ? "complete" : pricedRuns.length > 0 ? "partial" : "unavailable";
   const context = aggregateRunContextFootprint(ordered);
+  const inputTokens = ordered.reduce((sum, run) => sum + run.inputTokens, 0);
+  const outputTokens = ordered.reduce((sum, run) => sum + run.outputTokens, 0);
+  const cacheReadInputTokens = ordered.reduce((sum, run) => sum + run.cacheReadInputTokens, 0);
+  const cacheCreationInputTokens = ordered.reduce((sum, run) => sum + run.cacheCreationInputTokens, 0);
+  const reasoningOutputTokens = ordered.reduce((sum, run) => sum + run.reasoningOutputTokens, 0);
   return {
     ...currentRun,
+    runId: subjectRunId,
+    correlationId: subjectRunId,
+    queryId: subjectRunId,
     startedAt: ordered[0].startedAt,
     endedAt: ordered.map((run) => run.endedAt).filter((value): value is string => Boolean(value)).sort().at(-1) ?? currentRun.endedAt,
-    inputTokens: ordered.reduce((sum, run) => sum + run.inputTokens, 0),
-    outputTokens: ordered.reduce((sum, run) => sum + run.outputTokens, 0),
-    cacheReadInputTokens: ordered.reduce((sum, run) => sum + run.cacheReadInputTokens, 0),
-    cacheCreationInputTokens: ordered.reduce((sum, run) => sum + run.cacheCreationInputTokens, 0),
-    reasoningOutputTokens: ordered.reduce((sum, run) => sum + run.reasoningOutputTokens, 0),
-    totalTokens: ordered.reduce((sum, run) => sum + run.totalTokens, 0),
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
+    reasoningOutputTokens,
+    totalTokens: inputTokens + outputTokens,
     estimatedNanoUsd,
     usageValueNanoUsd,
     costEstimateBasis: aggregateCostEstimateBasis(pricedRuns),
     costCoverage,
+    toolCallCount: ordered.reduce((sum, run) => sum + (run.toolCallCount ?? 0), 0),
+    breakdown: aggregateRunBreakdown(ordered, subjectRunId),
     ...(context ? { context } : {}),
     models: uniqueStrings(ordered.flatMap((run) => run.models ?? (run.model ? [run.model] : [])))
   };
+}
+
+function aggregateRunBreakdown(runs: ProductionRunV1[], subjectRunId: string): RunBreakdownV1[] {
+  const grouped = new Map<string, RunBreakdownV1[]>();
+  for (const run of runs) {
+    for (const breakdown of conservingRunBreakdown(run)) {
+      const key = `${breakdown.kind}:${breakdown.name}`;
+      grouped.set(key, [...(grouped.get(key) ?? []), breakdown]);
+    }
+  }
+  return [...grouped.entries()]
+    .map(([key, group]): RunBreakdownV1 => {
+      const inputTokens = group.reduce((sum, item) => sum + nonNegativeToken(item.inputTokens), 0);
+      const outputTokens = group.reduce((sum, item) => sum + nonNegativeToken(item.outputTokens), 0);
+      const cacheReadInputTokens = group.reduce((sum, item) => sum + nonNegativeToken(item.cacheReadInputTokens), 0);
+      const cacheCreationInputTokens = group.reduce((sum, item) => sum + nonNegativeToken(item.cacheCreationInputTokens), 0);
+      const reasoningOutputTokens = group.reduce((sum, item) => sum + nonNegativeToken(item.reasoningOutputTokens), 0);
+      const hasUsage = group.some((item) => breakdownTokenTotals(item).present);
+      const attributionBases = uniqueStrings(group.map((item) => item.attributionBasis));
+      return {
+        schemaVersion: 1,
+        breakdownId: `brk_${contentHash({ subjectRunId, key })}`,
+        kind: group[0].kind,
+      name: group[0].name,
+      count: group.reduce((sum, item) => sum + item.count, 0),
+      failureCount: group.reduce((sum, item) => sum + item.failureCount, 0),
+      ...(group.some((item) => item.unknownCount != null) ? {
+        unknownCount: group.reduce((sum, item) => sum + (item.unknownCount ?? 0), 0)
+      } : {}),
+        ...sumOptionalBreakdownField(group, "totalDurationMs"),
+        ...sumOptionalBreakdownField(group, "resultSizeBytes"),
+        ...sumOptionalBreakdownField(group, "providerReportedResultTokens"),
+        ...(hasUsage ? {
+          inputTokens,
+          outputTokens,
+          cacheReadInputTokens,
+          cacheCreationInputTokens,
+          reasoningOutputTokens,
+          totalTokens: inputTokens + outputTokens
+        } : {}),
+        attributionBasis: attributionBases.length === 1
+          ? attributionBases[0] as RunBreakdownV1["attributionBasis"]
+          : "unavailable",
+        coverage: aggregateBreakdownCoverage(group)
+      };
+    })
+    .sort((left, right) =>
+      left.kind === "unallocated"
+        ? 1
+        : right.kind === "unallocated"
+          ? -1
+          : right.count - left.count || left.name.localeCompare(right.name)
+    );
+}
+
+function sumOptionalBreakdownField(
+  breakdown: RunBreakdownV1[],
+  field: "totalDurationMs" | "resultSizeBytes" | "providerReportedResultTokens"
+): Partial<Pick<RunBreakdownV1, typeof field>> {
+  const values = breakdown
+    .map((item) => item[field])
+    .filter((value): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+  return values.length > 0 ? { [field]: values.reduce((sum, value) => sum + value, 0) } : {};
+}
+
+function aggregateBreakdownCoverage(group: RunBreakdownV1[]): RunBreakdownV1["coverage"] {
+  if (group.every((item) => item.coverage === "complete")) {
+    return "complete";
+  }
+  if (group.some((item) => item.coverage !== "unavailable" || hasTokenUsage(breakdownTokenTotals(item)))) {
+    return "partial";
+  }
+  return "unavailable";
 }
 
 function aggregateRunContextFootprint(runs: ProductionRunV1[]): RunContextFootprintV1 | undefined {
@@ -3024,6 +4712,806 @@ function runEndedMeaningHash(event: RunEndedWebhookEventDraft | RunEndedWebhookE
   return contentHash(meaning);
 }
 
+function normalizeRunEndedDraft(event: RunEndedWebhookEventDraft): RunEndedWebhookEventDraft {
+  const startedAt = earliestIso([event.startedAt, event.endedAt]);
+  const endedAt = latestIso([startedAt, event.endedAt]);
+  const boundedActivity = (event.activity ?? []).map((activity) =>
+    normalizeTerminalActivityBounds(activity, startedAt, endedAt)
+  );
+  const normalized: RunEndedWebhookEventDraft = {
+    ...event,
+    startedAt,
+    endedAt,
+    activity: boundedActivity
+  };
+  return {
+    ...normalized,
+    activity: conserveTerminalActivityUsage(normalized, boundedActivity)
+  };
+}
+
+function monotonicRunEndedRevision(
+  previous: RunEndedWebhookEventV1,
+  next: RunEndedWebhookEventDraft
+): RunEndedWebhookEventDraft {
+  const preferredCost = preferredTerminalCost(previous, next);
+  const preferredUsage = preferredTerminalUsage(previous, next);
+  const coverage = mergeTerminalCoverage(previous.coverage, next.coverage);
+  const preferredContext = preferredTerminalContext(previous.context, next.context);
+  const merged: RunEndedWebhookEventDraft = {
+    ...next,
+    sessionId: preferredTerminalSessionId(previous.sessionId, next.sessionId),
+    repository: repositoryIdentityScore(previous.repository) >= repositoryIdentityScore(next.repository)
+      ? previous.repository
+      : next.repository,
+    startedAt: earliestIso([previous.startedAt, next.startedAt]),
+    endedAt: latestIso([previous.endedAt, next.endedAt]),
+    evidence: preferredWebhookEvidence(previous.evidence, next.evidence),
+    coverage,
+    inputTokens: preferredUsage.inputTokens,
+    outputTokens: preferredUsage.outputTokens,
+    cacheReadInputTokens: preferredUsage.cacheReadInputTokens,
+    cacheCreationInputTokens: preferredUsage.cacheCreationInputTokens,
+    reasoningOutputTokens: preferredUsage.reasoningOutputTokens,
+    totalTokens: preferredUsage.inputTokens + preferredUsage.outputTokens,
+    traceIds: uniqueStrings([...previous.traceIds, ...next.traceIds]),
+    filesChanged: safeRepoRelativePaths([...previous.filesChanged, ...next.filesChanged]),
+    llmModels: uniqueStrings([...previous.llmModels, ...next.llmModels]),
+    estimatedNanoUsd: preferredCost.estimatedNanoUsd,
+    usageValueNanoUsd: preferredCost.usageValueNanoUsd,
+    costEstimateBasis: preferredCost.costEstimateBasis,
+    costCoverage: preferredCost.costCoverage,
+    // Context is optional. Never relabel a provisional footprint as final merely
+    // because final usage arrived from another telemetry surface.
+    context: preferredContext?.coverage === coverage.usageCoverage ? preferredContext : undefined,
+    activity: mergeTerminalActivity(previous.activity ?? [], next.activity ?? [])
+  };
+  return normalizeRunEndedDraft(merged);
+}
+
+function preferredTerminalUsage(
+  previous: RunEndedWebhookEventV1,
+  next: RunEndedWebhookEventDraft
+): RunEndedWebhookEventV1 | RunEndedWebhookEventDraft {
+  if (next.endedAt !== previous.endedAt) {
+    return next.endedAt > previous.endedAt ? next : previous;
+  }
+  return compareTerminalUsage(next, previous) > 0 ? next : previous;
+}
+
+function compareTerminalUsage(
+  left: RunEndedWebhookEventDraft | RunEndedWebhookEventV1,
+  right: RunEndedWebhookEventDraft | RunEndedWebhookEventV1
+): number {
+  const tuple = (event: RunEndedWebhookEventDraft | RunEndedWebhookEventV1): number[] => {
+    const detailedUsageDimensions = [
+      event.cacheReadInputTokens,
+      event.cacheCreationInputTokens,
+      event.reasoningOutputTokens
+    ].filter((value) => value > 0).length;
+    return [
+      terminalUsageCoverageRank(event.coverage.usageCoverage),
+      event.totalTokens,
+      detailedUsageDimensions,
+      event.cacheReadInputTokens + event.cacheCreationInputTokens + event.reasoningOutputTokens,
+      event.cacheReadInputTokens,
+      event.cacheCreationInputTokens,
+      event.reasoningOutputTokens,
+      event.inputTokens,
+      event.outputTokens
+    ];
+  };
+  const leftTuple = tuple(left);
+  const rightTuple = tuple(right);
+  for (let index = 0; index < leftTuple.length; index += 1) {
+    if (leftTuple[index] !== rightTuple[index]) {
+      return leftTuple[index] > rightTuple[index] ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
+function preferredTerminalSessionId(previous: string, next: string): string {
+  const previousScore = terminalSessionIdScore(previous);
+  const nextScore = terminalSessionIdScore(next);
+  return nextScore > previousScore ? next : previous;
+}
+
+function terminalSessionIdScore(sessionId: string): number {
+  return sessionId.startsWith("ses_")
+    ? 3
+    : sessionId.startsWith("qry_") || sessionId.startsWith("run_")
+      ? 1
+      : 2;
+}
+
+function preferredTerminalCost(
+  previous: RunEndedWebhookEventV1,
+  next: RunEndedWebhookEventDraft
+): RunEndedWebhookEventV1 | RunEndedWebhookEventDraft {
+  const previousScore = terminalCostScore(previous);
+  const nextScore = terminalCostScore(next);
+  if (nextScore !== previousScore) {
+    return nextScore > previousScore ? next : previous;
+  }
+  const usageChanged = next.inputTokens !== previous.inputTokens
+    || next.outputTokens !== previous.outputTokens
+    || next.cacheReadInputTokens !== previous.cacheReadInputTokens
+    || next.cacheCreationInputTokens !== previous.cacheCreationInputTokens
+    || next.reasoningOutputTokens !== previous.reasoningOutputTokens;
+  return usageChanged || next.endedAt > previous.endedAt ? next : previous;
+}
+
+function terminalCostScore(event: RunEndedWebhookEventDraft | RunEndedWebhookEventV1): number {
+  return costCoverageRank(event.costCoverage) * 100
+    + (event.usageValueNanoUsd != null ? 10 : 0)
+    + (event.costEstimateBasis !== "unavailable" ? 4 : 0)
+    + (event.estimatedNanoUsd > 0 ? 1 : 0);
+}
+
+function normalizeTerminalActivityBounds(
+  activity: RunLifecycleActivityWebhookV1,
+  runStartedAt: string,
+  runEndedAt: string
+): RunLifecycleActivityWebhookV1 {
+  const startedAt = clampIso(activity.startedAt, runStartedAt, runEndedAt);
+  const endedAt = activity.endedAt ? clampIso(activity.endedAt, startedAt, runEndedAt) : undefined;
+  return {
+    ...activity,
+    startedAt,
+    endedAt,
+    durationMs: endedAt ? durationMs(startedAt, endedAt) : activity.durationMs
+  };
+}
+
+function clampIso(value: string, lowerBound: string, upperBound: string): string {
+  const valueMs = Date.parse(value);
+  const lowerMs = Date.parse(lowerBound);
+  const upperMs = Date.parse(upperBound);
+  if (!Number.isFinite(valueMs) || !Number.isFinite(lowerMs) || !Number.isFinite(upperMs)) {
+    return lowerBound;
+  }
+  return new Date(Math.min(Math.max(valueMs, lowerMs), upperMs)).toISOString();
+}
+
+function mergeTerminalActivity(
+  previous: RunLifecycleActivityWebhookV1[],
+  next: RunLifecycleActivityWebhookV1[]
+): RunLifecycleActivityWebhookV1[] {
+  // Final breakdown rows group the same safe observations that a provisional
+  // terminal exposed individually. Replace that semantic slice before the ID
+  // merge so terminal versions never add the two representations together.
+  const previousAuthoritativeSemanticKeys = new Set(previous
+    .filter((activity) => activity.evidence.basis === "usage_projection" && !isUnallocatedTerminalActivity(activity))
+    .map(terminalActivitySemanticKey));
+  const nextAuthoritativeSemanticKeys = new Set(next
+    .filter((activity) => activity.evidence.basis === "usage_projection" && !isUnallocatedTerminalActivity(activity))
+    .map(terminalActivitySemanticKey));
+  const byIdentity = new Map<string, RunLifecycleActivityWebhookV1>();
+  for (const activity of previous) {
+    const semanticKey = terminalActivitySemanticKey(activity);
+    if (
+      nextAuthoritativeSemanticKeys.has(semanticKey)
+      || (previousAuthoritativeSemanticKeys.has(semanticKey) && activity.evidence.basis !== "usage_projection")
+    ) {
+      continue;
+    }
+    byIdentity.set(terminalActivityIdentity(activity), activity);
+  }
+  for (const activity of next) {
+    const semanticKey = terminalActivitySemanticKey(activity);
+    if (
+      previousAuthoritativeSemanticKeys.has(semanticKey)
+      && !nextAuthoritativeSemanticKeys.has(semanticKey)
+      && activity.evidence.basis !== "usage_projection"
+    ) {
+      continue;
+    }
+    const identity = terminalActivityIdentity(activity);
+    const existing = byIdentity.get(identity);
+    byIdentity.set(identity, existing ? mergeTerminalActivityRow(existing, activity) : activity);
+  }
+  return reconcileTerminalSubagentAggregateUsage(previous, next, [...byIdentity.values()])
+    .sort(compareLifecycleActivity);
+}
+
+function reconcileTerminalSubagentAggregateUsage(
+  previous: RunLifecycleActivityWebhookV1[],
+  next: RunLifecycleActivityWebhookV1[],
+  activity: RunLifecycleActivityWebhookV1[]
+): RunLifecycleActivityWebhookV1[] {
+  const observedSubagents = groupTerminalSubagentsBySemanticKey([
+    ...new Map([...previous, ...next]
+      .filter((item) => item.kind === "subagent" && item.evidence.basis !== "usage_projection")
+      .map((item) => [item.activityId, item])).values()
+  ]);
+  const authoritativeSubagents = groupTerminalSubagentsBySemanticKey(activity.filter((item) =>
+    item.evidence.basis === "usage_projection"
+  ));
+  const previousAuthoritativeSubagents = groupTerminalSubagentsBySemanticKey(previous.filter((item) =>
+    item.evidence.basis === "usage_projection"
+  ));
+  const parentAliases = new Map<string, string>();
+  for (const [semanticKey, prior] of observedSubagents) {
+    const authoritative = authoritativeSubagents.get(semanticKey) ?? [];
+    if (
+      authoritative.length === 1
+      && prior.reduce((count, item) => count + (item.count ?? 1), 0) === (authoritative[0].count ?? 1)
+    ) {
+      for (const item of prior) {
+        parentAliases.set(item.activityId, authoritative[0].activityId);
+      }
+    }
+  }
+  const remapped = activity.map((item) => {
+    const parentActivityId = item.parentActivityId ? parentAliases.get(item.parentActivityId) : undefined;
+    return parentActivityId ? { ...item, parentActivityId } : item;
+  });
+  const duplicateParents = new Map<string, string>();
+  const residualUsageByActivityId = new Map<string, {
+    usage: RunTokenTotals;
+    consumedCount: number;
+    consumedFailureCount: number;
+  }>();
+  const claimedLlmIds = new Set<string>();
+  const verifiedSubagentIds = new Set<string>();
+  const authoritativeUnallocated = activity.filter(isUnallocatedTerminalActivity);
+  for (const [semanticKey, authoritative] of authoritativeSubagents) {
+    const prior = observedSubagents.get(semanticKey) ?? [];
+    if (authoritative.length !== 1) {
+      continue;
+    }
+    const authoritativeSubagent = authoritative[0];
+    const expectedChildCount = authoritativeSubagent.count ?? 1;
+    const usageKey = terminalActivityUsageKey(authoritativeSubagent);
+    if (!usageKey) {
+      continue;
+    }
+    const previousAuthoritative = previousAuthoritativeSubagents.get(semanticKey) ?? [];
+    const authoritativeUsageIsVerified = (
+      (
+        authoritativeSubagent.usageAttributionBasis === "trace_descendant"
+        && authoritativeSubagent.usageCoverage === "complete"
+      )
+      || (
+        previousAuthoritative.length === 1
+        && previousAuthoritative[0].usageAttributionBasis === "trace_descendant"
+        && previousAuthoritative[0].usageCoverage === "complete"
+        && terminalActivityUsageKey(previousAuthoritative[0]) === usageKey
+      )
+    );
+    if (authoritativeUsageIsVerified) {
+      verifiedSubagentIds.add(authoritativeSubagent.activityId);
+    }
+    if (
+      expectedChildCount < 1
+      || prior.length !== expectedChildCount
+      || prior.some((item) => (item.count ?? 1) !== 1)
+    ) {
+      continue;
+    }
+    const childUsage = lifecycleActivityTokenTotals(authoritativeSubagent);
+    if (!childUsage.present || !childUsage.valid) {
+      continue;
+    }
+    const candidates = remapped.filter((item) =>
+      item.kind === "llm_request"
+      && item.evidence.basis !== "usage_projection"
+      && !claimedLlmIds.has(item.activityId)
+      && (
+        item.parentActivityId === authoritativeSubagent.activityId
+        || (!item.parentActivityId && prior.some((subagent) => terminalSubagentLineageIsPlausible(subagent, item)))
+      )
+    );
+    const linkedIds = new Set(candidates
+      .filter((item) => item.parentActivityId === authoritativeSubagent.activityId)
+      .map((item) => item.activityId));
+    const exactChildren = uniqueTerminalActivityUsageSubset(
+      candidates,
+      expectedChildCount,
+      childUsage,
+      linkedIds
+    );
+    if (
+      exactChildren
+      && terminalSubagentLineageSetIsPlausible(prior, exactChildren, authoritativeSubagent.activityId)
+    ) {
+      for (const child of exactChildren) {
+        duplicateParents.set(child.activityId, authoritativeSubagent.activityId);
+        claimedLlmIds.add(child.activityId);
+      }
+      verifiedSubagentIds.add(authoritativeSubagent.activityId);
+      continue;
+    }
+    const tokenlessChildren = candidates.filter((item) => !lifecycleActivityTokenTotals(item).present);
+    if (
+      authoritativeUsageIsVerified
+      && tokenlessChildren.length === expectedChildCount
+      && terminalSubagentLineageSetIsPlausible(prior, tokenlessChildren, authoritativeSubagent.activityId)
+    ) {
+      for (const child of tokenlessChildren) {
+        duplicateParents.set(child.activityId, authoritativeSubagent.activityId);
+        claimedLlmIds.add(child.activityId);
+      }
+      continue;
+    }
+    if (expectedChildCount !== 1 || authoritativeUnallocated.length !== 1) {
+      continue;
+    }
+    const unallocatedUsage = lifecycleActivityTokenTotals(authoritativeUnallocated[0]);
+    if (!unallocatedUsage.present || !unallocatedUsage.valid || tokenlessChildren.length !== 1) {
+      continue;
+    }
+    const cumulativeParents = remapped.filter((item) =>
+      item.kind === "llm_request"
+      && item.evidence.basis !== "usage_projection"
+      && !item.parentActivityId
+      && !claimedLlmIds.has(item.activityId)
+      && terminalActivityUsageEqualsSum(item, childUsage, unallocatedUsage)
+    );
+    if (cumulativeParents.length !== 1) {
+      continue;
+    }
+    duplicateParents.set(tokenlessChildren[0].activityId, authoritativeSubagent.activityId);
+    residualUsageByActivityId.set(cumulativeParents[0].activityId, {
+      usage: {
+        inputTokens: unallocatedUsage.inputTokens,
+        outputTokens: unallocatedUsage.outputTokens,
+        cacheReadInputTokens: unallocatedUsage.cacheReadInputTokens,
+        cacheCreationInputTokens: unallocatedUsage.cacheCreationInputTokens,
+        reasoningOutputTokens: unallocatedUsage.reasoningOutputTokens,
+        totalTokens: unallocatedUsage.totalTokens
+      },
+      consumedCount: tokenlessChildren[0].count ?? 1,
+      consumedFailureCount: tokenlessChildren[0].failureCount ?? 0
+    });
+    claimedLlmIds.add(tokenlessChildren[0].activityId);
+    claimedLlmIds.add(cumulativeParents[0].activityId);
+    verifiedSubagentIds.add(authoritativeSubagent.activityId);
+  }
+  let consumeAuthoritativeUnallocated = false;
+  if (duplicateParents.size > 0 && authoritativeUnallocated.length === 1) {
+    const unallocatedUsage = lifecycleActivityTokenTotals(authoritativeUnallocated[0]);
+    const rootCandidates = remapped.filter((item) =>
+      item.kind === "llm_request"
+      && item.evidence.basis !== "usage_projection"
+      && !item.parentActivityId
+      && !claimedLlmIds.has(item.activityId)
+      && !duplicateParents.has(item.activityId)
+      && !residualUsageByActivityId.has(item.activityId)
+    );
+    if (unallocatedUsage.present && unallocatedUsage.valid && rootCandidates.length === 1) {
+      residualUsageByActivityId.set(rootCandidates[0].activityId, {
+        usage: {
+          inputTokens: unallocatedUsage.inputTokens,
+          outputTokens: unallocatedUsage.outputTokens,
+          cacheReadInputTokens: unallocatedUsage.cacheReadInputTokens,
+          cacheCreationInputTokens: unallocatedUsage.cacheCreationInputTokens,
+          reasoningOutputTokens: unallocatedUsage.reasoningOutputTokens,
+          totalTokens: unallocatedUsage.totalTokens
+        },
+        consumedCount: 0,
+        consumedFailureCount: 0
+      });
+      consumeAuthoritativeUnallocated = true;
+    }
+  }
+  return remapped.filter((item) =>
+    !consumeAuthoritativeUnallocated || !isUnallocatedTerminalActivity(item)
+  ).map((item) => {
+    if (verifiedSubagentIds.has(item.activityId)) {
+      return {
+        ...item,
+        usageAttributionBasis: "trace_descendant",
+        usageCoverage: "complete"
+      };
+    }
+    const parentActivityId = duplicateParents.get(item.activityId);
+    if (parentActivityId) {
+      return { ...withoutLifecycleActivityUsage(item), parentActivityId };
+    }
+    const residual = residualUsageByActivityId.get(item.activityId);
+    if (!residual) {
+      return item;
+    }
+    const count = Math.max(1, (item.count ?? 1) - residual.consumedCount);
+    const failureCount = Math.min(
+      count,
+      Math.max(0, (item.failureCount ?? 0) - residual.consumedFailureCount)
+    );
+    return {
+      ...item,
+      count,
+      failureCount,
+      ...residual.usage
+    };
+  });
+}
+
+function groupTerminalSubagentsBySemanticKey(
+  activity: RunLifecycleActivityWebhookV1[]
+): Map<string, RunLifecycleActivityWebhookV1[]> {
+  const grouped = new Map<string, RunLifecycleActivityWebhookV1[]>();
+  for (const item of activity) {
+    if (item.kind !== "subagent") {
+      continue;
+    }
+    const key = terminalActivitySemanticKey(item);
+    grouped.set(key, [...(grouped.get(key) ?? []), item]);
+  }
+  return grouped;
+}
+
+function terminalSubagentLineageIsPlausible(
+  subagent: RunLifecycleActivityWebhookV1,
+  llmRequest: RunLifecycleActivityWebhookV1
+): boolean {
+  const subagentStartedMs = Date.parse(subagent.startedAt);
+  const llmStartedMs = Date.parse(llmRequest.startedAt);
+  return Number.isFinite(subagentStartedMs)
+    && Number.isFinite(llmStartedMs)
+    && Math.abs(subagentStartedMs - llmStartedMs) <= 15_000;
+}
+
+function terminalSubagentLineageSetIsPlausible(
+  subagents: RunLifecycleActivityWebhookV1[],
+  llmRequests: RunLifecycleActivityWebhookV1[],
+  authoritativeActivityId: string
+): boolean {
+  return llmRequests.every((request) =>
+    request.parentActivityId === authoritativeActivityId
+    || subagents.some((subagent) => terminalSubagentLineageIsPlausible(subagent, request))
+  ) && subagents.every((subagent) =>
+    llmRequests.some((request) =>
+      request.parentActivityId === authoritativeActivityId
+      || terminalSubagentLineageIsPlausible(subagent, request)
+    )
+  );
+}
+
+function uniqueTerminalActivityUsageSubset(
+  candidates: RunLifecycleActivityWebhookV1[],
+  expectedCount: number,
+  expectedUsage: RunTokenTotals,
+  requiredActivityIds: Set<string>
+): RunLifecycleActivityWebhookV1[] | undefined {
+  const eligible = candidates
+    .filter((candidate) => {
+      const usage = lifecycleActivityTokenTotals(candidate);
+      return usage.present && usage.valid;
+    })
+    .sort(compareLifecycleActivity);
+  if (
+    expectedCount < 1
+    || expectedCount > 8
+    || eligible.length < expectedCount
+    || eligible.length > 16
+    || requiredActivityIds.size > expectedCount
+  ) {
+    return undefined;
+  }
+  const matches: RunLifecycleActivityWebhookV1[][] = [];
+  const visit = (
+    index: number,
+    selected: RunLifecycleActivityWebhookV1[],
+    totals: RunTokenTotals
+  ): void => {
+    if (matches.length > 1 || selected.length > expectedCount) {
+      return;
+    }
+    if (selected.length === expectedCount) {
+      if (
+        terminalTokenTotalsEqual(totals, expectedUsage)
+        && [...requiredActivityIds].every((activityId) =>
+          selected.some((candidate) => candidate.activityId === activityId)
+        )
+      ) {
+        matches.push(selected);
+      }
+      return;
+    }
+    if (index >= eligible.length || selected.length + eligible.length - index < expectedCount) {
+      return;
+    }
+    const candidate = eligible[index];
+    const candidateUsage = lifecycleActivityTokenTotals(candidate);
+    const withCandidate = addTerminalTokenTotals(totals, candidateUsage);
+    if (!terminalTokenTotalsExceed(withCandidate, expectedUsage)) {
+      visit(index + 1, [...selected, candidate], withCandidate);
+    }
+    if (!requiredActivityIds.has(candidate.activityId)) {
+      visit(index + 1, selected, totals);
+    }
+  };
+  visit(0, [], {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 0
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function addTerminalTokenTotals(left: RunTokenTotals, right: RunTokenTotals): RunTokenTotals {
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    cacheReadInputTokens: left.cacheReadInputTokens + right.cacheReadInputTokens,
+    cacheCreationInputTokens: left.cacheCreationInputTokens + right.cacheCreationInputTokens,
+    reasoningOutputTokens: left.reasoningOutputTokens + right.reasoningOutputTokens,
+    totalTokens: left.totalTokens + right.totalTokens
+  };
+}
+
+function terminalTokenTotalsEqual(left: RunTokenTotals, right: RunTokenTotals): boolean {
+  return left.inputTokens === right.inputTokens
+    && left.outputTokens === right.outputTokens
+    && left.cacheReadInputTokens === right.cacheReadInputTokens
+    && left.cacheCreationInputTokens === right.cacheCreationInputTokens
+    && left.reasoningOutputTokens === right.reasoningOutputTokens
+    && left.totalTokens === right.totalTokens;
+}
+
+function terminalTokenTotalsExceed(left: RunTokenTotals, right: RunTokenTotals): boolean {
+  return left.inputTokens > right.inputTokens
+    || left.outputTokens > right.outputTokens
+    || left.cacheReadInputTokens > right.cacheReadInputTokens
+    || left.cacheCreationInputTokens > right.cacheCreationInputTokens
+    || left.reasoningOutputTokens > right.reasoningOutputTokens
+    || left.totalTokens > right.totalTokens;
+}
+
+function terminalActivityUsageEqualsSum(
+  activity: RunLifecycleActivityWebhookV1,
+  left: RunTokenTotals,
+  right: RunTokenTotals
+): boolean {
+  const usage = lifecycleActivityTokenTotals(activity);
+  return usage.present
+    && usage.valid
+    && usage.inputTokens === left.inputTokens + right.inputTokens
+    && usage.outputTokens === left.outputTokens + right.outputTokens
+    && usage.cacheReadInputTokens === left.cacheReadInputTokens + right.cacheReadInputTokens
+    && usage.cacheCreationInputTokens === left.cacheCreationInputTokens + right.cacheCreationInputTokens
+    && usage.reasoningOutputTokens === left.reasoningOutputTokens + right.reasoningOutputTokens;
+}
+
+function terminalActivityUsageKey(activity: RunLifecycleActivityWebhookV1): string | undefined {
+  const usage = lifecycleActivityTokenTotals(activity);
+  return usage.present && usage.valid
+    ? [
+        usage.inputTokens,
+        usage.outputTokens,
+        usage.cacheReadInputTokens,
+        usage.cacheCreationInputTokens,
+        usage.reasoningOutputTokens
+      ].join(":")
+    : undefined;
+}
+
+function terminalActivitySemanticKey(activity: RunLifecycleActivityWebhookV1): string {
+  return `${activity.kind}:${activity.name.trim().toLowerCase()}`;
+}
+
+function terminalActivityIdentity(activity: RunLifecycleActivityWebhookV1): string {
+  return isUnallocatedTerminalActivity(activity) ? "unallocated_run_usage" : activity.activityId;
+}
+
+function mergeTerminalActivityRow(
+  previous: RunLifecycleActivityWebhookV1,
+  next: RunLifecycleActivityWebhookV1
+): RunLifecycleActivityWebhookV1 {
+  const startedAt = earliestIso([previous.startedAt, next.startedAt]);
+  const endedAt = latestIsoOptional([previous.endedAt, next.endedAt]);
+  return {
+    ...previous,
+    ...next,
+    // Semantic aliases such as the unallocated-usage row can be projected with
+    // different implementation IDs. Once published, keep the public identity stable
+    // so alternating equivalent projections cannot churn terminal versions.
+    activityId: previous.activityId,
+    parentActivityId: next.parentActivityId ?? previous.parentActivityId,
+    startedAt,
+    endedAt,
+    durationMs: endedAt ? durationMs(startedAt, endedAt) : next.durationMs ?? previous.durationMs,
+    evidence: preferredWebhookEvidence(previous.evidence, next.evidence)
+  };
+}
+
+function conserveTerminalActivityUsage(
+  event: RunEndedWebhookEventDraft,
+  activity: RunLifecycleActivityWebhookV1[]
+): RunLifecycleActivityWebhookV1[] {
+  const remaining = terminalEventTokenTotals(event);
+  const result: RunLifecycleActivityWebhookV1[] = [];
+  let unallocated: RunLifecycleActivityWebhookV1 | undefined;
+  for (const item of activity.sort(compareLifecycleActivity)) {
+    if (isUnallocatedTerminalActivity(item)) {
+      unallocated = unallocated ? mergeTerminalActivityRow(unallocated, item) : item;
+      continue;
+    }
+    const usage = lifecycleActivityTokenTotals(item);
+    const fits = usage.valid
+      && usage.inputTokens <= remaining.inputTokens
+      && usage.outputTokens <= remaining.outputTokens
+      && usage.cacheReadInputTokens <= remaining.cacheReadInputTokens
+      && usage.cacheCreationInputTokens <= remaining.cacheCreationInputTokens
+      && usage.reasoningOutputTokens <= remaining.reasoningOutputTokens;
+    if (!usage.present || !fits) {
+      result.push(usage.present ? withoutLifecycleActivityUsage(item) : item);
+      continue;
+    }
+    remaining.inputTokens -= usage.inputTokens;
+    remaining.outputTokens -= usage.outputTokens;
+    remaining.cacheReadInputTokens -= usage.cacheReadInputTokens;
+    remaining.cacheCreationInputTokens -= usage.cacheCreationInputTokens;
+    remaining.reasoningOutputTokens -= usage.reasoningOutputTokens;
+    remaining.totalTokens = remaining.inputTokens + remaining.outputTokens;
+    result.push({
+      ...item,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      reasoningOutputTokens: usage.reasoningOutputTokens,
+      totalTokens: usage.totalTokens
+    });
+  }
+  if (hasTokenUsage(remaining)) {
+    result.push({
+      ...(unallocated ?? {
+        activityId: `activity_${contentHash({ runId: event.runId, kind: "unallocated_terminal_usage" }).slice(0, 24)}`,
+        kind: "unknown" as const,
+        name: "Unallocated run usage",
+        outcome: "unknown" as const,
+        count: 1,
+        failureCount: 0,
+        startedAt: event.startedAt,
+        endedAt: event.endedAt,
+        evidence: event.evidence
+      }),
+      ...remaining,
+      usageAttributionBasis: "unavailable",
+      usageCoverage: result.some(hasLiveActivityUsage) ? "partial" : "unavailable"
+    });
+  }
+  return result.sort(compareLifecycleActivity);
+}
+
+function isUnallocatedTerminalActivity(activity: RunLifecycleActivityWebhookV1): boolean {
+  return activity.kind === "unknown" && activity.name === "Unallocated run usage";
+}
+
+function terminalEventTokenTotals(event: RunEndedWebhookEventDraft): RunTokenTotals {
+  return {
+    inputTokens: nonNegativeToken(event.inputTokens),
+    outputTokens: nonNegativeToken(event.outputTokens),
+    cacheReadInputTokens: nonNegativeToken(event.cacheReadInputTokens),
+    cacheCreationInputTokens: nonNegativeToken(event.cacheCreationInputTokens),
+    reasoningOutputTokens: nonNegativeToken(event.reasoningOutputTokens),
+    totalTokens: nonNegativeToken(event.inputTokens) + nonNegativeToken(event.outputTokens)
+  };
+}
+
+function lifecycleActivityTokenTotals(
+  activity: RunLifecycleActivityWebhookV1
+): RunTokenTotals & { present: boolean; valid: boolean } {
+  const values = [
+    activity.inputTokens,
+    activity.outputTokens,
+    activity.cacheReadInputTokens,
+    activity.cacheCreationInputTokens,
+    activity.reasoningOutputTokens
+  ];
+  const inputTokens = nonNegativeToken(activity.inputTokens);
+  const outputTokens = nonNegativeToken(activity.outputTokens);
+  return {
+    present: values.some((value) => value != null) || activity.totalTokens != null,
+    valid: values.every((value) => value == null || isNonNegativeSafeInteger(value))
+      && (activity.totalTokens == null
+        || (isNonNegativeSafeInteger(activity.totalTokens) && activity.totalTokens === inputTokens + outputTokens)),
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens: nonNegativeToken(activity.cacheReadInputTokens),
+    cacheCreationInputTokens: nonNegativeToken(activity.cacheCreationInputTokens),
+    reasoningOutputTokens: nonNegativeToken(activity.reasoningOutputTokens),
+    totalTokens: inputTokens + outputTokens
+  };
+}
+
+function preferredWebhookEvidence(previous: WebhookEvidenceV1, next: WebhookEvidenceV1): WebhookEvidenceV1 {
+  const previousScore = webhookEvidenceScore(previous);
+  const nextScore = webhookEvidenceScore(next);
+  if (nextScore !== previousScore) {
+    return nextScore > previousScore ? next : previous;
+  }
+  return next.observedAt > previous.observedAt ? next : previous;
+}
+
+function webhookEvidenceScore(evidence: WebhookEvidenceV1): number {
+  const basisRank: Record<WebhookEvidenceV1["basis"], number> = {
+    prompt_hook: 6,
+    session_hook: 6,
+    tool_hook: 7,
+    subagent_hook: 7,
+    stop_hook: 8,
+    root_span: 5,
+    trace_span: 5,
+    otel_event: 4,
+    provider_metric: 4,
+    span_db_replay: 4,
+    usage_projection: 3,
+    inactivity: 2
+  };
+  return basisRank[evidence.basis] * 10
+    + (evidence.identityConfidence === "high" ? 4 : 0)
+    + (evidence.timingConfidence === "high" ? 2 : 0)
+    + (evidence.delayed ? 0 : 1);
+}
+
+function mergeTerminalCoverage(previous: WebhookCoverageV1, next: WebhookCoverageV1): WebhookCoverageV1 {
+  return {
+    usageCoverage: terminalUsageCoverageRank(next.usageCoverage) >= terminalUsageCoverageRank(previous.usageCoverage)
+      ? next.usageCoverage
+      : previous.usageCoverage,
+    activityCoverage: terminalActivityCoverageRank(next.activityCoverage) >= terminalActivityCoverageRank(previous.activityCoverage)
+      ? next.activityCoverage
+      : previous.activityCoverage,
+    costCoverage: costCoverageRank(next.costCoverage) >= costCoverageRank(previous.costCoverage)
+      ? next.costCoverage
+      : previous.costCoverage
+  };
+}
+
+function preferredTerminalContext(
+  previous: RunContextFootprintV1 | undefined,
+  next: RunContextFootprintV1 | undefined
+): RunContextFootprintV1 | undefined {
+  if (!previous) return next;
+  if (!next) return previous;
+  const previousScore = terminalContextScore(previous);
+  const nextScore = terminalContextScore(next);
+  return nextScore > previousScore ? next : previous;
+}
+
+function terminalContextScore(context: RunContextFootprintV1): number {
+  const coverageRank = context.coverage === "final" ? 3 : context.coverage === "complete_so_far" ? 2 : 1;
+  const populatedDimensions = [
+    context.initialInputContextTokens,
+    context.latestInputContextTokens,
+    context.peakInputContextTokens,
+    context.contextGrowthInputTokens,
+    context.contextGrowthRatio
+  ].filter((value) => value != null).length;
+  return coverageRank * 1_000_000
+    + Math.min(context.observedLlmRequestCount, 100_000) * 10
+    + populatedDimensions;
+}
+
+function terminalUsageCoverageRank(value: WebhookCoverageV1["usageCoverage"]): number {
+  return value === "final" ? 4 : value === "complete_so_far" ? 3 : value === "partial" ? 2 : 1;
+}
+
+function terminalActivityCoverageRank(value: WebhookCoverageV1["activityCoverage"]): number {
+  return value === "complete_for_reported_surface" ? 3 : value === "partial" ? 2 : 1;
+}
+
+function shouldCoalesceTerminalActivityCorrection(event: RunEndedWebhookEventV1): boolean {
+  return (event.version ?? 1) > 1
+    && event.coverage.usageCoverage === "final"
+    && event.coverage.activityCoverage === "partial"
+    && (event.activity ?? []).some((activity) =>
+      activity.kind === "subagent" && activity.usageCoverage !== "complete");
+}
+
+function repositoryIdentityScore(repository: WebhookRepositoryV1): number {
+  return Number(repository.name !== "repository") * 2
+    + Number(repository.owner !== "local")
+    + Number(repository.fullName !== "local/repository");
+}
+
 function commitSubject(repoKey: string, commitHash: string): string {
   return `commit.attributed:${repoKey}:${commitHash}`;
 }
@@ -3034,11 +5522,36 @@ function commitMessagePayload(message?: string): { commitMessage?: string } {
 }
 
 function contentHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  return createHash("sha256").update(JSON.stringify(canonicalJsonValue(value))).digest("hex");
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalJsonValue);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalJsonValue(item)]));
+  }
+  return value;
+}
+
+function providerIdentityKey(provider: SafeObservationV1["provider"], identity: string): string {
+  return `${provider}:${identity}`;
+}
+
+function addRepositoryHint(hints: Map<string, Set<string>>, identity: string, repositoryKey: string): void {
+  hints.set(identity, new Set([...(hints.get(identity) ?? []), repositoryKey]));
 }
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim() !== ""))].sort();
+}
+
+function uniqueOutboxEntries(entries: WebhookOutboxEntry[]): WebhookOutboxEntry[] {
+  return [...new Map(entries.map((entry) => [entry.key, entry])).values()];
 }
 
 function safeRepoRelativePaths(values: string[]): string[] {
@@ -3100,54 +5613,6 @@ function isWebhookOpaqueString(value: string): boolean {
 
 function isWebhookBoundedString(value: string): boolean {
   return value.length <= 200 && !/[\r\n\t]/.test(value);
-}
-
-function writingRunIdsFromDeliveredLifecycle(
-  outboxEntries: WebhookOutboxEntry[],
-  subjectStates: WebhookSubjectState[] = []
-): Set<string> {
-  const runIds = new Set<string>();
-  const projectedWritingState = new Map<string, boolean>();
-  for (const state of subjectStates) {
-    if (state.eventType !== "run.ended" || !state.deliveredAt) {
-      continue;
-    }
-    const runId = runIdFromRunEndedSubject(state.subjectId);
-    if (!runId) {
-      continue;
-    }
-    projectedWritingState.set(runId, (state.filesChangedCount ?? 0) > 0);
-  }
-  for (const entry of outboxEntries) {
-    if (entry.eventType !== "run.ended") {
-      continue;
-    }
-    const event = entry.event as RunEndedWebhookEventV1;
-    if (event.runId.trim() === "") {
-      continue;
-    }
-    const writes = (event.filesChanged?.length ?? 0) > 0;
-    if (projectedWritingState.get(event.runId) === false) {
-      continue;
-    }
-    if (writes) {
-      projectedWritingState.set(event.runId, true);
-      continue;
-    }
-    if (entry.deliveredAt || entry.deliveryState === "delivered") {
-      projectedWritingState.set(event.runId, projectedWritingState.get(event.runId) ?? false);
-    }
-  }
-  for (const [runId, writes] of projectedWritingState) {
-    if (writes) {
-      runIds.add(runId);
-    }
-  }
-  return runIds;
-}
-
-function runIdFromRunEndedSubject(subjectId: string): string | undefined {
-  return subjectId.startsWith("run.ended:") ? subjectId.slice("run.ended:".length) : undefined;
 }
 
 function runIdsForCommit(
@@ -3221,7 +5686,7 @@ function artifactKeysForRun(
         evidence.repoKey === repoKey
         && (evidence.queryId === queryId || (evidence.runIds ?? []).includes(run.runId))
       )
-      .flatMap((evidence) => evidence.artifactKeys ?? [])
+      .flatMap((evidence) => evidence.causalArtifactKeys ?? [])
   ));
 }
 
@@ -3258,7 +5723,7 @@ function artifactKeysForEvidenceScope(
         || (evidence.runIds ?? []).some((runId) => runIdSet.has(runId))
       )
     )
-    .flatMap((evidence) => evidence.artifactKeys ?? []));
+    .flatMap((evidence) => evidence.causalArtifactKeys ?? []));
 }
 
 function attributedCommitCost(
@@ -3338,6 +5803,10 @@ function retryDelayMs(attempts: number): number {
   return Math.min(MAX_RETRY_DELAY_MS, RETRY_INTERVAL_MS * Math.max(1, attempts));
 }
 
+function positiveDurationMs(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
 function asWebhookFailure(error: unknown): { code: string; retryable: boolean } {
   if (isWebhookFailure(error)) {
     return error;
@@ -3355,7 +5824,8 @@ function isWebhookFailure(value: unknown): value is { code: string; retryable: b
 async function postWebhook(
   configuration: StoredWebhookConfiguration,
   event: WebhookEventV1,
-  attemptAt: string
+  attemptAt: string,
+  requestTimeoutMs: number
 ): Promise<{ statusCode: number }> {
   const payload = JSON.stringify(event);
   const target = new URL(configuration.url!);
@@ -3401,6 +5871,10 @@ async function postWebhook(
       });
     });
     request.once("error", () => reject({ code: "network_error", retryable: true }));
+    request.setTimeout(requestTimeoutMs, () => {
+      reject({ code: "delivery_timeout", retryable: true });
+      request.destroy();
+    });
     request.end(payload);
   });
   return { statusCode };

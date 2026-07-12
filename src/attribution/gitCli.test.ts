@@ -123,12 +123,35 @@ describe("GitCli", () => {
     const snapshot = await cli.snapshot(repo);
 
     expect(snapshot.dirty).toBe(true);
+    expect(snapshot.artifactCoverage).toBe("partial");
     expect(snapshot.artifacts).toHaveLength(MAX_WORKTREE_SNAPSHOT_ARTIFACTS);
     expect(snapshot.artifacts).toEqual(expect.arrayContaining([
       expect.objectContaining({
         identifier: "tirion-webhook-smoke.txt",
         artifactKey: new AttributionHasher("test-salt").artifactKey(repo.repoKey, "tirion-webhook-smoke.txt")
       })
+    ]));
+  });
+
+  it("bounds filesystem metadata probes for very large dirty worktrees", async () => {
+    const dir = await repository();
+    await fs.mkdir(path.join(dir, "bulk"));
+    for (let index = 0; index < MAX_WORKTREE_SNAPSHOT_ARTIFACTS * 12; index += 1) {
+      await fs.writeFile(path.join(dir, "bulk", `${String(index).padStart(4, "0")}.txt`), "bulk\n", "utf8");
+    }
+    await fs.writeFile(path.join(dir, "latest-root-file.txt"), "latest\n", "utf8");
+    let statCalls = 0;
+    const cli = new GitCli(new AttributionHasher("test-salt"), async (filePath) => {
+      statCalls += 1;
+      return await fs.stat(filePath);
+    });
+    const [repo] = (await cli.discoverRepositories([dir])).repositories;
+
+    const snapshot = await cli.snapshot(repo);
+
+    expect(statCalls).toBeLessThanOrEqual(MAX_WORKTREE_SNAPSHOT_ARTIFACTS * 4);
+    expect(snapshot.artifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ identifier: "latest-root-file.txt" })
     ]));
   });
 

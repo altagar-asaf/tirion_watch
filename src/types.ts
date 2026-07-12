@@ -482,6 +482,7 @@ export type TraceRole = "main" | "helper" | "unknown";
 
 type AgenticRunRecordBase = Omit<LegacyAgenticQueryRun, "schemaVersion"> & {
   billingContext?: BillingContextId;
+  repoKey?: string;
   queryId: string;
   queryStartedAt: string;
   chatSessionId?: string;
@@ -743,6 +744,8 @@ export type RepositorySnapshotObservation = {
   observedSequence: number;
   dirty: boolean;
   dirtyKnown: boolean;
+  /** A partial snapshot can prove observed changes but cannot establish a complete baseline. */
+  artifactCoverage?: "complete" | "partial";
   artifactStates: ArtifactStateEvidence[];
 };
 
@@ -767,6 +770,8 @@ export type QueryWorkEvidence = {
   dirtyAtStart: boolean;
   observedChangeCount: number;
   artifactKeys: string[];
+  /** Artifact keys causally tied to this query by exact successful write telemetry. */
+  causalArtifactKeys?: string[];
   baselineArtifactStates?: ArtifactStateEvidence[];
   artifactStates?: ArtifactStateEvidence[];
   addedLines: number;
@@ -972,6 +977,9 @@ export type WorkEpisodeQuery = {
   repoKey?: string;
   commitHash?: string;
   status?: WorkEpisodeStatus;
+  queryId?: string;
+  runId?: string;
+  chatSessionId?: string;
 };
 
 export type CommitAttributionChange = {

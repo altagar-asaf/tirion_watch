@@ -85,8 +85,8 @@ export class DefaultAgenticWorkEpisodeTracker implements AgenticWorkEpisodeTrack
       if (evidence.length === 0) {
         return;
       }
-      const episodes = await this.ledger.listEpisodes({});
       for (const item of evidence) {
+        const episodes = await this.ledger.listEpisodes({ queryId: item.queryId });
         const episode = episodes.find((candidate) => candidate.queryIds.includes(item.queryId));
         if (!episode) {
           continue;
@@ -149,7 +149,9 @@ export class DefaultAgenticWorkEpisodeTracker implements AgenticWorkEpisodeTrack
 
   private async findOrCreateEpisode(run: PartialAgenticQueryRun, runTime: string): Promise<AgenticWorkEpisode> {
     const sessionId = sessionGroupingId(run);
-    const episodes = await this.ledger.listEpisodes({});
+    const episodes = await this.ledger.listEpisodes(run.chatSessionId
+      ? { chatSessionId: run.chatSessionId }
+      : { queryId: run.queryId! });
     const existing = episodes.find((episode) =>
       (
         episode.status === "open"
@@ -265,6 +267,7 @@ function mergeEvidenceRecord(a: QueryWorkEvidence, b: QueryWorkEvidence): QueryW
     dirtyAtStart: a.dirtyAtStart || b.dirtyAtStart,
     observedChangeCount: artifactStates.length,
     artifactKeys: uniqueStrings([...a.artifactKeys, ...b.artifactKeys]),
+    causalArtifactKeys: uniqueStrings([...(a.causalArtifactKeys ?? []), ...(b.causalArtifactKeys ?? [])]),
     artifactStates,
     addedLines: Math.max(a.addedLines, b.addedLines),
     deletedLines: Math.max(a.deletedLines, b.deletedLines),

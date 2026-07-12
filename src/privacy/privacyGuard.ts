@@ -85,6 +85,7 @@ const RUN_ENDED_WEBHOOK_KEYS = new Set([
   "costEstimateBasis",
   "costCoverage",
   "context",
+  "activity",
   "state"
 ]);
 
@@ -473,6 +474,7 @@ function isStrictRunUpdatedWebhookEvent(value: unknown): boolean {
     && isNonNegativeSafeInteger(value.cacheCreationInputTokens)
     && isNonNegativeSafeInteger(value.reasoningOutputTokens)
     && isNonNegativeSafeInteger(value.totalTokens)
+    && value.totalTokens === value.inputTokens + value.outputTokens
     && isWebhookStringArray(value.llmModels)
     && isNonNegativeSafeInteger(value.estimatedNanoUsd)
     && (value.usageValueNanoUsd == null || isNonNegativeSafeInteger(value.usageValueNanoUsd))
@@ -483,7 +485,8 @@ function isStrictRunUpdatedWebhookEvent(value: unknown): boolean {
     && isRecord(value.coverage)
     && value.coverage.costCoverage === value.costCoverage
     && (value.context == null || isWebhookContextFootprint(value.context))
-    && isWebhookActivityArray(value.activity);
+    && isWebhookActivityArray(value.activity)
+    && webhookActivityConservesUsage(value.activity, value);
 }
 
 function isStrictRunEndedWebhookEvent(value: unknown): boolean {
@@ -511,6 +514,7 @@ function isStrictRunEndedWebhookEvent(value: unknown): boolean {
     && isNonNegativeSafeInteger(value.cacheCreationInputTokens)
     && isNonNegativeSafeInteger(value.reasoningOutputTokens)
     && isNonNegativeSafeInteger(value.totalTokens)
+    && value.totalTokens === value.inputTokens + value.outputTokens
     && isWebhookStringArray(value.llmModels)
     && isRepoRelativePathArray(value.filesChanged)
     && isNonNegativeSafeInteger(value.estimatedNanoUsd)
@@ -521,8 +525,14 @@ function isStrictRunEndedWebhookEvent(value: unknown): boolean {
     && (value.costCoverage === "complete" || value.costCoverage === "partial" || value.costCoverage === "unavailable")
     && isRecord(value.coverage)
     && value.coverage.costCoverage === value.costCoverage
-    && value.coverage.usageCoverage === "final"
-    && (value.context == null || isWebhookContextFootprint(value.context, "final"))
+    // An explicit harness completion is safe to publish promptly with clearly
+    // provisional usage. A later versioned terminal event still supplies final usage.
+    && isPermittedTerminalUsageCoverage(value.coverage.usageCoverage, value.evidence)
+    && (value.context == null || isWebhookContextFootprint(value.context, webhookUsageCoverage(value.coverage)))
+    && (value.activity == null || (
+      isWebhookActivityArray(value.activity)
+      && webhookActivityConservesUsage(value.activity, value)
+    ))
     && value.state === "completed";
 }
 
@@ -595,7 +605,27 @@ function isWebhookEvidenceBasis(value: unknown): boolean {
     || value === "otel_event"
     || value === "provider_metric"
     || value === "span_db_replay"
+    || value === "usage_projection"
     || value === "inactivity";
+}
+
+function isPermittedTerminalUsageCoverage(usageCoverage: unknown, evidence: unknown): boolean {
+  if (usageCoverage === "final") {
+    return true;
+  }
+  return (usageCoverage === "none" || usageCoverage === "partial" || usageCoverage === "complete_so_far")
+    && isExplicitTerminalWebhookEvidence(evidence);
+}
+
+function isExplicitTerminalWebhookEvidence(value: unknown): boolean {
+  return isRecord(value)
+    && value.delayed === false
+    && value.identityConfidence === "high"
+    && value.timingConfidence === "high"
+    && (value.basis === "stop_hook"
+      || value.basis === "session_hook"
+      || value.basis === "root_span"
+      || value.basis === "otel_event");
 }
 
 function isWebhookCoverage(value: unknown): boolean {
@@ -609,6 +639,12 @@ function isWebhookCoverage(value: unknown): boolean {
       || value.activityCoverage === "partial"
       || value.activityCoverage === "complete_for_reported_surface")
     && (value.costCoverage === "complete" || value.costCoverage === "partial" || value.costCoverage === "unavailable");
+}
+
+function webhookUsageCoverage(value: unknown): string | undefined {
+  return isRecord(value) && typeof value.usageCoverage === "string"
+    ? value.usageCoverage
+    : undefined;
 }
 
 function isWebhookContextFootprint(value: unknown, requiredCoverage?: string): boolean {
@@ -660,15 +696,22 @@ function isWebhookActivity(value: unknown): boolean {
       "kind",
       "name",
       "outcome",
+      "count",
+      "failureCount",
+      "unknownCount",
       "startedAt",
       "endedAt",
       "durationMs",
+      "resultSizeBytes",
+      "providerReportedResultTokens",
       "inputTokens",
       "outputTokens",
       "cacheReadInputTokens",
       "cacheCreationInputTokens",
       "reasoningOutputTokens",
       "totalTokens",
+      "usageAttributionBasis",
+      "usageCoverage",
       "evidence"
     ].includes(key))
     && isWebhookOpaqueId(value.activityId)
@@ -676,16 +719,62 @@ function isWebhookActivity(value: unknown): boolean {
     && isWebhookActivityKind(value.kind)
     && isWebhookRuntime(value.name)
     && (value.outcome === "success" || value.outcome === "failure" || value.outcome === "rejected" || value.outcome === "unknown")
+    && (value.count == null || isPositiveSafeInteger(value.count))
+    && (value.failureCount == null || (
+      isNonNegativeSafeInteger(value.failureCount)
+      && isPositiveSafeInteger(value.count)
+      && value.failureCount <= value.count
+    ))
+    && (value.unknownCount == null || (
+      isNonNegativeSafeInteger(value.unknownCount)
+      && isPositiveSafeInteger(value.count)
+      && value.unknownCount <= value.count
+      && Number(value.failureCount ?? 0) + value.unknownCount <= value.count
+    ))
     && isTimestamp(value.startedAt)
     && (value.endedAt == null || (isTimestamp(value.endedAt) && value.endedAt >= value.startedAt))
     && (value.durationMs == null || isNonNegativeSafeInteger(value.durationMs))
+    && (value.resultSizeBytes == null || isNonNegativeSafeInteger(value.resultSizeBytes))
+    && (value.providerReportedResultTokens == null || isNonNegativeSafeInteger(value.providerReportedResultTokens))
     && (value.inputTokens == null || isNonNegativeSafeInteger(value.inputTokens))
     && (value.outputTokens == null || isNonNegativeSafeInteger(value.outputTokens))
     && (value.cacheReadInputTokens == null || isNonNegativeSafeInteger(value.cacheReadInputTokens))
     && (value.cacheCreationInputTokens == null || isNonNegativeSafeInteger(value.cacheCreationInputTokens))
     && (value.reasoningOutputTokens == null || isNonNegativeSafeInteger(value.reasoningOutputTokens))
     && (value.totalTokens == null || isNonNegativeSafeInteger(value.totalTokens))
+    && (value.totalTokens == null
+      || (value.inputTokens == null && value.outputTokens == null)
+      || value.totalTokens === (value.inputTokens ?? 0) + (value.outputTokens ?? 0))
+    && (value.usageAttributionBasis == null
+      || value.usageAttributionBasis === "provider_reported"
+      || value.usageAttributionBasis === "trace_descendant"
+      || value.usageAttributionBasis === "activity_only"
+      || value.usageAttributionBasis === "unavailable")
+    && (value.usageCoverage == null
+      || value.usageCoverage === "complete"
+      || value.usageCoverage === "partial"
+      || value.usageCoverage === "unavailable")
     && isWebhookEvidence(value.evidence);
+}
+
+function webhookActivityConservesUsage(
+  activity: unknown,
+  run: Record<string, unknown>
+): boolean {
+  if (!Array.isArray(activity)) {
+    return false;
+  }
+  return [
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "reasoningOutputTokens",
+    "totalTokens"
+  ].every((field) => activity.reduce<number>((sum, item) => {
+    const value = isRecord(item) ? item[field] : undefined;
+    return sum + (isNonNegativeSafeInteger(value) ? value : 0);
+  }, 0) === run[field]);
 }
 
 function isWebhookActivityKind(value: unknown): boolean {

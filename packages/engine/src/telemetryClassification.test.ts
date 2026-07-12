@@ -401,7 +401,7 @@ describe("first-heartbeat privacy and classification", () => {
     expect(JSON.stringify(occurrences)).not.toContain("copilot-session");
   });
 
-  it("segments Codex log usage by user prompt and revises cumulative completion snapshots", () => {
+  it("segments Codex log usage by user prompt and retains every completed model response", () => {
     const guard = new DefaultAgentPrivacyGuard();
     const raw = {
       resourceLogs: [{
@@ -453,11 +453,12 @@ describe("first-heartbeat privacy and classification", () => {
       startedAt: "2026-06-08T00:00:00.000Z"
     })]);
     expect(atoms).toHaveLength(2);
-    expect(atoms[0].atomId).toBe(atoms[1].atomId);
+    expect(atoms[0].atomId).not.toBe(atoms[1].atomId);
+    expect(atoms[0].requestId).not.toBe(atoms[1].requestId);
     expect(atoms[1]).toMatchObject({
       queryId: occurrences[0].queryId,
       sessionId: occurrences[0].sessionId,
-      authority: "turn",
+      authority: "request",
       signal: "logs",
       sourceId: "otlp_codex_logs",
       profileVersion: "codex-otel-logs-v1",
@@ -466,7 +467,7 @@ describe("first-heartbeat privacy and classification", () => {
       outputTokens: 5,
       cacheReadInputTokens: 40,
       reasoningOutputTokens: 35,
-      startedAt: "2026-06-08T00:00:00.000Z",
+      startedAt: "2026-06-08T00:00:02.000Z",
       endedAt: "2026-06-08T00:00:02.000Z"
     });
     expect(JSON.stringify(atoms)).not.toContain("codex-conversation");
@@ -513,10 +514,10 @@ describe("first-heartbeat privacy and classification", () => {
     expect(atoms).toEqual([expect.objectContaining({
       queryId: occurrences[0].queryId,
       sessionId: occurrences[0].sessionId,
-      authority: "turn",
+      authority: "request",
       inputTokens: 200,
       outputTokens: 20,
-      startedAt: "2026-06-08T00:00:00.000Z",
+      startedAt: "2026-06-08T00:00:04.000Z",
       endedAt: "2026-06-08T00:00:04.000Z"
     })]);
     expect(JSON.stringify(atoms)).not.toContain("codex-parent-conversation");
@@ -588,6 +589,275 @@ describe("first-heartbeat privacy and classification", () => {
       profileVersion: "codex-otel-traces-v1",
       tokenDimensions: ["input", "output", "cache_read_input", "cache_creation_input", "reasoning_output", "total"]
     });
+  });
+
+  it("reconciles delayed root and child Codex hooks without replacing the active root turn", () => {
+    const guard = new DefaultAgentPrivacyGuard();
+    const rootSession = "019f4fd6-2481-73e2-b765-bd1b21209467";
+    const childSession = "019f4fd6-4d3b-7ca0-b63c-31c75ce51794";
+    const rootTurn = "019f4fd6-2caa-7a75-b226-c328794de001";
+    const childTurn = "019f4fd6-51ad-7f12-abc6-9fef9b326c62";
+    const promptEnvelope = (session: string, at: string) => ({
+      resourceLogs: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
+        scopeLogs: [{ logRecords: [{
+          attributes: [
+            { key: "event.name", value: { stringValue: "codex.user_prompt" } },
+            { key: "event.timestamp", value: { stringValue: at } },
+            { key: "conversation.id", value: { stringValue: session } }
+          ]
+        }] }]
+      }]
+    });
+    const rootPrompt = promptEnvelope(rootSession, "2026-06-08T00:00:00.000Z");
+    const rootMetadata = guard.sanitizeOtlpEnvelope(rootPrompt, "logs", "2026-06-08T00:00:00.000Z");
+    const rootClassification = new DefaultTelemetryClassification().classify(rootMetadata);
+    const rootOccurrence = guard.sanitizeQueryOccurrences(
+      rootPrompt,
+      "logs",
+      rootClassification,
+      rootMetadata.observedAt
+    )[0];
+    const rootHook = guard.sanitizeProviderHookObservation({
+      hook_event_name: "UserPromptSubmit",
+      session_id: rootSession,
+      turn_id: rootTurn,
+      transcript_path: `/private/session/rollout-2026-06-08T03-00-00-${rootSession}.jsonl`,
+      prompt: "private root prompt"
+    }, "codex", "2026-06-08T00:00:02.000Z");
+    expect(rootHook?.queryOccurrences?.[0]).toMatchObject({
+      queryId: rootOccurrence.queryId,
+      sessionId: rootOccurrence.sessionId,
+      startedAt: rootOccurrence.startedAt,
+      evidence: "submission_hook",
+      lifecycleVisibility: "customer"
+    });
+
+    const childPrompt = promptEnvelope(childSession, "2026-06-08T00:00:03.100Z");
+    const childMetadata = guard.sanitizeOtlpEnvelope(childPrompt, "logs", "2026-06-08T00:00:03.100Z");
+    const childClassification = new DefaultTelemetryClassification().classify(childMetadata);
+    const childOccurrence = guard.sanitizeQueryOccurrences(
+      childPrompt,
+      "logs",
+      childClassification,
+      childMetadata.observedAt
+    )[0];
+    const childHook = guard.sanitizeProviderHookObservation({
+      hook_event_name: "UserPromptSubmit",
+      session_id: rootSession,
+      turn_id: childTurn,
+      transcript_path: `/private/session/rollout-2026-06-08T03-00-03-${childSession}.jsonl`,
+      prompt: "private child prompt"
+    }, "codex", "2026-06-08T00:00:05.000Z");
+    expect(childHook?.queryOccurrences?.[0]).toMatchObject({
+      queryId: childOccurrence.queryId,
+      sessionId: childOccurrence.sessionId,
+      parentSessionId: rootOccurrence.sessionId,
+      startedAt: childOccurrence.startedAt,
+      evidence: "submission_hook"
+    });
+    expect(childOccurrence.sessionId).not.toBe(rootOccurrence.sessionId);
+    const subagentStart = guard.sanitizeProviderHookObservation({
+      hook_event_name: "SubagentStart",
+      session_id: rootSession,
+      turn_id: childTurn,
+      transcript_path: `/private/session/rollout-2026-06-08T03-00-03-${childSession}.jsonl`,
+      agent_id: childSession,
+      agent_type: "explorer"
+    }, "codex", "2026-06-08T00:00:05.100Z");
+    expect(subagentStart?.activityAtoms?.[0]).toMatchObject({
+      queryId: rootOccurrence.queryId,
+      childSessionId: childOccurrence.sessionId
+    });
+
+    const childTrace = {
+      resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
+        scopeSpans: [{ spans: [{
+          traceId: "codex-child-trace",
+          spanId: "codex-child-turn",
+          name: "codex.turn",
+          startTimeUnixNano: otlpNano("2026-06-08T00:00:03.100Z"),
+          endTimeUnixNano: otlpNano("2026-06-08T00:00:07.000Z"),
+          attributes: [
+            { key: "conversation.id", value: { stringValue: rootSession } },
+            { key: "turn.id", value: { stringValue: childTurn } },
+            { key: "gen_ai.usage.input_tokens", value: { intValue: "30" } },
+            { key: "gen_ai.usage.output_tokens", value: { intValue: "4" } }
+          ]
+        }] }]
+      }]
+    };
+    const childTraceMetadata = guard.sanitizeOtlpEnvelope(childTrace, "traces", "2026-06-08T00:00:07.100Z");
+    const childTraceClassification = new DefaultTelemetryClassification().classify(childTraceMetadata);
+    const childAtoms = guard.sanitizeUsageAtoms(
+      childTrace,
+      "traces",
+      childTraceClassification,
+      childTraceMetadata.observedAt
+    );
+    expect(childAtoms).toEqual([expect.objectContaining({
+      queryId: childOccurrence.queryId,
+      sessionId: childOccurrence.sessionId,
+      authority: "turn",
+      completionMode: "explicit"
+    })]);
+
+    const rootResponse = {
+      resourceLogs: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
+        scopeLogs: [{ logRecords: [{
+          attributes: [
+            { key: "event.name", value: { stringValue: "codex.sse_event" } },
+            { key: "event.kind", value: { stringValue: "response.completed" } },
+            { key: "event.timestamp", value: { stringValue: "2026-06-08T00:00:08.000Z" } },
+            { key: "conversation.id", value: { stringValue: rootSession } },
+            { key: "input_token_count", value: { intValue: "80" } },
+            { key: "output_token_count", value: { intValue: "8" } }
+          ]
+        }] }]
+      }]
+    };
+    const rootResponseMetadata = guard.sanitizeOtlpEnvelope(rootResponse, "logs", "2026-06-08T00:00:08.000Z");
+    const rootResponseClassification = new DefaultTelemetryClassification().classify(rootResponseMetadata);
+    expect(guard.sanitizeUsageAtoms(
+      rootResponse,
+      "logs",
+      rootResponseClassification,
+      rootResponseMetadata.observedAt
+    )).toEqual([expect.objectContaining({
+      queryId: rootOccurrence.queryId,
+      sessionId: rootOccurrence.sessionId,
+      authority: "request"
+    })]);
+    expect(JSON.stringify([rootHook, childHook, childAtoms])).not.toContain("/private/session");
+    expect(JSON.stringify([rootHook, childHook])).not.toContain("private root prompt");
+    expect(JSON.stringify([rootHook, childHook])).not.toContain("private child prompt");
+  });
+
+  it("does not expose Codex implementation spans as LLM or tool activity", () => {
+    const guard = new DefaultAgentPrivacyGuard();
+    expect(guard.sanitizeProviderHookObservation({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "codex-internal-session",
+      turn_id: "codex-internal-turn",
+      transcript_path: "/private/session/codex-internal-session.jsonl"
+    }, "codex", "2026-06-08T00:00:00.000Z")).toBeDefined();
+    const raw = {
+      resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
+        scopeSpans: [{ spans: [{
+          traceId: "codex-internal-trace",
+          spanId: "turn",
+          name: "codex.turn",
+          startTimeUnixNano: otlpNano("2026-06-08T00:00:00.000Z"),
+          endTimeUnixNano: otlpNano("2026-06-08T00:00:02.000Z"),
+          attributes: [
+            { key: "conversation.id", value: { stringValue: "codex-internal-session" } },
+            { key: "turn.id", value: { stringValue: "codex-internal-turn" } },
+            { key: "gen_ai.request.model", value: { stringValue: "gpt-5.5" } },
+            { key: "gen_ai.usage.input_tokens", value: { intValue: "20" } },
+            { key: "gen_ai.usage.output_tokens", value: { intValue: "3" } }
+          ]
+        }, {
+          traceId: "codex-internal-trace",
+          spanId: "startup",
+          parentSpanId: "turn",
+          name: "codex.startup_phase",
+          startTimeUnixNano: otlpNano("2026-06-08T00:00:00.050Z"),
+          endTimeUnixNano: otlpNano("2026-06-08T00:00:00.075Z"),
+          attributes: [
+            { key: "conversation.id", value: { stringValue: "codex-internal-session" } },
+            { key: "turn.id", value: { stringValue: "codex-internal-turn" } },
+            { key: "gen_ai.request.model", value: { stringValue: "gpt-5.5" } }
+          ]
+        }, {
+          traceId: "codex-internal-trace",
+          spanId: "persist",
+          parentSpanId: "turn",
+          name: "persist_rollout_items",
+          startTimeUnixNano: otlpNano("2026-06-08T00:00:00.100Z"),
+          endTimeUnixNano: otlpNano("2026-06-08T00:00:00.200Z"),
+          attributes: [
+            { key: "conversation.id", value: { stringValue: "codex-internal-session" } },
+            { key: "turn.id", value: { stringValue: "codex-internal-turn" } }
+          ]
+        }, {
+          traceId: "codex-internal-trace",
+          spanId: "dispatch",
+          parentSpanId: "turn",
+          name: "dispatch_tool_call_with_terminal_outcome",
+          startTimeUnixNano: otlpNano("2026-06-08T00:00:00.300Z"),
+          endTimeUnixNano: otlpNano("2026-06-08T00:00:00.400Z"),
+          attributes: [
+            { key: "conversation.id", value: { stringValue: "codex-internal-session" } },
+            { key: "turn.id", value: { stringValue: "codex-internal-turn" } },
+            { key: "gen_ai.tool.name", value: { stringValue: "exec_command" } }
+          ]
+        }] }]
+      }]
+    };
+    const metadata = guard.sanitizeOtlpEnvelope(raw, "traces", "2026-06-08T00:00:02.000Z");
+    const classification = new DefaultTelemetryClassification().classify(metadata);
+
+    expect(guard.sanitizeActivityAtoms(raw, "traces", classification, metadata.observedAt)).toEqual([]);
+    expect(guard.sanitizeExecutionNodes(raw, "traces", classification, metadata.observedAt)).toEqual([]);
+    expect(guard.sanitizeUsageAtoms(raw, "traces", classification, metadata.observedAt)).toEqual([
+      expect.objectContaining({
+        authority: "turn",
+        model: "gpt-5.5",
+        inputTokens: 20,
+        outputTokens: 3
+      })
+    ]);
+  });
+
+  it("marks transcriptless Codex work internal and cannot promote it through a later Stop hook", () => {
+    const guard = new DefaultAgentPrivacyGuard();
+    const fallbackPrompt = {
+      resourceLogs: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
+        scopeLogs: [{ logRecords: [{
+          attributes: [
+            { key: "event.name", value: { stringValue: "codex.user_prompt" } },
+            { key: "event.timestamp", value: { stringValue: "2026-06-08T00:00:00.000Z" } },
+            { key: "conversation.id", value: { stringValue: "codex-ephemeral-session" } }
+          ]
+        }] }]
+      }]
+    };
+    const metadata = guard.sanitizeOtlpEnvelope(fallbackPrompt, "logs", "2026-06-08T00:00:00.000Z");
+    const classification = new DefaultTelemetryClassification().classify(metadata);
+    const fallbackOccurrence = guard.sanitizeQueryOccurrences(
+      fallbackPrompt,
+      "logs",
+      classification,
+      metadata.observedAt
+    )[0];
+    const marker = guard.sanitizeProviderHookObservation({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "codex-ephemeral-session",
+      turn_id: "codex-ephemeral-turn",
+      transcript_path: null
+    }, "codex", "2026-06-08T00:00:01.000Z");
+    expect(marker).toMatchObject({
+      sourceId: "hook_codex_internal",
+      queryOccurrences: [{
+        queryId: fallbackOccurrence.queryId,
+        sessionId: fallbackOccurrence.sessionId,
+        lifecycleVisibility: "internal"
+      }],
+      usageAtoms: []
+    });
+    expect(marker?.executionNodes).toBeUndefined();
+    expect(guard.sanitizeProviderHookObservation({
+      hook_event_name: "Stop",
+      session_id: "codex-ephemeral-session",
+      turn_id: "codex-ephemeral-turn",
+      transcript_path: null
+    }, "codex", "2026-06-08T00:00:02.000Z")).toBeUndefined();
+    expect(JSON.stringify(marker)).not.toContain("codex-ephemeral-session");
+    expect(JSON.stringify(marker)).not.toContain("codex-ephemeral-turn");
   });
 
   it("captures only exact initiating prompt events and honors the disabled policy", () => {
@@ -1117,6 +1387,22 @@ describe("first-heartbeat privacy and classification", () => {
       session_id: "claude-session-1",
       prompt: "write the secret feature"
     }, "claude-code", "2026-06-08T00:00:00.000Z");
+    const subagentStart = guard.sanitizeProviderHookObservation({
+      hook_event_name: "SubagentStart",
+      session_id: "claude-session-1",
+      subagent_id: "claude-child-session-1",
+      subagent_type: "researcher"
+    }, "claude-code", "2026-06-08T00:00:01.000Z");
+    const subagentStop = guard.sanitizeProviderHookObservation({
+      hook_event_name: "SubagentStop",
+      session_id: "claude-session-1",
+      subagent_id: "claude-child-session-1",
+      subagent_type: "researcher"
+    }, "claude-code", "2026-06-08T00:00:03.000Z");
+    const stop = guard.sanitizeProviderHookObservation({
+      hook_event_name: "Stop",
+      session_id: "claude-session-1"
+    }, "claude-code", "2026-06-08T00:00:04.000Z");
 
     expect(observation).toMatchObject({
       sourceId: "hook_claude_code_lifecycle",
@@ -1130,7 +1416,32 @@ describe("first-heartbeat privacy and classification", () => {
       })],
       usageAtoms: []
     });
-    expect(JSON.stringify(observation)).not.toContain("write the secret feature");
+    expect(subagentStart).toMatchObject({
+      activityAtoms: [expect.objectContaining({
+        kind: "subagent",
+        outcome: "unknown",
+        childSessionId: expect.stringMatching(/^ses_/),
+        startedAt: "2026-06-08T00:00:01.000Z",
+        endedAt: undefined
+      })]
+    });
+    expect(subagentStop).toMatchObject({
+      activityAtoms: [expect.objectContaining({
+        kind: "subagent",
+        outcome: "success",
+        childSessionId: subagentStart?.activityAtoms?.[0]?.childSessionId,
+        startedAt: "2026-06-08T00:00:01.000Z",
+        endedAt: "2026-06-08T00:00:03.000Z"
+      })]
+    });
+    expect(stop).toMatchObject({
+      queryOccurrences: [expect.objectContaining({
+        queryId: observation?.queryOccurrences?.[0]?.queryId,
+        completedAt: "2026-06-08T00:00:04.000Z",
+        completionEvidence: "stop_hook"
+      })]
+    });
+    expect(JSON.stringify([observation, subagentStart, subagentStop, stop])).not.toContain("write the secret feature");
   });
 
   it("records Codex prompt hooks as safe query lifecycle observations and correlates later tool hooks", () => {
@@ -1139,8 +1450,30 @@ describe("first-heartbeat privacy and classification", () => {
       hook_event_name: "UserPromptSubmit",
       session_id: "codex-session-1",
       turn_id: "codex-turn-1",
+      transcript_path: "/private/session/codex-session-1.jsonl",
       prompt: "change src/secret.ts"
     }, "codex", "2026-06-08T00:00:00.000Z");
+    const fallbackPromptLog = {
+      resourceLogs: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
+        scopeLogs: [{ logRecords: [{
+          attributes: [
+            { key: "event.name", value: { stringValue: "codex.user_prompt" } },
+            { key: "event.timestamp", value: { stringValue: "2026-06-08T00:00:00.250Z" } },
+            { key: "conversation.id", value: { stringValue: "codex-session-1" } }
+          ]
+        }] }]
+      }]
+    };
+    const fallbackMetadata = guard.sanitizeOtlpEnvelope(fallbackPromptLog, "logs", "2026-06-08T00:00:00.250Z");
+    const fallbackClassification = new DefaultTelemetryClassification().classify(fallbackMetadata);
+    const fallbackOccurrences = guard.sanitizeQueryOccurrences(
+      fallbackPromptLog,
+      "logs",
+      fallbackClassification,
+      fallbackMetadata.observedAt
+    );
+    guard.sanitizeUsageAtoms(fallbackPromptLog, "logs", fallbackClassification, fallbackMetadata.observedAt);
     const toolObservation = guard.sanitizeProviderHookObservation({
       hook_event_name: "PostToolUse",
       session_id: "codex-session-1",
@@ -1149,6 +1482,53 @@ describe("first-heartbeat privacy and classification", () => {
       tool_input: { command: "do not store this" },
       tool_response: { success: true, content: "ok" }
     }, "codex", "2026-06-08T00:00:01.000Z");
+    const failedToolObservation = guard.sanitizeProviderHookObservation({
+      hook_event_name: "PostToolUseFailure",
+      session_id: "codex-session-1",
+      turn_id: "codex-turn-1",
+      tool_name: "exec_command",
+      tool_input: { command: "do not store this either" },
+      error: "private failure"
+    }, "codex", "2026-06-08T00:00:02.000Z");
+    const spawnToolObservation = guard.sanitizeProviderHookObservation({
+      hook_event_name: "PostToolUse",
+      session_id: "codex-session-1",
+      turn_id: "codex-turn-1",
+      tool_name: "spawn_agent",
+      tool_response: { success: true, agent_id: "codex-child-session-1" }
+    }, "codex", "2026-06-08T00:00:02.100Z");
+    const waitToolObservation = guard.sanitizeProviderHookObservation({
+      hook_event_name: "PostToolUse",
+      session_id: "codex-session-1",
+      turn_id: "codex-turn-1",
+      tool_name: "multi_agent_v1wait_agent",
+      tool_response: { success: true }
+    }, "codex", "2026-06-08T00:00:02.200Z");
+    const subagentStart = guard.sanitizeProviderHookObservation({
+      hook_event_name: "SubagentStart",
+      session_id: "codex-session-1",
+      turn_id: "codex-turn-1",
+      agent_id: "codex-child-session-1",
+      agent_type: "explorer"
+    }, "codex", "2026-06-08T00:00:03.000Z");
+    const subagentStop = guard.sanitizeProviderHookObservation({
+      hook_event_name: "SubagentStop",
+      session_id: "codex-session-1",
+      turn_id: "codex-turn-1",
+      agent_id: "codex-child-session-1",
+      agent_type: "explorer"
+    }, "codex", "2026-06-08T00:00:04.000Z");
+    const childPrompt = guard.sanitizeProviderHookObservation({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "codex-child-session-1",
+      turn_id: "codex-child-turn-1",
+      transcript_path: "/private/session/codex-child-session-1.jsonl"
+    }, "codex", "2026-06-08T00:00:03.100Z");
+    const stopObservation = guard.sanitizeProviderHookObservation({
+      hook_event_name: "Stop",
+      session_id: "codex-session-1",
+      turn_id: "codex-turn-1"
+    }, "codex", "2026-06-08T00:00:05.000Z");
 
     expect(promptObservation).toMatchObject({
       sourceId: "hook_codex_lifecycle",
@@ -1157,6 +1537,11 @@ describe("first-heartbeat privacy and classification", () => {
         evidence: "submission_hook"
       })]
     });
+    expect(fallbackOccurrences).toEqual([expect.objectContaining({
+      queryId: promptObservation?.queryOccurrences?.[0]?.queryId,
+      sessionId: promptObservation?.queryOccurrences?.[0]?.sessionId,
+      startedAt: "2026-06-08T00:00:00.000Z"
+    })]);
     expect(toolObservation).toMatchObject({
       sourceId: "hook_codex_tools",
       activityAtoms: [expect.objectContaining({
@@ -1168,8 +1553,160 @@ describe("first-heartbeat privacy and classification", () => {
         contents: undefined
       })]
     });
-    expect(JSON.stringify([promptObservation, toolObservation])).not.toContain("change src/secret.ts");
-    expect(JSON.stringify([promptObservation, toolObservation])).not.toContain("do not store this");
+    expect(failedToolObservation).toMatchObject({
+      activityAtoms: [expect.objectContaining({
+        kind: "tool",
+        name: "exec_command",
+        outcome: "failure"
+      })]
+    });
+    expect(spawnToolObservation).toMatchObject({
+      activityAtoms: [expect.objectContaining({ kind: "tool", name: "spawn_agent" })]
+    });
+    expect(waitToolObservation).toMatchObject({
+      activityAtoms: [expect.objectContaining({ kind: "tool", name: "multi_agent_v1wait_agent" })]
+    });
+    expect(subagentStart).toMatchObject({
+      activityAtoms: [expect.objectContaining({ kind: "subagent", outcome: "unknown" })]
+    });
+    expect(subagentStop).toMatchObject({
+      activityAtoms: [expect.objectContaining({
+        kind: "subagent",
+        outcome: "success",
+        startedAt: "2026-06-08T00:00:03.000Z",
+        endedAt: "2026-06-08T00:00:04.000Z",
+        childSessionId: childPrompt?.queryOccurrences?.[0]?.sessionId
+      })]
+    });
+    expect(stopObservation).toMatchObject({
+      sourceId: "hook_codex_lifecycle",
+      queryOccurrences: [expect.objectContaining({
+        queryId: promptObservation?.queryOccurrences?.[0]?.queryId,
+        startedAt: "2026-06-08T00:00:00.000Z",
+        completedAt: "2026-06-08T00:00:05.000Z",
+        completionEvidence: "stop_hook"
+      })]
+    });
+    const serialized = JSON.stringify([
+      promptObservation,
+      toolObservation,
+      failedToolObservation,
+      spawnToolObservation,
+      waitToolObservation,
+      subagentStart,
+      subagentStop,
+      childPrompt,
+      stopObservation
+    ]);
+    expect(serialized).not.toContain("change src/secret.ts");
+    expect(serialized).not.toContain("do not store this");
+    expect(serialized).not.toContain("do not store this either");
+    expect(serialized).not.toContain("private failure");
+  });
+
+  it("does not mistake Codex unified-exec protocol success for a shell outcome", () => {
+    const guard = new DefaultAgentPrivacyGuard(() => true, () => true);
+    guard.sanitizeProviderHookObservation({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "codex-outcome-session",
+      turn_id: "codex-outcome-turn",
+      transcript_path: "/private/session/codex-outcome-session.jsonl"
+    }, "codex", "2026-06-08T00:00:00.000Z");
+    const hook = guard.sanitizeProviderHookObservation({
+      hook_event_name: "PostToolUse",
+      session_id: "codex-outcome-session",
+      turn_id: "codex-outcome-turn",
+      tool_name: "Bash",
+      tool_use_id: "call-exit-seven",
+      tool_input: { command: "PRIVATE_TOOL_ARGUMENT" },
+      tool_response: "PRIVATE_TOOL_OUTPUT"
+    }, "codex", "2026-06-08T00:00:01.000Z");
+    const structuredFailureHook = guard.sanitizeProviderHookObservation({
+      hook_event_name: "PostToolUse",
+      session_id: "codex-outcome-session",
+      turn_id: "codex-outcome-turn",
+      tool_name: "Bash",
+      tool_use_id: "call-structured-exit-seven",
+      tool_response: { exit_code: 7, output: "PRIVATE_STRUCTURED_TOOL_OUTPUT" }
+    }, "codex", "2026-06-08T00:00:01.050Z");
+    const raw = {
+      resourceLogs: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
+        scopeLogs: [{ logRecords: [{
+          timeUnixNano: otlpNano("2026-06-08T00:00:01.000Z"),
+          attributes: [
+            { key: "event.name", value: { stringValue: "codex.tool_result" } },
+            { key: "event.timestamp", value: { stringValue: "2026-06-08T00:00:01.000Z" } },
+            { key: "conversation.id", value: { stringValue: "codex-outcome-session" } },
+            { key: "turn.id", value: { stringValue: "codex-outcome-turn" } },
+            { key: "tool_name", value: { stringValue: "exec_command" } },
+            { key: "call_id", value: { stringValue: "call-exit-seven" } },
+            { key: "duration_ms", value: { intValue: "12" } },
+            { key: "success", value: { stringValue: "true" } },
+            { key: "arguments", value: { stringValue: "PRIVATE_TOOL_ARGUMENT" } },
+            { key: "output", value: { stringValue: "PRIVATE_TOOL_OUTPUT" } }
+          ]
+        }, {
+          attributes: [
+            { key: "event.name", value: { stringValue: "codex.tool_result" } },
+            { key: "conversation.id", value: { stringValue: "codex-outcome-session" } },
+            { key: "turn.id", value: { stringValue: "codex-outcome-turn" } },
+            { key: "tool_name", value: { stringValue: "exec_command" } },
+            { key: "success", value: { stringValue: "false" } }
+          ]
+        }, {
+          timeUnixNano: otlpNano("2026-06-08T00:00:01.100Z"),
+          attributes: [
+            { key: "event.name", value: { stringValue: "codex.tool_result" } },
+            { key: "event.timestamp", value: { stringValue: "2026-06-08T00:00:01.100Z" } },
+            { key: "conversation.id", value: { stringValue: "codex-outcome-session" } },
+            { key: "turn.id", value: { stringValue: "codex-outcome-turn" } },
+            { key: "tool_name", value: { stringValue: "exec_command" } },
+            { key: "call_id", value: { stringValue: "call-dispatch-failure" } },
+            { key: "success", value: { stringValue: "false" } }
+          ]
+        }] }]
+      }]
+    };
+    const metadata = guard.sanitizeOtlpEnvelope(raw, "logs", "2026-06-08T00:00:01.100Z");
+    const classification = new DefaultTelemetryClassification().classify(metadata);
+    const atoms = guard.sanitizeActivityAtoms(raw, "logs", classification, metadata.observedAt);
+
+    expect(hook).toMatchObject({
+      activityAtoms: [expect.objectContaining({
+        name: "Bash",
+        outcome: "unknown"
+      })]
+    });
+    expect(structuredFailureHook).toMatchObject({
+      activityAtoms: [expect.objectContaining({
+        name: "Bash",
+        outcome: "failure"
+      })]
+    });
+    expect(atoms).toEqual([
+      expect.objectContaining({
+        queryId: hook?.activityAtoms?.[0]?.queryId,
+        requestId: hook?.activityAtoms?.[0]?.requestId,
+        kind: "tool",
+        name: "exec_command",
+        outcome: "unknown",
+        durationMs: 12,
+        evidenceBasis: "otel_event"
+      }),
+      expect.objectContaining({
+        queryId: hook?.activityAtoms?.[0]?.queryId,
+        kind: "tool",
+        name: "exec_command",
+        outcome: "failure",
+        evidenceBasis: "otel_event"
+      })
+    ]);
+    expect(atoms[0].sensitiveAuditEvidence).toBeUndefined();
+    const serialized = JSON.stringify([hook, structuredFailureHook, atoms]);
+    expect(serialized).not.toContain("PRIVATE_TOOL_ARGUMENT");
+    expect(serialized).not.toContain("PRIVATE_TOOL_OUTPUT");
+    expect(serialized).not.toContain("PRIVATE_STRUCTURED_TOOL_OUTPUT");
   });
 
   it("records Cursor hook runs with token revisions and metadata-only activity", () => {

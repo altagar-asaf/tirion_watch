@@ -1,7 +1,7 @@
 export const AGENT_PROTOCOL_MAJOR = 1;
 export const AGENT_PROTOCOL_MINOR = 0;
 export const AGENT_SCHEMA_VERSION = 1;
-export const AGENT_DATABASE_SCHEMA_VERSION = 9;
+export const AGENT_DATABASE_SCHEMA_VERSION = 10;
 
 export type OwnershipState =
   | "extension_legacy"
@@ -144,7 +144,10 @@ export type ProviderConfigurationReasonCode =
   | "stale_managed_agent_token"
   | "managed_configuration_drifted"
   | "foreign_exporter_present"
-  | "local_tirion_exporter_unclaimed";
+  | "local_tirion_exporter_unclaimed"
+  | "hook_trust_required"
+  | "hooks_disabled"
+  | "hook_trust_status_unavailable";
 
 export type ProviderConfigurationRequestV1 = {
   schemaVersion: 1;
@@ -271,6 +274,9 @@ export type RepositoryActivationV1 = {
     | "foreign_provider_configuration"
     | "managed_provider_configuration_drifted"
     | "stale_managed_agent_token"
+    | "hook_trust_required"
+    | "hooks_disabled"
+    | "hook_trust_status_unavailable"
     | "source_configuration_unavailable"
   )[];
 };
@@ -296,6 +302,8 @@ export type SafeObservationV1 = {
   resourceCount: number;
   recordCount: number;
   observedAt: string;
+  /** Opaque trusted repository identity resolved before raw workspace context is discarded. */
+  repositoryKey?: string;
   queryOccurrences?: QueryOccurrenceV1[];
   activityAtoms?: SafeActivityAtomV1[];
   executionNodes?: ExecutionNodeAtomV1[];
@@ -353,6 +361,7 @@ export type SafeUsageAtomV1 = {
   correlationId: string;
   queryId?: string;
   sessionId?: string;
+  repositoryKey?: string;
   requestId?: string;
   owningActivityId?: string;
   signal?: TelemetrySignal;
@@ -384,6 +393,10 @@ export type SafeActivityAtomV1 = {
   activityId: string;
   queryId: string;
   sessionId?: string;
+  repositoryKey?: string;
+  requestId?: string;
+  /** Opaque child session identity for a provider-reported subagent activity. */
+  childSessionId?: string;
   provider: SafeObservationV1["provider"];
   runtime: string;
   kind: SafeActivityKind;
@@ -406,9 +419,16 @@ export type QueryOccurrenceV1 = {
   schemaVersion: 1;
   queryId: string;
   sessionId: string;
+  /** Opaque parent session when a provider reports a child rollout in parent context. */
+  parentSessionId?: string;
+  /** Explicit provider evidence that this occurrence is or is not customer-visible work. */
+  lifecycleVisibility?: "customer" | "internal";
   provider: SafeObservationV1["provider"];
   runtime: string;
   startedAt: string;
+  completedAt?: string;
+  completionEvidence?: "stop_hook" | "session_hook" | "closed_root_span" | "provider_completed_event" | "inactivity";
+  repositoryKey?: string;
   promptState: QueryPromptState;
   promptText?: string;
   evidence: QueryOccurrenceEvidence;
@@ -453,6 +473,7 @@ export type ExecutionNodeAtomV1 = {
   nodeId: string;
   queryId: string;
   sessionId?: string;
+  repositoryKey?: string;
   requestId?: string;
   provider: SafeObservationV1["provider"];
   runtime: string;
@@ -466,6 +487,9 @@ export type ExecutionNodeAtomV1 = {
   durationMs?: number;
   model?: string;
   toolName?: string;
+  /** Opaque repository artifact identities from an exact successful write signal. */
+  artifactKeys?: string[];
+  artifactEvidence?: "provider_write_hook" | "provider_tool_event";
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
@@ -526,10 +550,13 @@ export type RunBreakdownAttributionBasis =
 export type RunBreakdownV1 = {
   schemaVersion: 1;
   breakdownId: string;
+  parentBreakdownId?: string;
   kind: "model" | "request" | "tool" | "subagent" | "skill" | "mcp" | "unallocated";
   name: string;
   count: number;
   failureCount: number;
+  /** Number of represented observations whose native outcome is unavailable. */
+  unknownCount?: number;
   totalDurationMs?: number;
   resultSizeBytes?: number;
   providerReportedResultTokens?: number;
@@ -583,6 +610,7 @@ export type ShadowRunV1 = {
   correlationId: string;
   queryId?: string;
   sessionId?: string;
+  repositoryKey?: string;
   promptState: QueryPromptState;
   promptText?: string;
   provider: SafeObservationV1["provider"];
@@ -691,6 +719,9 @@ export type AgentDiagnosticEventCode =
   | "ownership_transitioned"
   | "production_usage_rebuilt"
   | "safe_journal_pruned"
+  | "execution_node_evidence_pruned"
+  | "attribution_evidence_sanitized"
+  | "storage_compacted"
   | "product_retention_applied"
   | "production_history_cleared"
   | "agent_data_cleared"
@@ -831,6 +862,7 @@ export type WebhookEvidenceBasisV1 =
   | "otel_event"
   | "provider_metric"
   | "span_db_replay"
+  | "usage_projection"
   | "inactivity";
 
 export type WebhookEvidenceV1 = {
@@ -855,15 +887,27 @@ export type RunLifecycleActivityWebhookV1 = {
   kind: "llm_request" | "tool" | "subagent" | "skill" | "mcp" | "hook" | "unknown";
   name: string;
   outcome: SafeActivityOutcome;
+  /** Number of privacy-safe activity observations represented by this row. */
+  count?: number;
+  /** Number of represented observations that failed or were rejected. */
+  failureCount?: number;
+  /** Number of represented observations whose native outcome is unavailable. */
+  unknownCount?: number;
   startedAt: string;
   endedAt?: string;
   durationMs?: number;
+  resultSizeBytes?: number;
+  providerReportedResultTokens?: number;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   reasoningOutputTokens?: number;
   totalTokens?: number;
+  /** How token usage was associated with this activity row. */
+  usageAttributionBasis?: RunBreakdownAttributionBasis;
+  /** Completeness of the token attribution for this activity row. */
+  usageCoverage?: RunBreakdownV1["coverage"];
   evidence: WebhookEvidenceV1;
 };
 
@@ -928,6 +972,8 @@ export type RunEndedWebhookEventV1 = RunWebhookEventBaseV1 & {
   costEstimateBasis: CostEstimateBasis;
   costCoverage: "complete" | "partial" | "unavailable";
   context?: RunContextFootprintV1;
+  /** Optional only for persisted schema-v1 compatibility. New terminal projections always populate it. */
+  activity?: RunLifecycleActivityWebhookV1[];
   state: "completed";
 };
 

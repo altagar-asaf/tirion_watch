@@ -183,6 +183,15 @@ describe("agent storage worker", () => {
       warnings: []
     }]);
     expect(await reopened.listProductionRuns()).toHaveLength(1);
+    const [storedProductionRun] = await reopened.listProductionRuns();
+    await reopened.upsertProductionRuns([{
+      ...storedProductionRun,
+      outputTokens: 4,
+      totalTokens: 16
+    }]);
+    expect(await reopened.listProductionRuns()).toEqual([
+      expect.objectContaining({ runId: "run_12345678", outputTokens: 4, totalTokens: 16 })
+    ]);
     await reopened.upsertRepositoryScope({
       scope: {
         schemaVersion: 1,
@@ -226,6 +235,344 @@ describe("agent storage worker", () => {
     await reopened.close();
   });
 
+  it("retrieves and retains execution evidence without loading unrelated nodes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-execution-evidence-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: "node_old",
+      sortAt: "2026-06-01T00:00:00.000Z",
+      value: { queryId: "query_target", nodeId: "node_old" }
+    });
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: "node_target",
+      sortAt: "2026-06-08T00:00:00.000Z",
+      value: { queryId: "query_target", nodeId: "node_target" }
+    });
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: "node_other",
+      sortAt: "2026-06-09T00:00:00.000Z",
+      value: { queryId: "query_other", nodeId: "node_other" }
+    });
+
+    expect(await storage.readAgentDocument("execution_node_atom", "node_target")).toEqual(
+      expect.objectContaining({ key: "node_target" })
+    );
+    expect(await storage.listExecutionNodeDocumentsForQuery<{ queryId: string }>("query_target")).toEqual([
+      expect.objectContaining({ key: "node_old", value: expect.objectContaining({ queryId: "query_target" }) }),
+      expect.objectContaining({ key: "node_target", value: expect.objectContaining({ queryId: "query_target" }) })
+    ]);
+
+    expect(await storage.applyExecutionNodeRetention("2026-06-07T00:00:00.000Z", 2)).toEqual({
+      removedByAge: 1,
+      removedByOverflow: 0,
+      retainedCount: 2
+    });
+    expect(await storage.listExecutionNodeDocumentsForQuery<{ queryId: string }>("query_target")).toEqual([
+      expect.objectContaining({ key: "node_target" })
+    ]);
+    await storage.close();
+  });
+
+  it("reads only due webhook outbox rows and the next durable delivery deadline", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-webhook-outbox-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const entry = (key: string, deliveryState: string, nextAttemptAt?: string) => ({
+      key,
+      sortAt: "2026-06-08T00:00:00.000Z",
+      value: { key, deliveryState, nextAttemptAt }
+    });
+    await storage.upsertAgentDocument("webhook_outbox", entry("pending_due", "pending", "2026-06-08T00:00:01.000Z"));
+    await storage.upsertAgentDocument("webhook_outbox", entry("pending_later", "pending", "2026-06-08T00:00:03.000Z"));
+    await storage.upsertAgentDocument("webhook_outbox", entry("retry_later", "retry", "2026-06-08T00:00:02.000Z"));
+    await storage.upsertAgentDocument("webhook_outbox", entry("blocked", "blocked"));
+    await storage.upsertAgentDocument("webhook_outbox", entry("delivered", "delivered"));
+
+    expect(await storage.listWebhookOutboxDueDocuments<{ key: string }>("2026-06-08T00:00:01.500Z"))
+      .toEqual([expect.objectContaining({ key: "pending_due" })]);
+    expect(await storage.listWebhookOutboxDueDocuments<{ key: string }>("2026-06-08T00:00:01.500Z", true))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ key: "pending_due" }),
+        expect.objectContaining({ key: "retry_later" }),
+        expect.objectContaining({ key: "blocked" })
+      ]));
+    expect((await storage.listWebhookOutboxDueDocuments("2026-06-08T00:00:01.500Z", true))
+      .map((document) => document.key)).not.toContain("pending_later");
+    expect(await storage.nextWebhookOutboxAttemptAt()).toBe("2026-06-08T00:00:01.000Z");
+    await storage.close();
+  });
+
+  it("compacts a materially fragmented database without failing storage startup", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-compact-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertAgentDocument("workspace_evidence", {
+      key: "fragmented",
+      sortAt: "2026-06-08T00:00:00.000Z",
+      value: { payload: "x".repeat(5 * 1024 * 1024) }
+    });
+    await storage.removeAgentDocument("workspace_evidence", "fragmented");
+
+    const result = await storage.compactIfFragmented();
+    expect(result).toMatchObject({ compacted: true });
+    expect(result.pageCountAfter).toBeLessThan(result.pageCountBefore);
+    expect(await storage.integrityCheck()).toBe("ok");
+    await storage.close();
+  });
+
+  it("prunes legacy oversized repository snapshots inside the storage worker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-snapshot-prune-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertAgentDocument("repository_snapshot", {
+      key: "snapshot_small",
+      sortAt: "2026-06-08T00:00:00.000Z",
+      value: { artifactStates: [{ artifactKey: "one" }] }
+    });
+    await storage.upsertAgentDocument("repository_snapshot", {
+      key: "snapshot_oversized",
+      sortAt: "2026-06-08T00:00:01.000Z",
+      value: { artifactStates: Array.from({ length: 101 }, (_, index) => ({ artifactKey: `item_${index}` })) }
+    });
+
+    expect(await storage.pruneRepositorySnapshotDocuments(100)).toBe(1);
+    expect(await storage.listAgentDocuments("repository_snapshot")).toEqual([
+      expect.objectContaining({ key: "snapshot_small" })
+    ]);
+    await storage.close();
+  });
+
+  it("scopes lifecycle storage reads and fails closed oversized attribution evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-lifecycle-scope-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertSource({ ...source("source_lifecycle_scope"), environmentId: metadata.environmentId }, "2026-06-08T00:00:00.000Z");
+    await storage.appendSafeObservation({
+      schemaVersion: 1,
+      observationId: "observation_lifecycle_scope",
+      sourceId: "source_lifecycle_scope",
+      provider: "codex",
+      runtime: "codex",
+      signal: "traces",
+      profileVersion: "codex-otlp-v1",
+      resourceCount: 1,
+      recordCount: 2,
+      observedAt: "2026-06-08T00:00:01.000Z",
+      usageAtoms: [{
+        schemaVersion: 1,
+        atomId: "atom_scope_a",
+        queryId: "qry_scope_a",
+        provider: "codex",
+        runtime: "codex",
+        authority: "request",
+        inputTokens: 1,
+        outputTokens: 1,
+        startedAt: "2026-06-08T00:00:01.000Z"
+      }, {
+        schemaVersion: 1,
+        atomId: "atom_scope_b",
+        queryId: "qry_scope_b",
+        provider: "codex",
+        runtime: "codex",
+        authority: "request",
+        inputTokens: 2,
+        outputTokens: 1,
+        startedAt: "2026-06-08T00:00:01.000Z"
+      }],
+      activityAtoms: [{
+        schemaVersion: 1,
+        activityId: "activity_scope_a",
+        queryId: "qry_scope_a",
+        provider: "codex",
+        runtime: "codex",
+        kind: "tool",
+        name: "Bash",
+        outcome: "success",
+        startedAt: "2026-06-08T00:00:01.000Z"
+      }, {
+        schemaVersion: 1,
+        activityId: "activity_scope_b",
+        queryId: "qry_scope_b",
+        provider: "codex",
+        runtime: "codex",
+        kind: "tool",
+        name: "Read",
+        outcome: "success",
+        startedAt: "2026-06-08T00:00:01.000Z"
+      }]
+    });
+    expect((await storage.listSafeUsageAtomsForQueryIds(["qry_scope_a"])).map((atom) => atom.atomId)).toEqual(["atom_scope_a"]);
+    expect((await storage.listSafeActivityAtomsForQueryIds(["qry_scope_a"])).map((atom) => atom.activityId))
+      .toEqual(["activity_scope_a"]);
+
+    const oversizedEvidence = {
+      queryId: "qry_scope_a",
+      repoKey: "repo_scope",
+      status: "completed",
+      baselineTrusted: true,
+      baselineReasons: [],
+      artifactKeys: ["artifact_legacy"],
+      causalArtifactKeys: ["artifact_legacy"],
+      baselineArtifactStates: [{ artifactKey: "baseline_1" }, { artifactKey: "baseline_2" }, { artifactKey: "baseline_3" }],
+      artifactStates: [{ artifactKey: "artifact_1" }, { artifactKey: "artifact_2" }, { artifactKey: "artifact_3" }],
+      observedChangeCount: 3,
+      addedLines: 9,
+      deletedLines: 2
+    };
+    await storage.upsertAgentDocument("workspace_evidence", {
+      key: "qry_scope_a:repo_scope",
+      sortAt: "2026-06-08T00:00:02.000Z",
+      value: oversizedEvidence
+    });
+    await storage.upsertAgentDocument("workspace_evidence", {
+      key: "qry_scope_b:repo_scope",
+      sortAt: "2026-06-08T00:00:03.000Z",
+      value: {
+        ...oversizedEvidence,
+        queryId: "qry_scope_b",
+        status: "active",
+        baselineArtifactStates: [],
+        artifactStates: []
+      }
+    });
+    await storage.upsertAgentDocument("work_episode", {
+      key: "episode_scope_a",
+      sortAt: "2026-06-08T00:00:04.000Z",
+      value: {
+        episodeId: "episode_scope_a",
+        chatSessionId: "ses_scope",
+        repoKeys: ["repo_scope"],
+        queryIds: ["qry_scope_a"],
+        runIds: ["run_scope_a"],
+        status: "open",
+        evidence: [oversizedEvidence]
+      }
+    });
+    await storage.upsertAgentDocument("work_episode", {
+      key: "episode_scope_b",
+      sortAt: "2026-06-08T00:00:05.000Z",
+      value: {
+        episodeId: "episode_scope_b",
+        chatSessionId: "ses_other",
+        repoKeys: [],
+        queryIds: ["qry_scope_b"],
+        runIds: ["run_scope_b"],
+        status: "claimed",
+        evidence: []
+      }
+    });
+    expect(await storage.listWorkspaceEvidenceDocuments({ queryId: "qry_scope_a" })).toHaveLength(1);
+    expect(await storage.listWorkEpisodeDocuments({ queryId: "qry_scope_a", runId: "run_scope_a" })).toEqual([
+      expect.objectContaining({ key: "episode_scope_a" })
+    ]);
+    expect(await storage.attributionDocumentSummary()).toMatchObject({
+      workspaceEvidence: { totalCount: 2, statusCounts: { active: 1, completed: 1 } },
+      workEpisodes: { totalCount: 2, statusCounts: { open: 1, claimed: 1 }, unboundCount: 1 }
+    });
+    expect(await storage.sanitizeOversizedAttributionDocuments(2)).toEqual({
+      workspaceEvidenceSanitized: 1,
+      workEpisodesSanitized: 1
+    });
+    expect((await storage.listWorkspaceEvidenceDocuments<{ baselineTrusted: boolean; artifactStates: unknown[] }>({ queryId: "qry_scope_a" }))[0]?.value)
+      .toMatchObject({ baselineTrusted: false, artifactStates: [] });
+    expect((await storage.listWorkEpisodeDocuments<{ evidence: Array<{ artifactStates: unknown[]; artifactKeys: unknown[] }> }>({ runId: "run_scope_a" }))[0]?.value.evidence[0])
+      .toMatchObject({ artifactStates: [], artifactKeys: [] });
+
+    const deliveredWriting = {
+      schemaVersion: 1,
+      key: "evt_scope_ended",
+      eventType: "run.ended",
+      subjectId: "run.ended:run_scope_a",
+      deliveryState: "delivered",
+      queuedAt: "2026-06-08T00:00:06.000Z",
+      deliveredAt: "2026-06-08T00:00:07.000Z",
+      updatedAt: "2026-06-08T00:00:07.000Z",
+      event: {
+        eventType: "run.ended",
+        runId: "run_scope_a",
+        sessionId: "ses_scope",
+        traceIds: ["qry_scope_a"],
+        filesChanged: ["src/scope.ts"]
+      }
+    };
+    await storage.upsertAgentDocument("webhook_outbox", {
+      key: deliveredWriting.key,
+      sortAt: deliveredWriting.updatedAt,
+      value: deliveredWriting
+    });
+    await storage.upsertAgentDocument("webhook_outbox", {
+      key: "evt_scope_pending",
+      sortAt: "2026-06-08T00:00:08.000Z",
+      value: {
+        ...deliveredWriting,
+        key: "evt_scope_pending",
+        eventType: "run.update",
+        subjectId: "run.update:run_scope_a",
+        deliveryState: "pending",
+        queuedAt: "2026-06-08T00:00:08.000Z",
+        deliveredAt: undefined,
+        updatedAt: "2026-06-08T00:00:08.000Z",
+        event: { ...deliveredWriting.event, eventType: "run.update", filesChanged: undefined }
+      }
+    });
+    expect(await storage.webhookOutboxStatus()).toMatchObject({
+      pendingCount: 1,
+      deliveredCount: 1,
+      activeEntries: [expect.objectContaining({ key: "evt_scope_pending" })]
+    });
+    expect(await storage.listWebhookLifecycleDocuments({ traceId: "qry_scope_a" })).toHaveLength(2);
+    expect(await storage.listDeliveredWritingLifecycleRunIds()).toEqual(["run_scope_a"]);
+    await storage.upsertAgentDocument("webhook_delivery_state", {
+      key: "run.ended:run_scope_a",
+      sortAt: "2026-06-08T00:00:09.000Z",
+      value: {
+        subjectId: "run.ended:run_scope_a",
+        eventType: "run.ended",
+        deliveredAt: "2026-06-08T00:00:09.000Z",
+        filesChangedCount: 0
+      }
+    });
+    expect(await storage.listDeliveredWritingLifecycleRunIds()).toEqual([]);
+    await storage.upsertAgentDocument("webhook_delivery_state", {
+      key: "run.ended:run_scope_a",
+      sortAt: "2026-06-08T00:00:10.000Z",
+      value: {
+        subjectId: "run.ended:run_scope_a",
+        eventType: "run.ended",
+        deliveredAt: "2026-06-08T00:00:10.000Z",
+        filesChangedCount: 1
+      }
+    });
+    expect(await storage.listDeliveredWritingLifecycleRunIds()).toEqual(["run_scope_a"]);
+    await storage.close();
+  });
+
   it("migrates forward with backups and supports rollback from an explicit backup", async () => {
     const root = mkdtempSync(join(tmpdir(), "tirion-storage-upgrade-"));
     roots.push(root);
@@ -251,7 +598,7 @@ describe("agent storage worker", () => {
       now: "2026-06-08T00:00:00.000Z",
       ownershipState: "agent_full_owner",
       protocolVersion: "1.0"
-    })).toMatchObject({ schemaVersion: 9 });
+    })).toMatchObject({ schemaVersion: 10 });
     expect(existsSync(`${databasePath}.pre-migration-1.bak`)).toBe(true);
     await storage.upsertSource(source("source_before_backup"), "2026-06-08T00:00:01.000Z");
     const backupPath = join(root, "rollback.db");
@@ -447,12 +794,14 @@ describe("agent storage worker", () => {
         schemaVersion: 1,
         queryId: "qry_query_occurrence",
         sessionId: "ses_query_occurrence",
+        parentSessionId: "ses_parent_query_occurrence",
+        lifecycleVisibility: "customer",
         provider: "claude-code",
         runtime: "claude-code",
         startedAt: "2026-06-08T00:00:01.000Z",
         promptState: "captured",
         promptText: "Implement the durable query ledger",
-        evidence: "provider_prompt_id"
+        evidence: "submission_hook"
       }],
       usageAtoms: []
     });
@@ -482,20 +831,35 @@ describe("agent storage worker", () => {
         schemaVersion: 1,
         queryId: "qry_query_occurrence",
         sessionId: "ses_query_occurrence",
+        lifecycleVisibility: "internal",
         provider: "claude-code",
         runtime: "claude-code",
         startedAt: "2026-06-08T00:00:01.000Z",
+        completedAt: "2026-06-08T00:00:02.000Z",
+        completionEvidence: "stop_hook",
+        repositoryKey: "repo_query_occurrence",
         promptState: "disabled",
-        evidence: "provider_prompt_id"
+        evidence: "provider_user_prompt_event"
       }],
       usageAtoms: []
     });
     expect(await storage.listQueryOccurrences()).toEqual([
       expect.objectContaining({
         promptState: "captured",
-        promptText: "Implement the durable query ledger"
+        promptText: "Implement the durable query ledger",
+        completedAt: "2026-06-08T00:00:02.000Z",
+        completionEvidence: "stop_hook",
+        repositoryKey: "repo_query_occurrence",
+        evidence: "submission_hook",
+        lifecycleVisibility: "internal",
+        parentSessionId: "ses_parent_query_occurrence"
       })
     ]);
+    await expect(storage.readQueryOccurrence("qry_query_occurrence")).resolves.toMatchObject({
+      queryId: "qry_query_occurrence",
+      lifecycleVisibility: "internal"
+    });
+    await expect(storage.readQueryOccurrence("qry_missing")).resolves.toBeUndefined();
     await storage.close();
 
     const reopened = new AgentStorageClient({ databasePath });

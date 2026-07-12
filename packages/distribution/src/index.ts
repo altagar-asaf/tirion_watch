@@ -12,6 +12,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { AGENT_DATABASE_SCHEMA_VERSION } from "@tirion/agent-contract";
 
 export type DistributionCommandOptions = {
   cwd?: string;
@@ -112,7 +113,7 @@ export function buildMacOsDistribution(options: MacOsDistributionOptions): MacOs
     product: "Tirion Agent",
     agentVersion,
     protocolVersion: "1.0",
-    databaseSchemaVersion: 9,
+    databaseSchemaVersion: AGENT_DATABASE_SCHEMA_VERSION,
     runtimeVersion,
     ownershipDefault: "agent_full_owner",
     artifact: {
@@ -122,7 +123,7 @@ export function buildMacOsDistribution(options: MacOsDistributionOptions): MacOs
     },
     migrationSupportWindow: {
       minimumDatabaseSchemaVersion: 1,
-      maximumDatabaseSchemaVersion: 9,
+      maximumDatabaseSchemaVersion: AGENT_DATABASE_SCHEMA_VERSION,
       legacyExtensionHistoryMigration: "unsupported"
     },
     privacyProfiles: [

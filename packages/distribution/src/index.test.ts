@@ -60,7 +60,7 @@ describe("macOS distribution", () => {
     expect(JSON.parse(readFileSync(result.birthCertificatePath, "utf8"))).toMatchObject({
       runtimeVersion: "v24.11.0",
       ownershipDefault: "agent_full_owner",
-      databaseSchemaVersion: 9,
+      databaseSchemaVersion: 10,
       artifact: {
         packageIdentifier: "dev.tirion.agent",
         signingIdentity: "Developer ID Installer: Tirion",
@@ -68,7 +68,7 @@ describe("macOS distribution", () => {
       },
       migrationSupportWindow: {
         minimumDatabaseSchemaVersion: 1,
-        maximumDatabaseSchemaVersion: 9,
+        maximumDatabaseSchemaVersion: 10,
         legacyExtensionHistoryMigration: "unsupported"
       }
     });

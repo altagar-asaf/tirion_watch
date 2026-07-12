@@ -32,6 +32,7 @@ import {
   type RunLedger,
   type RunQuery,
   type UsageTotals,
+  type WorkEpisodeQuery,
   type WorkspaceChangeTracker,
   usdFromNanoUsd
 } from "@tirion/engine/production";
@@ -54,6 +55,7 @@ type RunObservationBoundary = {
   sessionId?: string;
   provider?: ProductionRunV1["provider"];
   runtime?: string;
+  repoKey?: string;
   startedAt: string;
   endedAt?: string;
 };
@@ -63,7 +65,7 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
   private readonly episodes: SqliteWorkEpisodeLedger;
   private readonly episodeTracker: DefaultAgenticWorkEpisodeTracker;
   private workspaceTracker?: DefaultWorkspaceChangeTracker;
-  private readonly evidenceBoundHandlers = new Set<() => Promise<void>>();
+  private readonly evidenceBoundHandlers = new Set<(evidence: QueryWorkEvidence[]) => Promise<void>>();
   private readonly runBoundaries = new Map<string, RunObservationBoundary>();
   private pending: QueryWorkEvidence[] = [];
   private running = false;
@@ -91,13 +93,13 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       this.recordEvent,
       async (evidence) => {
         await this.episodeTracker.observeWorkspaceEvidence(evidence);
-        await this.notifyEvidenceBound();
+        await this.notifyEvidenceBound(evidence);
       },
       SETTLING_MS,
       this.now
     );
     await this.workspaceTracker.start();
-    this.pending = await this.evidence.listEvidence();
+    await this.refreshPendingEvidence();
     if (this.pending.length > 0) {
       await this.episodeTracker.observeWorkspaceEvidence(this.pending);
       this.recordEvent({
@@ -145,15 +147,15 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
     return this.evidence.listEvidence();
   }
 
-  listEpisodes(): Promise<AgenticWorkEpisode[]> {
-    return this.episodes.listEpisodes();
+  listEpisodes(query: WorkEpisodeQuery = {}): Promise<AgenticWorkEpisode[]> {
+    return this.episodes.listEpisodes(query);
   }
 
   workEpisodes(): DefaultAgenticWorkEpisodeTracker {
     return this.episodeTracker;
   }
 
-  onWorkspaceEvidenceBound(handler: () => Promise<void>): () => void {
+  onWorkspaceEvidenceBound(handler: (evidence: QueryWorkEvidence[]) => Promise<void>): () => void {
     this.evidenceBoundHandlers.add(handler);
     return () => this.evidenceBoundHandlers.delete(handler);
   }
@@ -168,6 +170,7 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       throw new Error("unsupported_capability");
     }
     const occurrences = (observation.queryOccurrences ?? [])
+      .filter((occurrence) => occurrence.lifecycleVisibility !== "internal")
       .filter(hasOccurrenceWorkspaceIdentity)
       .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
     for (const occurrence of occurrences) {
@@ -240,7 +243,7 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       const snapshots = await this.repositories.listSnapshots();
       await this.observeRunCompletedFromSnapshots(run, snapshots, { observeRunCompleted: false });
       await this.augmentExecutionWriteEvidence(run, snapshots);
-      this.pending = await this.evidence.listEvidence();
+      await this.refreshPendingEvidence();
       return;
     }
     this.recordEvent({
@@ -258,7 +261,7 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
     this.recordWorkspaceAssemblyOutcome(run, snapshots, assembled);
     if (assembled.length === 0) {
       await this.requireWorkspaceTracker().observeRunCompleted(run);
-      this.pending = await this.evidence.listEvidence();
+      await this.refreshPendingEvidence();
     }
     await this.augmentExecutionWriteEvidence(run, snapshots);
   }
@@ -313,7 +316,7 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
     }
     if (assembled.length > 0) {
       await this.episodeTracker.observeWorkspaceEvidence(assembled);
-      await this.notifyEvidenceBound();
+      await this.notifyEvidenceBound(assembled);
     }
     return assembled;
   }
@@ -403,7 +406,7 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       }
     });
     await this.episodeTracker.observeWorkspaceEvidence(augmented);
-    await this.notifyEvidenceBound();
+    await this.notifyEvidenceBound(augmented);
     this.recordEvent({
       kind: "constructLifecycle",
       construct: "ProductionRunAttribution",
@@ -444,6 +447,14 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
 
   private async hasTrackedEvidence(queryId: string): Promise<boolean> {
     return (await this.evidence.listEvidence({ queryId })).length > 0;
+  }
+
+  private async refreshPendingEvidence(): Promise<void> {
+    this.pending = (await Promise.all([
+      this.evidence.listEvidence({ status: "active" }),
+      this.evidence.listEvidence({ status: "settling" }),
+      this.evidence.listEvidence({ status: "completed" })
+    ])).flat();
   }
 
   private recordWorkspaceAssemblyOutcome(
@@ -491,9 +502,9 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
     });
   }
 
-  private async notifyEvidenceBound(): Promise<void> {
+  private async notifyEvidenceBound(evidence: QueryWorkEvidence[]): Promise<void> {
     for (const handler of this.evidenceBoundHandlers) {
-      await handler();
+      await handler(evidence);
     }
   }
 
@@ -520,7 +531,8 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       endedAt: latestIsoOptional([existing.endedAt, boundary.endedAt]),
       sessionId: existing.sessionId ?? boundary.sessionId,
       provider: existing.provider ?? boundary.provider,
-      runtime: existing.runtime ?? boundary.runtime
+      runtime: existing.runtime ?? boundary.runtime,
+      repoKey: existing.repoKey ?? boundary.repoKey
     };
     this.runBoundaries.set(key, next);
     return false;
@@ -557,7 +569,7 @@ export class AgentVerifiedAttributionService {
       recordEvent,
       now
     );
-    this.workspace.onWorkspaceEvidenceBound(() => this.gitAttribution.reconcile());
+    this.workspace.onWorkspaceEvidenceBound(async () => await this.gitAttribution.reconcile());
   }
 
   async start(): Promise<void> {
@@ -588,7 +600,8 @@ export class AgentVerifiedAttributionService {
     const processedRuns: ProductionRunV1[] = [];
     for (const run of completed) {
       const existing = processed.get(run.runId);
-      if (existing && existing.completedAt >= run.endedAt!) {
+      const completionUnchanged = Boolean(existing && existing.completedAt >= run.endedAt!);
+      if (completionUnchanged && existing?.outcome !== "identity_deferred") {
         continue;
       }
       if (state?.historicalCutoffAt && run.endedAt != null && run.endedAt < state.historicalCutoffAt) {
@@ -596,6 +609,10 @@ export class AgentVerifiedAttributionService {
         continue;
       }
       if (!hasWorkspaceAttributionIdentity(run)) {
+        if (completionUnchanged && existing?.outcome === "identity_deferred") {
+          deferredCount += 1;
+          continue;
+        }
         this.recordEvent({
           kind: "constructLifecycle",
           construct: "ProductionRunAttribution",
@@ -604,6 +621,18 @@ export class AgentVerifiedAttributionService {
           reason: "production_run_workspace_identity_unavailable",
           runId: run.runId,
           queryId: run.queryId ?? run.correlationId
+        });
+        await this.completedRuns.markIdentityDeferred({
+          runId: run.runId,
+          queryId: run.queryId ?? run.correlationId,
+          completedAt: run.endedAt!
+        }, new Date(this.now()).toISOString());
+        processed.set(run.runId, {
+          runId: run.runId,
+          queryId: run.queryId ?? run.correlationId,
+          completedAt: run.endedAt!,
+          processedAt: new Date(this.now()).toISOString(),
+          outcome: "identity_deferred"
         });
         deferredCount += 1;
         continue;
@@ -634,7 +663,8 @@ export class AgentVerifiedAttributionService {
         runId: run.runId,
         queryId: run.queryId ?? run.correlationId,
         completedAt: run.endedAt!,
-        processedAt: new Date(this.now()).toISOString()
+        processedAt: new Date(this.now()).toISOString(),
+        outcome: "processed"
       });
       processedCount += 1;
       processedRuns.push(run);
@@ -697,8 +727,8 @@ export class AgentVerifiedAttributionService {
     return this.workspace.listEvidence();
   }
 
-  listWorkEpisodes(): Promise<AgenticWorkEpisode[]> {
-    return this.workspace.listEpisodes();
+  listWorkEpisodes(query: WorkEpisodeQuery = {}): Promise<AgenticWorkEpisode[]> {
+    return this.workspace.listEpisodes(query);
   }
 
   export(format: "json" | "csv", query: CommitAttributionQuery = {}): Promise<ExportResult> {
@@ -730,7 +760,7 @@ export class AgentVerifiedAttributionService {
     return this.gitAttribution.onDidChange(handler);
   }
 
-  onWorkspaceEvidenceBound(handler: () => Promise<void>): () => void {
+  onWorkspaceEvidenceBound(handler: (evidence: QueryWorkEvidence[]) => Promise<void>): () => void {
     return this.workspace.onWorkspaceEvidenceBound(handler);
   }
 
@@ -875,6 +905,7 @@ export function productionRunForAttribution(run: ProductionRunV1): AgenticQueryR
     status: isCompletedProductionRun(run) ? "completed" : "running",
     serviceName: run.runtime,
     mode: run.provider === "codex" ? "cli" : run.provider === "claude-code" ? "claude" : "agent",
+    repoKey: run.repositoryKey,
     models,
     inputTokens: run.inputTokens,
     outputTokens: run.outputTokens,
@@ -918,6 +949,7 @@ function boundaryFromProductionRun(run: ProductionRunV1): RunObservationBoundary
     sessionId: run.sessionId,
     provider: run.provider,
     runtime: run.runtime,
+    repoKey: run.repositoryKey,
     startedAt: run.startedAt,
     endedAt: run.endedAt
   };
@@ -934,6 +966,7 @@ function boundaryFromAttributionRun(run: PartialAgenticQueryRun): RunObservation
     sessionId: run.chatSessionId ?? run.sessionId,
     provider: providerFromAttributionRun(run),
     runtime: run.serviceName,
+    repoKey: run.repoKey,
     startedAt,
     endedAt: run.endedAt
   };
@@ -946,6 +979,7 @@ function boundaryFromOccurrence(occurrence: QueryOccurrenceV1): RunObservationBo
     sessionId: occurrence.sessionId,
     provider: occurrence.provider,
     runtime: occurrence.runtime,
+    repoKey: occurrence.repositoryKey,
     startedAt: occurrence.startedAt
   };
 }
@@ -964,6 +998,7 @@ function partialRunFromOccurrence(occurrence: QueryOccurrenceV1): PartialAgentic
     status: "running",
     serviceName: occurrence.runtime,
     mode: occurrence.provider === "codex" ? "cli" : occurrence.provider === "claude-code" ? "claude" : "agent",
+    repoKey: occurrence.repositoryKey,
     models: [],
     tokenUsageSource: "not_reported",
     costCoverage: "unavailable",
@@ -1013,6 +1048,7 @@ function nextRunStartedAt(run: AgenticQueryRun, boundaries: RunObservationBounda
   return boundaries
     .filter((boundary) => boundary.queryId !== run.queryId)
     .filter((boundary) => !currentProvider || !boundary.provider || boundary.provider === currentProvider)
+    .filter((boundary) => !run.repoKey || !boundary.repoKey || boundary.repoKey === run.repoKey)
     .map((boundary) => boundary.startedAt)
     .filter((startedAt) => {
       const started = Date.parse(startedAt);
@@ -1032,7 +1068,7 @@ export function assembleWorkspaceEvidence(
   const end = Date.parse(run.endedAt ?? run.startedAt);
   const acceptingUntil = options.acceptingUntil ?? new Date(end + SETTLING_MS).toISOString();
   const byRepo = new Map<string, RepositorySnapshotObservation[]>();
-  for (const snapshot of snapshots) {
+  for (const snapshot of snapshots.filter((candidate) => !run.repoKey || candidate.repoKey === run.repoKey)) {
     byRepo.set(snapshot.repoKey, [...(byRepo.get(snapshot.repoKey) ?? []), snapshot]);
   }
   const evidence: QueryWorkEvidence[] = [];
@@ -1069,6 +1105,7 @@ export function assembleWorkspaceEvidence(
       continue;
     }
     const artifactStates = [...changed.values()].sort((a, b) => a.artifactKey.localeCompare(b.artifactKey));
+    const baselineTrust = snapshotBaselineTrust(baseline);
     evidence.push({
       queryId: run.queryId,
       runIds: [run.id],
@@ -1078,10 +1115,8 @@ export function assembleWorkspaceEvidence(
       completedAt: run.endedAt ?? run.startedAt,
       settlingUntil: acceptingUntil,
       expiresAt: new Date(Math.max(now, end) + EVIDENCE_TTL_MS).toISOString(),
-      baselineTrusted: baseline.dirtyKnown,
-      baselineReasons: baseline.dirtyKnown
-        ? baseline.dirty ? ["dirty_baseline_known"] : ["clean_baseline"]
-        : ["dirty_state_unknown"],
+      baselineTrusted: baselineTrust.trusted,
+      baselineReasons: baselineTrust.reasons,
       headCommitAtStart: baseline.headCommit,
       baselineSequence: baseline.observedSequence,
       dirtyAtStart: baseline.dirty,
@@ -1115,7 +1150,7 @@ function analyzeWorkspaceEvidenceAssembly(
   const end = Date.parse(run.endedAt ?? run.startedAt);
   const acceptingUntil = options.acceptingUntil ?? new Date(end + SETTLING_MS).toISOString();
   const byRepo = new Map<string, RepositorySnapshotObservation[]>();
-  for (const snapshot of snapshots) {
+  for (const snapshot of snapshots.filter((candidate) => !run.repoKey || candidate.repoKey === run.repoKey)) {
     byRepo.set(snapshot.repoKey, [...(byRepo.get(snapshot.repoKey) ?? []), snapshot]);
   }
   let baselineRepositoryCount = 0;
@@ -1199,7 +1234,7 @@ async function executionWriteEvidenceForQuery(
   repositories: AgentRepositoryObservationService
 ): Promise<ExecutionWriteEvidence[]> {
   const [nodes, knownRepositories] = await Promise.all([
-    storage.listAgentDocuments<ExecutionNodeAtomV1>("execution_node_atom"),
+    storage.listExecutionNodeDocumentsForQuery<ExecutionNodeAtomV1>(queryId),
     repositories.listRepositories()
   ]);
   const byRepo = new Map<string, ExecutionWriteEvidence>();
@@ -1209,11 +1244,30 @@ async function executionWriteEvidenceForQuery(
   for (const node of nodes
     .map((document) => document.value)
     .filter((item) =>
-      item.queryId === queryId
-      && item.nodeKind === "tool"
-      && (item.toolName === "Write" || item.toolName === "Edit")
+      item.nodeKind === "tool"
       && item.outcome === "success"
+      && ((item.artifactKeys?.length ?? 0) > 0 || item.toolName === "Write" || item.toolName === "Edit")
     )) {
+    const repositoryByKey = node.repositoryKey
+      ? sortedRepositories.find((candidate) => candidate.repoKey === node.repositoryKey)
+      : undefined;
+    if (repositoryByKey) {
+      for (const artifactKey of node.artifactKeys ?? []) {
+        const relativePath = repositories.relativePaths(repositoryByKey.repoKey, [artifactKey])[0];
+        if (!relativePath) {
+          continue;
+        }
+        const absolute = canonicalPath(path.join(repositoryByKey.root, relativePath));
+        const relative = path.relative(repositoryByKey.root, absolute).replace(/\\/g, "/");
+        if (relative === "" || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) {
+          continue;
+        }
+        const artifactState = executionArtifactState(absolute, artifactKey, repositories);
+        if (artifactState) {
+          mergeExecutionWriteState(byRepo, node.queryId, repositoryByKey.repoKey, node.startedAt, artifactState);
+        }
+      }
+    }
     for (const content of node.contents ?? []) {
       if (content.kind !== "tool_input" || content.visibility !== "visible" || !content.text) {
         continue;
@@ -1241,22 +1295,32 @@ async function executionWriteEvidenceForQuery(
       if (!artifactState) {
         continue;
       }
-      const existing = byRepo.get(repository.repoKey);
-      byRepo.set(repository.repoKey, existing
-        ? {
-            ...existing,
-            observedAt: maxIso(existing.observedAt, node.startedAt),
-            artifactStates: mergeArtifactStates(existing.artifactStates, [artifactState])
-          }
-        : {
-            queryId,
-            repoKey: repository.repoKey,
-            observedAt: node.startedAt,
-            artifactStates: [artifactState]
-          });
+      mergeExecutionWriteState(byRepo, queryId, repository.repoKey, node.startedAt, artifactState);
     }
   }
   return [...byRepo.values()];
+}
+
+function mergeExecutionWriteState(
+  byRepo: Map<string, ExecutionWriteEvidence>,
+  queryId: string,
+  repoKey: string,
+  observedAt: string,
+  artifactState: ArtifactStateEvidence
+): void {
+  const existing = byRepo.get(repoKey);
+  byRepo.set(repoKey, existing
+    ? {
+        ...existing,
+        observedAt: maxIso(existing.observedAt, observedAt),
+        artifactStates: mergeArtifactStates(existing.artifactStates, [artifactState])
+      }
+    : {
+        queryId,
+        repoKey,
+        observedAt,
+        artifactStates: [artifactState]
+      });
 }
 
 function executionArtifactState(
@@ -1310,6 +1374,7 @@ function evidenceFromExecutionWrite(
     return undefined;
   }
   const end = Date.parse(run.endedAt ?? startedAt);
+  const baselineTrust = snapshotBaselineTrust(baseline);
   return {
     queryId: run.queryId,
     runIds: [run.id],
@@ -1319,15 +1384,14 @@ function evidenceFromExecutionWrite(
     completedAt: run.endedAt ?? startedAt,
     settlingUntil: new Date(end + SETTLING_MS).toISOString(),
     expiresAt: new Date(Math.max(now, end) + EVIDENCE_TTL_MS).toISOString(),
-    baselineTrusted: baseline.dirtyKnown,
-    baselineReasons: baseline.dirtyKnown
-      ? baseline.dirty ? ["dirty_baseline_known"] : ["clean_baseline"]
-      : ["dirty_state_unknown"],
+    baselineTrusted: baselineTrust.trusted,
+    baselineReasons: baselineTrust.reasons,
     headCommitAtStart: baseline.headCommit,
     baselineSequence: baseline.observedSequence,
     dirtyAtStart: baseline.dirty,
     observedChangeCount: write.artifactStates.length,
     artifactKeys: write.artifactStates.map((state) => state.artifactKey).sort(),
+    causalArtifactKeys: write.artifactStates.map((state) => state.artifactKey).sort(),
     baselineArtifactStates: baseline.artifactStates.map((state) => ({ ...state })),
     artifactStates: write.artifactStates.map((state) => ({ ...state })),
     addedLines: 0,
@@ -1340,13 +1404,34 @@ function evidenceFromExecutionWrite(
 
 function mergeExecutionWriteEvidence(current: QueryWorkEvidence, write: ExecutionWriteEvidence): QueryWorkEvidence {
   const artifactStates = mergeArtifactStates(current.artifactStates ?? [], write.artifactStates);
+  const causalArtifactKeys = [...new Set([
+    ...(current.causalArtifactKeys ?? []),
+    ...write.artifactStates.map((state) => state.artifactKey)
+  ])].sort();
   return {
     ...current,
     observedChangeCount: artifactStates.length,
     artifactKeys: artifactStates.map((state) => state.artifactKey).sort(),
+    causalArtifactKeys,
     artifactStates,
     firstObservedAt: current.firstObservedAt ?? write.observedAt,
     lastObservedAt: maxIsoOptional(current.lastObservedAt, write.observedAt)
+  };
+}
+
+function snapshotBaselineTrust(snapshot: RepositorySnapshotObservation): {
+  trusted: boolean;
+  reasons: string[];
+} {
+  const artifactCoverageComplete = snapshot.artifactCoverage !== "partial";
+  return {
+    trusted: snapshot.dirtyKnown && artifactCoverageComplete,
+    reasons: [
+      ...(snapshot.dirtyKnown
+        ? snapshot.dirty ? ["dirty_baseline_known"] : ["clean_baseline"]
+        : ["dirty_state_unknown"]),
+      ...(artifactCoverageComplete ? [] : ["artifact_state_coverage_partial"])
+    ]
   };
 }
 

@@ -7,7 +7,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentRuntime, restorePreUpgradeBackup } from "./index";
 import { ExternalWebhookDispatchService } from "./externalWebhookDispatch";
 import { AgentVerifiedAttributionService } from "./productionRunAttribution";
+import { ProductionUsageService } from "./productionUsageService";
 import { OTLP_BODY_LIMIT_BYTES } from "./otlpIngress";
+import type { ProductionRunV1, SafeObservationV1, SupportedProvider } from "@tirion/agent-contract";
 import { AgentStorageClient } from "@tirion/agent-storage";
 import { OTLP_MAX_RECORDS } from "@tirion/engine";
 import type { AgentPaths } from "@tirion/platform";
@@ -384,7 +386,12 @@ describe("agent runtime control and client gateway", () => {
       }]);
       await storage.close();
 
-      const agent = new AgentRuntime({ paths, otlpPort: 0, initialOwnershipState: "agent_full_owner" });
+      const agent = new AgentRuntime({
+        paths,
+        otlpPort: 0,
+        now: () => new Date("2026-06-08T00:00:02.000Z"),
+        initialOwnershipState: "agent_full_owner"
+      });
       agents.push(agent);
       await agent.start();
       await (agent as unknown as { rebuildUsageProducts: () => Promise<unknown> }).rebuildUsageProducts();
@@ -451,7 +458,12 @@ describe("agent runtime control and client gateway", () => {
       }]);
       await storage.close();
 
-      const agent = new AgentRuntime({ paths, otlpPort: 0, initialOwnershipState: "agent_full_owner" });
+      const agent = new AgentRuntime({
+        paths,
+        otlpPort: 0,
+        now: () => new Date("2026-06-08T00:00:02.000Z"),
+        initialOwnershipState: "agent_full_owner"
+      });
       agents.push(agent);
       await agent.start();
       const rebuild = (agent as unknown as { rebuildUsageProducts: () => Promise<unknown> }).rebuildUsageProducts();
@@ -466,6 +478,551 @@ describe("agent runtime control and client gateway", () => {
       releaseAttribution?.();
       AgentVerifiedAttributionService.prototype.observeCompletedRunsIncrementally = originalObserveIncremental;
       ExternalWebhookDispatchService.prototype.observeCompletedRuns = originalObserveCompletedRuns;
+    }
+  });
+
+  it("projects live webhook observations for every harness without waiting for workspace evidence", async () => {
+    const originalObserveWorkspace = AgentVerifiedAttributionService.prototype.observeSafeObservation;
+    const originalObserveWebhook = ExternalWebhookDispatchService.prototype.observeSafeObservation;
+    const webhookProviders: SupportedProvider[] = [];
+    let workspaceStarted = false;
+    let releaseWorkspace!: () => void;
+    const workspaceBlocked = new Promise<void>((resolve) => {
+      releaseWorkspace = resolve;
+    });
+
+    AgentVerifiedAttributionService.prototype.observeSafeObservation = async function () {
+      workspaceStarted = true;
+      await workspaceBlocked;
+    };
+    ExternalWebhookDispatchService.prototype.observeSafeObservation = async function (observation) {
+      webhookProviders.push(observation.provider);
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: 0,
+        initialOwnershipState: "agent_full_owner"
+      });
+      agents.push(agent);
+      await agent.start();
+      const schedule = (agent as unknown as {
+        scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+      }).scheduleLiveIngestProcessing.bind(agent);
+      const providers: SupportedProvider[] = ["claude-code", "codex", "cursor", "github-copilot"];
+      for (const provider of providers) {
+        schedule({
+          schemaVersion: 1,
+          observationId: `obs_fast_lane_${provider}`,
+          sourceId: `source_fast_lane_${provider}`,
+          provider,
+          runtime: provider,
+          signal: "logs",
+          profileVersion: "fast-lane-test-v1",
+          resourceCount: 1,
+          recordCount: 1,
+          observedAt: "2026-06-08T00:00:00.000Z",
+          queryOccurrences: [{
+            schemaVersion: 1,
+            queryId: `qry_fast_lane_${provider}`,
+            sessionId: `ses_fast_lane_${provider}`,
+            provider,
+            runtime: provider,
+            startedAt: "2026-06-08T00:00:00.000Z",
+            promptState: "disabled",
+            evidence: "submission_hook"
+          }],
+          usageAtoms: []
+        });
+      }
+
+      await waitUntil(() => workspaceStarted && webhookProviders.length === providers.length);
+      expect(webhookProviders).toEqual(providers);
+    } finally {
+      releaseWorkspace?.();
+      AgentVerifiedAttributionService.prototype.observeSafeObservation = originalObserveWorkspace;
+      ExternalWebhookDispatchService.prototype.observeSafeObservation = originalObserveWebhook;
+    }
+  });
+
+  it("prioritizes a newly queued lifecycle anchor ahead of older enrichment", async () => {
+    const originalObserveWebhook = ExternalWebhookDispatchService.prototype.observeSafeObservation;
+    const projected: string[] = [];
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    ExternalWebhookDispatchService.prototype.observeSafeObservation = async function (observation) {
+      projected.push(observation.observationId);
+      if (observation.observationId === "obs_enrichment_first") {
+        await firstBlocked;
+      }
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: 0,
+        initialOwnershipState: "agent_full_owner"
+      });
+      agents.push(agent);
+      await agent.start();
+      const schedule = (agent as unknown as {
+        scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+      }).scheduleLiveIngestProcessing.bind(agent);
+      const enrichment = (suffix: string): SafeObservationV1 => ({
+        schemaVersion: 1,
+        observationId: `obs_enrichment_${suffix}`,
+        sourceId: "source_enrichment_priority",
+        provider: "codex",
+        runtime: "codex",
+        signal: "logs",
+        profileVersion: "priority-test-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: "2026-06-08T00:00:01.000Z",
+        activityAtoms: [{
+          schemaVersion: 1,
+          activityId: `act_enrichment_${suffix}`,
+          queryId: `qry_enrichment_${suffix}`,
+          sessionId: `ses_enrichment_${suffix}`,
+          provider: "codex",
+          runtime: "codex",
+          kind: "tool",
+          name: "Bash",
+          outcome: "success",
+          startedAt: "2026-06-08T00:00:01.000Z"
+        }],
+        usageAtoms: []
+      });
+      schedule(enrichment("first"));
+      await waitUntil(() => projected.length === 1);
+      schedule(enrichment("second"));
+      schedule({
+        schemaVersion: 1,
+        observationId: "obs_priority_lifecycle",
+        sourceId: "hook_codex_lifecycle",
+        provider: "codex",
+        runtime: "codex",
+        signal: "logs",
+        profileVersion: "priority-test-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: "2026-06-08T00:00:02.000Z",
+        queryOccurrences: [{
+          schemaVersion: 1,
+          queryId: "qry_priority_lifecycle",
+          sessionId: "ses_priority_lifecycle",
+          provider: "codex",
+          runtime: "codex",
+          startedAt: "2026-06-08T00:00:02.000Z",
+          promptState: "disabled",
+          evidence: "submission_hook"
+        }],
+        usageAtoms: []
+      });
+      releaseFirst();
+      await waitUntil(() => projected.length === 3);
+      expect(projected).toEqual([
+        "obs_enrichment_first",
+        "obs_priority_lifecycle",
+        "obs_enrichment_second"
+      ]);
+    } finally {
+      releaseFirst?.();
+      ExternalWebhookDispatchService.prototype.observeSafeObservation = originalObserveWebhook;
+    }
+  });
+
+  it("projects a fresh completed-run correction independently of in-flight historical replay", async () => {
+    const originalObserveCompletedRuns = ExternalWebhookDispatchService.prototype.observeCompletedRuns;
+    const projected: string[] = [];
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    ExternalWebhookDispatchService.prototype.observeCompletedRuns = async function (runs): Promise<void> {
+      projected.push(...runs.map((run) => run.runId));
+      if (projected.length === 1) {
+        await firstBlocked;
+      }
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: false,
+        initialOwnershipState: "agent_full_owner"
+      });
+      agents.push(agent);
+      await agent.start();
+      await (agent as unknown as { runtimeWarmup?: Promise<void> }).runtimeWarmup;
+      const schedule = (agent as unknown as {
+        scheduleWebhookLifecycleProjection: (
+          runs: ProductionRunV1[],
+          options?: { reconcileCommitEvents?: boolean; priority?: boolean }
+        ) => void;
+      }).scheduleWebhookLifecycleProjection.bind(agent);
+      schedule([
+        completedRun("run_historical_newer", "2026-06-08T00:00:02.000Z"),
+        completedRun("run_historical_older", "2026-06-08T00:00:01.000Z")
+      ], { reconcileCommitEvents: false, priority: false });
+      await waitUntil(() => projected.length === 1);
+      schedule([
+        completedRun("run_fresh_correction", "2026-06-07T00:00:00.000Z")
+      ], { reconcileCommitEvents: false, priority: true });
+      await waitUntil(() => projected.length === 2);
+      expect(projected).toEqual([
+        "run_historical_newer",
+        "run_fresh_correction"
+      ]);
+      releaseFirst();
+      await waitUntil(() => projected.length === 3);
+
+      expect(projected).toEqual([
+        "run_historical_newer",
+        "run_fresh_correction",
+        "run_historical_older"
+      ]);
+    } finally {
+      releaseFirst?.();
+      ExternalWebhookDispatchService.prototype.observeCompletedRuns = originalObserveCompletedRuns;
+    }
+  });
+
+  it("projects a fresh completed run while commit reconciliation is still in flight", async () => {
+    const originalObserveCompletedRuns = ExternalWebhookDispatchService.prototype.observeCompletedRuns;
+    const originalReconcileCommitEvents = ExternalWebhookDispatchService.prototype.reconcileCommitEvents;
+    const projected: string[] = [];
+    let blockReconciliation = false;
+    let reconciliationStarted = false;
+    let releaseReconciliation!: () => void;
+    const reconciliationBlocked = new Promise<void>((resolve) => {
+      releaseReconciliation = resolve;
+    });
+    ExternalWebhookDispatchService.prototype.observeCompletedRuns = async function (runs): Promise<void> {
+      projected.push(...runs.map((run) => run.runId));
+    };
+    ExternalWebhookDispatchService.prototype.reconcileCommitEvents = async function (): Promise<void> {
+      if (!blockReconciliation) {
+        return;
+      }
+      reconciliationStarted = true;
+      await reconciliationBlocked;
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: false,
+        initialOwnershipState: "agent_full_owner"
+      });
+      agents.push(agent);
+      await agent.start();
+      await (agent as unknown as { runtimeWarmup?: Promise<void> }).runtimeWarmup;
+      const schedule = (agent as unknown as {
+        scheduleWebhookLifecycleProjection: (
+          runs: ProductionRunV1[],
+          options?: { reconcileCommitEvents?: boolean; priority?: boolean }
+        ) => void;
+      }).scheduleWebhookLifecycleProjection.bind(agent);
+
+      blockReconciliation = true;
+      schedule([
+        completedRun("run_before_commit_scan", "2026-06-08T00:00:01.000Z")
+      ], { reconcileCommitEvents: true, priority: true });
+      await waitUntil(() => reconciliationStarted);
+
+      schedule([
+        completedRun("run_during_commit_scan", "2026-06-08T00:00:02.000Z")
+      ], { reconcileCommitEvents: true, priority: true });
+      await waitUntil(() => projected.includes("run_during_commit_scan"));
+
+      expect(projected).toEqual([
+        "run_before_commit_scan",
+        "run_during_commit_scan"
+      ]);
+    } finally {
+      releaseReconciliation?.();
+      ExternalWebhookDispatchService.prototype.observeCompletedRuns = originalObserveCompletedRuns;
+      ExternalWebhookDispatchService.prototype.reconcileCommitEvents = originalReconcileCommitEvents;
+    }
+  });
+
+  it("projects a terminal query independently of an in-flight global usage rebuild", async () => {
+    const originalProjectCompletedQuery = ProductionUsageService.prototype.projectCompletedQuery;
+    const originalObserveCompletedRuns = ExternalWebhookDispatchService.prototype.observeCompletedRuns;
+    let releaseGlobal!: () => void;
+    const globalBlocked = new Promise<void>((resolve) => {
+      releaseGlobal = resolve;
+    });
+    let globalStarted = false;
+    const projected: string[] = [];
+    ProductionUsageService.prototype.projectCompletedQuery = async function (_owner, queryId) {
+      return [completedRun(`run_${queryId}`, "2026-06-08T00:00:01.000Z")];
+    };
+    ExternalWebhookDispatchService.prototype.observeCompletedRuns = async function (runs) {
+      projected.push(...runs.map((run) => run.runId));
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: false,
+        initialOwnershipState: "agent_full_owner"
+      });
+      agents.push(agent);
+      await agent.start();
+      await (agent as unknown as { runtimeWarmup?: Promise<void> }).runtimeWarmup;
+      const runtime = agent as unknown as {
+        queueUsageRebuild: () => Promise<ProductionRunV1[]>;
+        enqueueUsageProjection: () => void;
+        enqueueTerminalUsageProjection: (queryId: string) => void;
+      };
+      runtime.queueUsageRebuild = async () => {
+        globalStarted = true;
+        await globalBlocked;
+        return [];
+      };
+      runtime.enqueueUsageProjection();
+      await waitUntil(() => globalStarted);
+
+      runtime.enqueueTerminalUsageProjection("qry_priority_terminal");
+      await waitUntil(() => projected.includes("run_qry_priority_terminal"));
+    } finally {
+      releaseGlobal?.();
+      ProductionUsageService.prototype.projectCompletedQuery = originalProjectCompletedQuery;
+      ExternalWebhookDispatchService.prototype.observeCompletedRuns = originalObserveCompletedRuns;
+    }
+  });
+
+  it("defers event-triggered and periodic usage rebuilds until live ingress is quiet", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_shadow",
+      usageProjectionQuietMs: 40
+    });
+    agents.push(agent);
+    await agent.start();
+    await (agent as unknown as { runtimeWarmup?: Promise<void> }).runtimeWarmup;
+
+    let rebuildCalls = 0;
+    const runtime = agent as unknown as {
+      queueUsageRebuild: () => Promise<unknown[]>;
+      runPeriodicUsageMaintenance: () => Promise<void>;
+      scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+    };
+    runtime.queueUsageRebuild = async () => {
+      rebuildCalls += 1;
+      return [];
+    };
+    const observation = (suffix: string): SafeObservationV1 => ({
+      schemaVersion: 1,
+      observationId: `obs_usage_quiet_${suffix}`,
+      sourceId: "source_usage_quiet",
+      provider: "codex",
+      runtime: "codex",
+      signal: "logs",
+      profileVersion: "usage-quiet-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date().toISOString(),
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId: `qry_usage_quiet_${suffix}`,
+        sessionId: "ses_usage_quiet",
+        provider: "codex",
+        runtime: "codex",
+        startedAt: new Date().toISOString(),
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }],
+      usageAtoms: []
+    });
+
+    runtime.scheduleLiveIngestProcessing(observation("first"));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await runtime.runPeriodicUsageMaintenance();
+    expect(rebuildCalls).toBe(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    runtime.scheduleLiveIngestProcessing(observation("second"));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(rebuildCalls).toBe(0);
+    await waitUntil(() => rebuildCalls === 1);
+  });
+
+  it("rebuilds terminal usage on a fixed deadline despite unrelated live telemetry", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_shadow",
+      usageProjectionQuietMs: 100
+    });
+    agents.push(agent);
+    await agent.start();
+    await (agent as unknown as { runtimeWarmup?: Promise<void> }).runtimeWarmup;
+
+    let rebuildCalls = 0;
+    const runtime = agent as unknown as {
+      queueUsageRebuild: () => Promise<unknown[]>;
+      scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+    };
+    runtime.queueUsageRebuild = async () => {
+      rebuildCalls += 1;
+      return [];
+    };
+    const at = new Date().toISOString();
+    runtime.scheduleLiveIngestProcessing({
+      schemaVersion: 1,
+      observationId: "obs_fixed_terminal",
+      sourceId: "hook_codex_lifecycle",
+      provider: "codex",
+      runtime: "codex",
+      signal: "logs",
+      profileVersion: "fixed-terminal-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: at,
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId: "qry_fixed_terminal",
+        sessionId: "ses_fixed_terminal",
+        provider: "codex",
+        runtime: "codex",
+        startedAt: at,
+        completedAt: at,
+        completionEvidence: "stop_hook",
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }],
+      usageAtoms: []
+    });
+    const noise = (suffix: string): SafeObservationV1 => ({
+      schemaVersion: 1,
+      observationId: `obs_terminal_noise_${suffix}`,
+      sourceId: "otlp_codex_logs",
+      provider: "codex",
+      runtime: "codex",
+      signal: "logs",
+      profileVersion: "fixed-terminal-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date().toISOString(),
+      activityAtoms: [{
+        schemaVersion: 1,
+        activityId: `act_terminal_noise_${suffix}`,
+        queryId: `qry_terminal_noise_${suffix}`,
+        sessionId: `ses_terminal_noise_${suffix}`,
+        provider: "codex",
+        runtime: "codex",
+        kind: "tool",
+        name: "Bash",
+        outcome: "success",
+        startedAt: new Date().toISOString()
+      }],
+      usageAtoms: []
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    runtime.scheduleLiveIngestProcessing(noise("one"));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    runtime.scheduleLiveIngestProcessing(noise("two"));
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    expect(rebuildCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("routes every supported harness through the query-scoped terminal projection path", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_shadow",
+      usageProjectionQuietMs: 0
+    });
+    agents.push(agent);
+    await agent.start();
+    await (agent as unknown as { runtimeWarmup?: Promise<void> }).runtimeWarmup;
+    const projected: string[] = [];
+    const runtime = agent as unknown as {
+      enqueueTerminalUsageProjection: (queryId: string) => void;
+      scheduleTerminalUsageProjection: (observation: SafeObservationV1) => void;
+    };
+    runtime.enqueueTerminalUsageProjection = (queryId) => {
+      projected.push(queryId);
+    };
+    const completedAt = new Date().toISOString();
+    const providers: SupportedProvider[] = ["claude-code", "codex", "cursor", "github-copilot"];
+    for (const provider of providers) {
+      runtime.scheduleTerminalUsageProjection({
+        schemaVersion: 1,
+        observationId: `obs_scoped_terminal_${provider}`,
+        sourceId: `source_scoped_terminal_${provider}`,
+        provider,
+        runtime: provider,
+        signal: "logs",
+        profileVersion: "scoped-terminal-test-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: completedAt,
+        queryOccurrences: [{
+          schemaVersion: 1,
+          queryId: `qry_scoped_terminal_${provider}`,
+          sessionId: `ses_scoped_terminal_${provider}`,
+          provider,
+          runtime: provider,
+          startedAt: completedAt,
+          completedAt,
+          completionEvidence: "stop_hook",
+          promptState: "disabled",
+          evidence: "submission_hook"
+        }],
+        usageAtoms: []
+      });
+    }
+
+    await waitUntil(() => projected.length === providers.length);
+    expect(projected).toEqual(providers.map((provider) => `qry_scoped_terminal_${provider}`));
+  });
+
+  it("keeps empty accepted telemetry off live projection and repository observation lanes", async () => {
+    const originalObserveWorkspace = AgentVerifiedAttributionService.prototype.observeSafeObservation;
+    const originalObserveWebhook = ExternalWebhookDispatchService.prototype.observeSafeObservation;
+    let workspaceCalls = 0;
+    let webhookCalls = 0;
+    AgentVerifiedAttributionService.prototype.observeSafeObservation = async function () {
+      workspaceCalls += 1;
+    };
+    ExternalWebhookDispatchService.prototype.observeSafeObservation = async function () {
+      webhookCalls += 1;
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: 0,
+        initialOwnershipState: "agent_full_owner"
+      });
+      agents.push(agent);
+      await agent.start();
+      const schedule = (agent as unknown as {
+        scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+      }).scheduleLiveIngestProcessing.bind(agent);
+      schedule({
+        schemaVersion: 1,
+        observationId: "obs_empty_telemetry",
+        sourceId: "source_empty_telemetry",
+        provider: "codex",
+        runtime: "codex",
+        signal: "traces",
+        profileVersion: "empty-telemetry-test-v1",
+        resourceCount: 1,
+        recordCount: 100,
+        observedAt: "2026-06-08T00:00:00.000Z",
+        usageAtoms: []
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(webhookCalls).toBe(0);
+      expect(workspaceCalls).toBe(0);
+    } finally {
+      AgentVerifiedAttributionService.prototype.observeSafeObservation = originalObserveWorkspace;
+      ExternalWebhookDispatchService.prototype.observeSafeObservation = originalObserveWebhook;
     }
   });
 
@@ -532,7 +1089,7 @@ describe("agent runtime control and client gateway", () => {
     const originalOnWorkspaceEvidenceBound = AgentVerifiedAttributionService.prototype.onWorkspaceEvidenceBound;
     const originalObserveCompletedRuns = ExternalWebhookDispatchService.prototype.observeCompletedRuns;
     const originalReconcileCommitEvents = ExternalWebhookDispatchService.prototype.reconcileCommitEvents;
-    const handlers = new Set<() => Promise<void>>();
+    const handlers = new Set<(evidence: { queryId: string }[]) => Promise<void>>();
     const dispatchedRunBatches: string[][] = [];
     let reconcileCalls = 0;
 
@@ -588,7 +1145,7 @@ describe("agent runtime control and client gateway", () => {
       const baselineReconciles = reconcileCalls;
 
       for (const handler of handlers) {
-        await handler();
+        await handler([{ queryId: "qry_late_evidence_webhook" }]);
       }
 
       await waitUntil(() =>
@@ -711,6 +1268,7 @@ describe("agent runtime control and client gateway", () => {
       paths,
       otlpPort: 0,
       initialOwnershipState: "agent_shadow",
+      codexHookReadinessProbe: async () => "ready",
       sourceConfigurationPaths: {
         claudeSettingsPath: join(sourceRoot, "claude", "settings.json"),
         codexConfigPath: join(sourceRoot, "codex", "config.toml"),
@@ -822,6 +1380,7 @@ describe("agent runtime control and client gateway", () => {
       paths,
       otlpPort: 0,
       initialOwnershipState: "agent_shadow",
+      codexHookReadinessProbe: async () => "ready",
       sourceConfigurationPaths: {
         claudeSettingsPath: join(sourceRoot, "claude", "settings.json"),
         codexConfigPath: join(sourceRoot, "codex", "config.toml"),
@@ -856,6 +1415,62 @@ describe("agent runtime control and client gateway", () => {
       }
     });
     expect(activated.body.repositoryScope).not.toHaveProperty("provider");
+  });
+
+  it("requires explicit Codex hook trust before declaring repository measurement ready", async () => {
+    const paths = testPaths();
+    const sourceRoot = mkdtempSync(join(tmpdir(), "tirion-agent-activation-trust-source-"));
+    roots.push(sourceRoot);
+    const probedCwds: string[] = [];
+    const agent = new AgentRuntime({
+      paths,
+      otlpPort: 0,
+      initialOwnershipState: "agent_shadow",
+      codexHookReadinessProbe: async (input) => {
+        probedCwds.push(input.cwd);
+        return "review_required";
+      },
+      sourceConfigurationPaths: {
+        claudeSettingsPath: join(sourceRoot, "claude", "settings.json"),
+        codexConfigPath: join(sourceRoot, "codex", "config.toml"),
+        restoreStatePath: join(paths.stateDir, "source-configuration-restore.json"),
+        codexHookRelayPath: join(paths.stateDir, "codex-hook-relay.cjs"),
+        cursorHooksPath: join(sourceRoot, "cursor", "hooks.json"),
+        cursorHookRelayPath: join(paths.stateDir, "cursor-hook-relay.cjs")
+      }
+    });
+    agents.push(agent);
+    await agent.start();
+    const repository = mkdtempSync(join(tmpdir(), "tirion-agent-activate-trust-repo-"));
+    roots.push(repository);
+    execFileSync("git", ["init", repository]);
+
+    const activated = await call(agent.socketPath(), "POST", "/v1/repositories/activate", {
+      path: repository,
+      provider: "codex"
+    }, agent.bootstrapCredential());
+
+    expect(activated).toMatchObject({
+      status: 200,
+      body: {
+        activationState: "attention_required",
+        provider: "codex",
+        restartRequired: true,
+        sourceStatus: {
+          configurationState: "partial",
+          measurementState: "unavailable",
+          toolDetailsEnabled: false,
+          reasonCodes: expect.arrayContaining(["hook_trust_required"])
+        },
+        configurationResult: {
+          status: "configured",
+          reasonCodes: expect.arrayContaining(["hook_trust_required"])
+        },
+        reasonCodes: expect.arrayContaining(["hook_trust_required"])
+      }
+    });
+    expect(probedCwds).toContain(repository);
+    expect(JSON.stringify(activated.body)).not.toContain(repository);
   });
 
   it("activates GitHub Copilot repositories through configured span DB telemetry", async () => {
@@ -1092,7 +1707,7 @@ describe("agent runtime control and client gateway", () => {
     );
     expect(prepared).toMatchObject({
       status: 200,
-      body: { backupAvailable: true, databaseSchemaVersion: 9 }
+      body: { backupAvailable: true, databaseSchemaVersion: 10 }
     });
     expect(await call(
       agent.socketPath(),
@@ -1102,7 +1717,7 @@ describe("agent runtime control and client gateway", () => {
       agent.bootstrapCredential()
     )).toMatchObject({
       status: 200,
-      body: { backupAvailable: true, agentVersion: "0.1.6", databaseSchemaVersion: 9 }
+      body: { backupAvailable: true, agentVersion: "0.1.6", databaseSchemaVersion: 10 }
     });
     expect(JSON.stringify(prepared.body)).not.toContain(paths.stateDir);
     await agent.stop();
@@ -1359,7 +1974,7 @@ describe("agent runtime control and client gateway", () => {
       .toMatchObject({ status: 200, body: { runCount: 1, totalTokens: 15 } });
   });
 
-  it("keeps Codex run identity across exporter batches and stores the final cumulative snapshot", async () => {
+  it("keeps Codex run identity across exporter batches and sums distinct response slices", async () => {
     const agent = new AgentRuntime({
       paths: testPaths(),
       otlpPort: 0,
@@ -1408,10 +2023,10 @@ describe("agent runtime control and client gateway", () => {
         body: {
           runs: [expect.objectContaining({
             provider: "codex",
-            inputTokens: 140,
+            inputTokens: 240,
             outputTokens: 5,
             cacheReadInputTokens: 40,
-            totalTokens: 145,
+            totalTokens: 245,
             billingContext: "subscription",
             promptState: "disabled",
             endedAt: "2026-06-08T00:00:02.000Z"
@@ -1606,6 +2221,7 @@ describe("agent runtime control and client gateway", () => {
       hook_event_name: "UserPromptSubmit",
       turn_id: "codex-hook-turn",
       session_id: "codex-hook-session",
+      transcript_path: "/private/session/codex-hook-session.jsonl",
       prompt: "Search the workspace with Codex hooks"
     }, "codex-hook-prompt")).status).toBe(200);
 
@@ -1648,6 +2264,12 @@ describe("agent runtime control and client gateway", () => {
         }] }]
       }]
     }, "codex-hook-trace")).status).toBe(200);
+
+    expect((await callOtlp(agent.otlpAddress()!.port, "/v1/provider-hooks/codex", {
+      hook_event_name: "Stop",
+      turn_id: "codex-hook-turn",
+      session_id: "codex-hook-session"
+    }, "codex-hook-stop")).status).toBe(200);
 
     await waitUntil(async () => {
       const execution = await call(agent.socketPath(), "GET", "/v1/execution/runs", undefined, agent.bootstrapCredential());
@@ -2115,4 +2737,35 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>): Promise<v
 
 function wait(delayMs: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function completedRun(runId: string, endedAt: string): ProductionRunV1 {
+  const queryId = `qry_${runId.slice(4)}`;
+  return {
+    schemaVersion: 1,
+    production: true,
+    runId,
+    correlationId: queryId,
+    queryId,
+    sessionId: `ses_${runId.slice(4)}`,
+    promptState: "disabled",
+    provider: "codex",
+    runtime: "codex",
+    authority: "turn",
+    inputTokens: 10,
+    outputTokens: 1,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 11,
+    costEstimateBasis: "unavailable",
+    billingContext: "openai-direct",
+    costCoverage: "unavailable",
+    evidenceGrade: "estimated_usage_cost_unattributed",
+    toolCallCount: 0,
+    breakdown: [],
+    startedAt: "2026-06-01T00:00:00.000Z",
+    endedAt,
+    warnings: []
+  };
 }

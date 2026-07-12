@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,13 +28,15 @@ describe("agent production run attribution foundation", () => {
       correlationId: "qry_legacy_alias",
       queryId: "qry_prompt",
       sessionId: "ses_thread",
+      repositoryKey: "repo_bound",
       promptState: "captured",
       promptText: "private initiating prompt"
     });
     expect(adapted).toMatchObject({
       traceId: "qry_legacy_alias",
       queryId: "qry_prompt",
-      chatSessionId: "ses_thread"
+      chatSessionId: "ses_thread",
+      repoKey: "repo_bound"
     });
     expect(JSON.stringify(adapted)).not.toContain("private initiating prompt");
   });
@@ -84,6 +86,7 @@ describe("agent production run attribution foundation", () => {
         status: "completed"
       })
     ]);
+    expect((await attribution.listEvidence())[0]?.causalArtifactKeys ?? []).toEqual([]);
     expect(await attribution.listEpisodes()).toEqual([
       expect.objectContaining({
         queryIds: ["correlation_12345678"],
@@ -103,6 +106,107 @@ describe("agent production run attribution foundation", () => {
     expect(await reopened.listAgentDocuments("workspace_evidence")).toHaveLength(1);
     expect(await reopened.listAgentDocuments("work_episode")).toHaveLength(1);
     await reopened.close();
+  });
+
+  it("persists exact provider writes as opaque causal artifact evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-agent-causal-write-"));
+    roots.push(root);
+    const repository = join(root, "repo");
+    execFileSync("git", ["init", repository]);
+    execFileSync("git", ["-C", repository, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", repository, "config", "user.name", "Test"]);
+    writeFileSync(join(repository, "initial.txt"), "initial\n");
+    execFileSync("git", ["-C", repository, "add", "."]);
+    execFileSync("git", ["-C", repository, "commit", "-m", "initial"]);
+
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: new Date().toISOString(),
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const scopes = new RepositoryScopeManagement(storage, join(root, "locator.key"));
+    await scopes.add(repository, "repository", metadata.environmentId, new Date().toISOString());
+    const repositories = new AgentRepositoryObservationService(storage, scopes, join(root, "hmac.key"), 60_000);
+    await repositories.start();
+    await repositories.refresh();
+    const baseline = (await repositories.listSnapshots()).at(-1)!;
+    const startedAt = new Date(Date.parse(baseline.observedAt) + 1).toISOString();
+    const resolved = await repositories.resolveWorkspaceEvidence(repository, ["src/causal-write.ts"]);
+    expect(resolved).toMatchObject({
+      repositoryKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+      artifactKeys: [expect.stringMatching(/^[a-f0-9]{64}$/)]
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    mkdirSync(join(repository, "src"));
+    writeFileSync(join(repository, "src", "causal-write.ts"), "causal\n");
+    const observedAt = new Date().toISOString();
+    const completed = {
+      ...run(startedAt, observedAt),
+      repositoryKey: resolved!.repositoryKey
+    };
+    await storage.upsertSource({
+      schemaVersion: 1,
+      sourceId: "hook_codex_tools",
+      sourceKind: "provider-hook",
+      provider: "codex",
+      runtime: "codex",
+      environmentId: metadata.environmentId,
+      profileVersion: "codex-hooks-v1",
+      granularity: ["event"],
+      tokenDimensions: [],
+      billingEvidence: [],
+      durability: "at_least_once",
+      contentRisk: "metadata_only",
+      compatibility: "supported",
+      evidenceGrade: "estimated_usage_cost_unattributed"
+    }, observedAt);
+    await storage.appendSafeObservation({
+      schemaVersion: 1,
+      observationId: "obs_causal_write",
+      sourceId: "hook_codex_tools",
+      provider: "codex",
+      runtime: "codex",
+      signal: "logs",
+      profileVersion: "codex-hooks-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt,
+      repositoryKey: resolved!.repositoryKey,
+      executionNodes: [{
+        schemaVersion: 1,
+        nodeId: "node_causal_write",
+        queryId: completed.correlationId,
+        repositoryKey: resolved!.repositoryKey,
+        provider: "codex",
+        runtime: "codex",
+        nodeKind: "tool",
+        name: "Write",
+        toolName: "Write",
+        outcome: "success",
+        startedAt: observedAt,
+        endedAt: observedAt,
+        artifactKeys: resolved!.artifactKeys,
+        artifactEvidence: "provider_write_hook"
+      }],
+      usageAtoms: []
+    });
+    await repositories.refresh();
+    const attribution = new AgentProductionRunAttribution(storage, repositories);
+    await attribution.start();
+    await attribution.observeProductionRuns([completed]);
+
+    const evidence = await attribution.listEvidence();
+    expect(evidence).toEqual([expect.objectContaining({
+      queryId: completed.correlationId,
+      repoKey: resolved!.repositoryKey,
+      causalArtifactKeys: resolved!.artifactKeys
+    })]);
+    expect(JSON.stringify(evidence)).not.toContain("causal-write.ts");
+
+    await attribution.stop();
+    await repositories.stop();
+    await storage.close();
   });
 
   it("caps reconstructed workspace evidence at the next run start", async () => {
@@ -674,7 +778,24 @@ describe("agent production run attribution foundation", () => {
       processedCount: 0,
       deferredCount: 1
     });
-    expect(await storage.listAgentDocuments("workspace_evidence")).toEqual([]);
+    expect((await storage.listAgentDocuments<{ outcome?: string }>("completed_run_tracking"))[0]?.value.outcome)
+      .toBe("identity_deferred");
+    expect(await attribution.observeCompletedRunsIncrementally([uncorrelated])).toMatchObject({
+      processedCount: 0,
+      deferredCount: 1
+    });
+    expect(await storage.listAgentDocuments("completed_run_tracking")).toHaveLength(1);
+
+    expect(await attribution.observeCompletedRunsIncrementally([{
+      ...uncorrelated,
+      promptState: "disabled"
+    }])).toMatchObject({
+      processedCount: 1,
+      deferredCount: 0
+    });
+    expect((await storage.listAgentDocuments<{ outcome?: string }>("completed_run_tracking"))[0]?.value.outcome)
+      .toBe("processed");
+    expect(await storage.listAgentDocuments("workspace_evidence")).toHaveLength(1);
 
     await attribution.stop();
     await repositories.stop();

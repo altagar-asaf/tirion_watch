@@ -11,6 +11,11 @@ import {
   DefaultAgentPrivacyGuard,
   DefaultTelemetryClassification
 } from "@tirion/engine";
+import {
+  observationWithRepositoryEvidence,
+  otlpWorkspaceEvidenceHint,
+  type WorkspaceEvidenceResolution
+} from "./otlpIngress";
 
 type SqliteRow = Record<string, unknown>;
 
@@ -55,7 +60,11 @@ export class CopilotSpanDbIngress {
     private readonly environmentId: string,
     private readonly now: () => Date,
     private readonly onAccepted?: (observation: SafeObservationV1) => Promise<void>,
-    private readonly onDiagnosticEvent?: (event: DiagnosticEvent) => void
+    private readonly onDiagnosticEvent?: (event: DiagnosticEvent) => void,
+    private readonly resolveWorkspaceEvidence?: (
+      workspacePath: string,
+      artifactPaths: string[]
+    ) => Promise<WorkspaceEvidenceResolution | undefined>
   ) {}
 
   setPromptCapture(enabled: boolean): void {
@@ -198,7 +207,7 @@ export class CopilotSpanDbIngress {
     }
     const sourceId = signal === "traces" ? "span_db_github_copilot_traces" : "span_db_github_copilot_logs";
     const profileVersion = signal === "traces" ? "copilot-span-db-traces-v1" : "copilot-span-db-logs-v1";
-    const observation: SafeObservationV1 = {
+    const sanitized: SafeObservationV1 = {
       schemaVersion: 1,
       observationId: opaqueHash("obs", `${sourceId}|${stringValue(record.span.span_id) ?? "unknown"}|${record.revision}`),
       sourceId,
@@ -214,6 +223,13 @@ export class CopilotSpanDbIngress {
       executionNodes: metadata.executionNodes,
       usageAtoms: metadata.usageAtoms
     };
+    const workspaceHint = otlpWorkspaceEvidenceHint(raw);
+    const workspaceEvidence = workspaceHint.workspacePath && this.resolveWorkspaceEvidence
+      ? await this.resolveWorkspaceEvidence(workspaceHint.workspacePath, workspaceHint.artifactPaths)
+      : undefined;
+    const observation = workspaceEvidence
+      ? observationWithRepositoryEvidence(sanitized, workspaceEvidence, "provider_tool_event")
+      : sanitized;
     await this.storage.upsertSource(sourceCapabilityForCopilotSpanDb(
       this.environmentId,
       signal,
@@ -326,6 +342,7 @@ function toTraceEnvelope(record: CopilotSpanDbRecord): Record<string, unknown> {
     ...spanColumnAttributes(span),
     ...spanDbAttributes(record.attributes)
   };
+  const status = otlpStatus(span.status_code, span.status_message);
   return {
     resourceSpans: [{
       resource: {
@@ -339,6 +356,7 @@ function toTraceEnvelope(record: CopilotSpanDbRecord): Record<string, unknown> {
           name: stringValue(span.name),
           startTimeUnixNano: msToUnixNano(span.start_time_ms),
           endTimeUnixNano: msToUnixNano(span.end_time_ms),
+          ...(status ? { status } : {}),
           attributes: Object.entries(attributes).map(([key, value]) => otlpAttribute(key, value))
         }]
       }]
@@ -538,6 +556,27 @@ function numberValue(value: unknown): number | undefined {
     : typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))
       ? Number(value)
       : undefined;
+}
+
+function otlpStatus(code: unknown, message: unknown): { code: number; message?: string } | undefined {
+  const messageText = stringValue(message);
+  const numericCode = numberValue(code);
+  const normalizedCode = numericCode != null
+    ? numericCode
+    : (() => {
+        const text = stringValue(code)?.trim().toLowerCase();
+        if (!text) return undefined;
+        if (text === "ok" || text.includes("success")) return 1;
+        if (text.includes("error") || text.includes("fail")) return 2;
+        return 0;
+      })();
+  if (normalizedCode == null && !messageText) {
+    return undefined;
+  }
+  return {
+    code: normalizedCode ?? 0,
+    ...(messageText ? { message: messageText } : {})
+  };
 }
 
 function stringValue(value: unknown): string | undefined {

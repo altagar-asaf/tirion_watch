@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -19,6 +20,19 @@ export type SourceConfigurationPaths = {
   codexHookRelayPath: string;
   cursorHookRelayPath: string;
 };
+
+export type CodexHookReadiness = "ready" | "review_required" | "disabled" | "unavailable";
+
+export type CodexHookReadinessProbeInput = {
+  codexConfigPath: string;
+  cwd: string;
+  expectedRelayPath: string;
+  expectedUrl: string;
+};
+
+export type CodexHookReadinessProbe = (
+  input: CodexHookReadinessProbeInput
+) => Promise<CodexHookReadiness>;
 
 type SourceConfigurationOptions = Omit<ProviderConfigurationRequestV1, "schemaVersion">;
 
@@ -51,8 +65,130 @@ export function resolveSourceConfigurationPaths(
   };
 }
 
+export async function probeCodexHookReadiness(
+  input: CodexHookReadinessProbeInput
+): Promise<CodexHookReadiness> {
+  const executable = resolveCodexExecutable(process.env);
+  return await new Promise<CodexHookReadiness>((resolve) => {
+    let settled = false;
+    let stdout = "";
+    const child = spawn(executable, ["app-server", "--stdio"], {
+      cwd: input.cwd,
+      env: { ...process.env, CODEX_HOME: dirname(input.codexConfigPath) },
+      stdio: ["pipe", "pipe", "ignore"]
+    });
+    const finish = (status: CodexHookReadiness) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.kill();
+      resolve(status);
+    };
+    const send = (value: unknown) => {
+      if (!settled) child.stdin.write(`${JSON.stringify(value)}\n`);
+    };
+    const timeout = setTimeout(() => finish("unavailable"), 3_000);
+    child.stdin.on("error", () => finish("unavailable"));
+    child.once("error", () => finish("unavailable"));
+    child.once("exit", () => finish("unavailable"));
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+      if (stdout.length > 2_000_000) {
+        finish("unavailable");
+        return;
+      }
+      for (;;) {
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) break;
+        const line = stdout.slice(0, newline);
+        stdout = stdout.slice(newline + 1);
+        let message: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(line) as unknown;
+          if (!isRecord(parsed)) continue;
+          message = parsed;
+        } catch {
+          continue;
+        }
+        if (message.id === 1 && isRecord(message.result)) {
+          send({ method: "initialized", params: {} });
+          send({ id: 2, method: "hooks/list", params: { cwds: [input.cwd] } });
+          continue;
+        }
+        if (message.id === 2) {
+          finish(codexHookReadinessFromListResponse(message.result, input.expectedUrl));
+        }
+      }
+    });
+    send({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "tirion-agent", version: "0.1" },
+        capabilities: { experimentalApi: true }
+      }
+    });
+  });
+}
+
+function codexHookReadinessFromListResponse(result: unknown, expectedUrl: string): CodexHookReadiness {
+  if (!isRecord(result) || !Array.isArray(result.data)) {
+    return "unavailable";
+  }
+  const hooks = result.data.flatMap((entry) => {
+    if (!isRecord(entry) || !Array.isArray(entry.hooks)) return [];
+    return entry.hooks.filter(isRecord);
+  }).filter((hook) =>
+    typeof hook.command === "string"
+    && hook.command.includes("codex-hook-relay.cjs")
+    && hook.command.includes(expectedUrl));
+  const requiredEvents = new Set(["userPromptSubmit", "stop", "subagentStart", "subagentStop", "postToolUse"]);
+  const byEvent = new Map<string, Record<string, unknown>>();
+  for (const hook of hooks) {
+    if (typeof hook.eventName === "string" && requiredEvents.has(hook.eventName)) {
+      byEvent.set(hook.eventName, hook);
+    }
+  }
+  if ([...requiredEvents].some((eventName) => !byEvent.has(eventName))) {
+    return "unavailable";
+  }
+  if ([...byEvent.values()].some((hook) => hook.enabled !== true)) {
+    return "disabled";
+  }
+  if ([...byEvent.values()].some((hook) => !["trusted", "managed"].includes(String(hook.trustStatus)))) {
+    return "review_required";
+  }
+  return "ready";
+}
+
+function resolveCodexExecutable(environment: NodeJS.ProcessEnv): string {
+  const configured = environment.TIRION_CODEX_BIN?.trim();
+  if (configured) return configured;
+  for (const candidate of [
+    join(homedir(), ".local", "bin", "codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+    "/usr/bin/codex"
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "codex";
+}
+
 export class SourceConfigurationService {
-  constructor(private readonly paths: SourceConfigurationPaths) {}
+  constructor(
+    private readonly paths: SourceConfigurationPaths,
+    private readonly probeCodexHooks: CodexHookReadinessProbe = probeCodexHookReadiness
+  ) {}
+
+  async codexHookReadiness(cwd: string, otlpBaseUrl: string): Promise<CodexHookReadiness> {
+    return await this.probeCodexHooks({
+      codexConfigPath: this.paths.codexConfigPath,
+      cwd,
+      expectedRelayPath: this.paths.codexHookRelayPath,
+      expectedUrl: `${otlpBaseUrl}/v1/provider-hooks/codex`
+    });
+  }
 
   configure(
     provider: ConfigurableProvider,
@@ -249,7 +385,8 @@ export class SourceConfigurationService {
       return result("codex", "conflict", "invalid_existing_configuration", undefined, undefined, "invalid");
     }
     const otel = current.value.otel == null ? {} : asTomlTable(current.value.otel);
-    if (!otel) {
+    const features = current.value.features == null ? {} : asTomlTable(current.value.features);
+    if (!otel || !features) {
       return result("codex", "conflict", "invalid_existing_configuration", undefined, undefined, "invalid");
     }
     const recoverableConflict = currentStatus.ownershipState === "managed_stale_authority"
@@ -294,10 +431,17 @@ export class SourceConfigurationService {
       desiredPromptHookCapture,
       desiredToolHookCapture
     );
-    const relayScriptRequired = desiredToolHookCapture || desiredPromptHookCapture;
-    const relayScriptMissing = relayScriptRequired && !existsSync(this.paths.codexHookRelayPath);
+    const relayScript = relayScriptRequired(desiredToolHookCapture, desiredPromptHookCapture)
+      ? codexHookRelayScript()
+      : undefined;
+    const relayScriptNeedsUpdate = relayScript != null
+      && !privateFileMatches(this.paths.codexHookRelayPath, relayScript);
     const next = {
       ...current.value,
+      features: {
+        ...features,
+        hooks: true
+      },
       otel: {
         ...otel,
         log_user_prompt: desiredPromptCapture,
@@ -310,7 +454,7 @@ export class SourceConfigurationService {
     if (!desiredHooks) {
       delete (next as TomlTable).hooks;
     }
-    if (JSON.stringify(current.value) === JSON.stringify(next) && !relayScriptMissing) {
+    if (JSON.stringify(current.value) === JSON.stringify(next) && !relayScriptNeedsUpdate) {
       if (localTirionConfig) {
         this.recordRestoreState("codex", {
           filePresent: existsSync(this.paths.codexConfigPath),
@@ -322,7 +466,9 @@ export class SourceConfigurationService {
           logUserPrompt: "absent",
           configuredPromptCapture: desiredPromptCapture,
           configuredToolHookCapture: desiredToolHookCapture,
-          configuredPromptHookCapture: desiredPromptHookCapture
+          configuredPromptHookCapture: desiredPromptHookCapture,
+          featuresContainerPresent: current.value.features != null,
+          hooksFeature: codexHooksFeatureState(features.hooks)
         });
       }
       return result("codex", "already_configured", "already_configured", undefined, {
@@ -344,7 +490,9 @@ export class SourceConfigurationService {
           logUserPrompt: "absent",
           configuredPromptCapture: desiredPromptCapture,
           configuredToolHookCapture: desiredToolHookCapture,
-          configuredPromptHookCapture: desiredPromptHookCapture
+          configuredPromptHookCapture: desiredPromptHookCapture,
+          featuresContainerPresent: current.value.features != null,
+          hooksFeature: codexHooksFeatureState(features.hooks)
         }
       : {
           filePresent: existsSync(this.paths.codexConfigPath),
@@ -355,12 +503,14 @@ export class SourceConfigurationService {
           logUserPrompt: otel.log_user_prompt === true ? "true" : otel.log_user_prompt === false ? "false" : "absent",
           configuredPromptCapture: desiredPromptCapture,
           configuredToolHookCapture: desiredToolHookCapture,
-          configuredPromptHookCapture: desiredPromptHookCapture
+          configuredPromptHookCapture: desiredPromptHookCapture,
+          featuresContainerPresent: current.value.features != null,
+          hooksFeature: codexHooksFeatureState(features.hooks)
         });
     ensurePrivateDirectory(dirname(this.paths.codexConfigPath));
-    if (relayScriptRequired) {
+    if (relayScript != null) {
       ensurePrivateDirectory(dirname(this.paths.codexHookRelayPath));
-      writePrivateFileAtomic(this.paths.codexHookRelayPath, codexHookRelayScript());
+      writePrivateFileAtomic(this.paths.codexHookRelayPath, relayScript);
     }
     writePrivateFileAtomic(this.paths.codexConfigPath, stringify(next));
     return result("codex", "configured", "provider_configured", undefined, {
@@ -397,13 +547,14 @@ export class SourceConfigurationService {
       authToken,
       desiredActivityHookCapture
     );
-    const relayScriptMissing = !existsSync(this.paths.cursorHookRelayPath);
+    const relayScript = codexHookRelayScript();
+    const relayScriptNeedsUpdate = !privateFileMatches(this.paths.cursorHookRelayPath, relayScript);
     const next = {
       ...current.value,
       version: current.value.version ?? 1,
       hooks: desiredHooks
     };
-    if (JSON.stringify(current.value) === JSON.stringify(next) && !relayScriptMissing) {
+    if (JSON.stringify(current.value) === JSON.stringify(next) && !relayScriptNeedsUpdate) {
       if (localTirionConfig) {
         this.recordRestoreState("cursor", {
           filePresent: existsSync(this.paths.cursorHooksPath),
@@ -443,7 +594,7 @@ export class SourceConfigurationService {
         });
     ensurePrivateDirectory(dirname(this.paths.cursorHooksPath));
     ensurePrivateDirectory(dirname(this.paths.cursorHookRelayPath));
-    writePrivateFileAtomic(this.paths.cursorHookRelayPath, codexHookRelayScript());
+    writePrivateFileAtomic(this.paths.cursorHookRelayPath, relayScript);
     writePrivateFileAtomic(this.paths.cursorHooksPath, `${JSON.stringify(next, null, 2)}\n`);
     return result("cursor", "configured", "provider_configured", undefined, {
       promptCaptureEnabled: false,
@@ -530,23 +681,26 @@ export class SourceConfigurationService {
     const ownership = this.codexStatus(otlpBaseUrl, authToken).ownershipState;
     const current = readToml(this.paths.codexConfigPath);
     const otel = current.ok && current.value.otel != null ? asTomlTable(current.value.otel) : current.ok ? {} : undefined;
+    const features = current.ok && current.value.features != null ? asTomlTable(current.value.features) : current.ok ? {} : undefined;
     const desiredExporter = codexDesiredExporter(otlpBaseUrl, authToken);
     const desiredTraceExporter = codexDesiredTraceExporter(otlpBaseUrl, authToken);
     const desiredMetricsExporter = codexDesiredMetricsExporter(otlpBaseUrl, authToken);
     const codexHooks = current.ok
-      ? codexHookShape(current.value.hooks, this.paths.codexHookRelayPath, otlpBaseUrl)
+      ? codexHookShape(current.value.hooks, this.paths.codexHookRelayPath, otlpBaseUrl, authToken, true)
       : { promptHooksConfigured: false, toolHooksConfigured: false, localTirionShape: false };
     const restoreReady = restoration.adoptedWithoutBaseline
       ? ownership === "managed_current" || ownership === "managed_stale_authority"
       : current.ok
         && Boolean(otel)
+        && Boolean(features)
+        && features!.hooks === true
         && codexExporterMatchesForRestore(otel!.exporter, desiredExporter, ownership === "managed_stale_authority")
         && codexExporterMatchesForRestore(otel!.trace_exporter, desiredTraceExporter, ownership === "managed_stale_authority")
         && codexExporterMatchesForRestore(otel!.metrics_exporter, desiredMetricsExporter, ownership === "managed_stale_authority")
         && otel!.log_user_prompt === (restoration.configuredPromptCapture ?? true)
         && ((restoration.configuredPromptHookCapture === true ? codexHooks.promptHooksConfigured : true)
           && (restoration.configuredToolHookCapture === true ? codexHooks.toolHooksConfigured : true));
-    if (!current.ok || !otel || !restoreReady) {
+    if (!current.ok || !otel || !features || !restoreReady) {
       return result("codex", "conflict", "restore_conflict", undefined, undefined, "managed_drifted");
     }
     const restoredOtel = { ...otel };
@@ -575,6 +729,17 @@ export class SourceConfigurationService {
       restored.hooks = restoredHooks as TomlTable;
     } else {
       delete restored.hooks;
+    }
+    const restoredFeatures = { ...features };
+    if (restoration.adoptedWithoutBaseline || restoration.hooksFeature === "absent") {
+      delete restoredFeatures.hooks;
+    } else {
+      restoredFeatures.hooks = restoration.hooksFeature === "true";
+    }
+    if (!restoration.featuresContainerPresent && Object.keys(restoredFeatures).length === 0) {
+      delete restored.features;
+    } else {
+      restored.features = restoredFeatures;
     }
     writeOrRemoveConfiguration(this.paths.codexConfigPath, restored, restoration.filePresent, "toml");
     rmSync(this.paths.codexHookRelayPath, { force: true });
@@ -794,20 +959,21 @@ export class SourceConfigurationService {
       return state("codex", "conflict", ["invalid_existing_configuration"], undefined, "invalid");
     }
     const otel = current.value.otel == null ? {} : asTomlTable(current.value.otel);
-    if (!otel) {
+    const features = current.value.features == null ? {} : asTomlTable(current.value.features);
+    if (!otel || !features) {
       return state("codex", "conflict", ["invalid_existing_configuration"], undefined, "invalid");
     }
     const desiredExporter = codexDesiredExporter(otlpBaseUrl, authToken);
     const desiredTraceExporter = codexDesiredTraceExporter(otlpBaseUrl, authToken);
     const desiredMetricsExporter = codexDesiredMetricsExporter(otlpBaseUrl, authToken);
-    const hookShape = codexHookShape(current.value.hooks, this.paths.codexHookRelayPath, otlpBaseUrl);
+    const hookShape = codexHookShape(current.value.hooks, this.paths.codexHookRelayPath, otlpBaseUrl, authToken);
     const snapshot = {
       promptCaptureEnabled: otel.log_user_prompt === true,
       logsEnabled: JSON.stringify(otel.exporter) === JSON.stringify(desiredExporter),
       tracesEnabled: JSON.stringify(otel.trace_exporter) === JSON.stringify(desiredTraceExporter)
         && JSON.stringify(otel.metrics_exporter) === JSON.stringify(desiredMetricsExporter),
-      toolDetailsEnabled: hookShape.toolHooksConfigured,
-      toolContentEnabled: hookShape.toolHooksConfigured,
+      toolDetailsEnabled: features.hooks === true && hookShape.toolHooksConfigured,
+      toolContentEnabled: features.hooks === true && hookShape.toolHooksConfigured,
       responseContentEnabled: false,
     };
     const exporterShape = codexExporterShape(otel.exporter, `${otlpBaseUrl}/v1/logs`, authToken);
@@ -861,6 +1027,7 @@ export class SourceConfigurationService {
       !snapshot.logsEnabled
       || !snapshot.tracesEnabled
       || snapshot.promptCaptureEnabled !== (restoration.configuredPromptCapture === true)
+      || features.hooks !== true
       || snapshot.toolDetailsEnabled !== (restoration.configuredToolHookCapture === true)
       || (restoration.configuredPromptHookCapture === true && !hookShape.promptHooksConfigured)
     )) {
@@ -1006,6 +1173,8 @@ type ProviderRestoreState = {
   configuredResponseContent?: boolean;
   configuredToolHookCapture?: boolean;
   configuredPromptHookCapture?: boolean;
+  featuresContainerPresent?: boolean;
+  hooksFeature?: "absent" | "false" | "true";
   versionPresent?: boolean;
 };
 
@@ -1067,6 +1236,10 @@ function codexDesiredMetricsExporter(otlpBaseUrl: string, authToken?: string): T
   };
 }
 
+function codexHooksFeatureState(value: unknown): "absent" | "false" | "true" {
+  return value === true ? "true" : value === false ? "false" : "absent";
+}
+
 function writeOrRemoveConfiguration(
   path: string,
   value: Record<string, unknown> | TomlTable,
@@ -1098,6 +1271,12 @@ function parseRestoreState(value: unknown): RestoreState {
       throw new Error("invalid restore state");
     }
     if (record.versionPresent != null && typeof record.versionPresent !== "boolean") {
+      throw new Error("invalid restore state");
+    }
+    if (record.featuresContainerPresent != null && typeof record.featuresContainerPresent !== "boolean") {
+      throw new Error("invalid restore state");
+    }
+    if (record.hooksFeature != null && !["absent", "false", "true"].includes(record.hooksFeature as string)) {
       throw new Error("invalid restore state");
     }
     if (record.configuredPromptCapture != null && typeof record.configuredPromptCapture !== "boolean") {
@@ -1154,7 +1333,9 @@ function parseRestoreState(value: unknown): RestoreState {
         logUserPrompt: record.logUserPrompt as "absent" | "false" | "true",
         configuredPromptCapture: record.configuredPromptCapture === true,
         configuredToolHookCapture: record.configuredToolHookCapture !== false,
-        configuredPromptHookCapture: record.configuredPromptHookCapture === true
+        configuredPromptHookCapture: record.configuredPromptHookCapture === true,
+        featuresContainerPresent: record.featuresContainerPresent === true,
+        hooksFeature: (record.hooksFeature ?? "absent") as "absent" | "false" | "true"
       };
     } else {
       state[provider] = {
@@ -1433,6 +1614,10 @@ function claudeHooksValue(
     ...eventHookGroups(hooks.Stop),
     claudeManagedHookGroup("Stop", otlpBaseUrl, authToken)
   ];
+  hooks.SubagentStart = [
+    ...eventHookGroups(hooks.SubagentStart),
+    claudeManagedHookGroup("SubagentStart", otlpBaseUrl, authToken)
+  ];
   hooks.SubagentStop = [
     ...eventHookGroups(hooks.SubagentStop),
     claudeManagedHookGroup("SubagentStop", otlpBaseUrl, authToken)
@@ -1457,7 +1642,7 @@ function claudeHooksValue(
 
 function removeClaudeHooks(currentHooks: unknown): Record<string, unknown> | undefined {
   const hooks = isRecord(currentHooks) ? { ...currentHooks } : {};
-  for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStop"] as const) {
+  for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStart", "SubagentStop"] as const) {
     const remaining = eventHookGroups(hooks[eventName]).filter((group) => !isClaudeManagedHookGroup(group));
     if (remaining.length > 0) {
       hooks[eventName] = remaining;
@@ -1476,17 +1661,18 @@ function claudeHookShape(currentHooks: unknown, otlpBaseUrl: string): {
   const expectedUrl = `${otlpBaseUrl}/v1/provider-hooks/claude-code`;
   const userPromptSubmit = eventHookGroups(hooks.UserPromptSubmit).some((group) => isClaudeManagedHookGroup(group, expectedUrl));
   const stop = eventHookGroups(hooks.Stop).some((group) => isClaudeManagedHookGroup(group, expectedUrl));
+  const subagentStart = eventHookGroups(hooks.SubagentStart).some((group) => isClaudeManagedHookGroup(group, expectedUrl));
   const subagentStop = eventHookGroups(hooks.SubagentStop).some((group) => isClaudeManagedHookGroup(group, expectedUrl));
   const postToolUse = eventHookGroups(hooks.PostToolUse).some((group) => isClaudeManagedHookGroup(group, expectedUrl));
   const postToolUseFailure = eventHookGroups(hooks.PostToolUseFailure).some((group) => isClaudeManagedHookGroup(group, expectedUrl));
   return {
     toolHooksConfigured: postToolUse && postToolUseFailure,
-    localTirionShape: userPromptSubmit && stop && subagentStop && postToolUse && postToolUseFailure
+    localTirionShape: userPromptSubmit && stop && subagentStart && subagentStop && postToolUse && postToolUseFailure
   };
 }
 
 function claudeManagedHookGroup(
-  eventName: "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "SubagentStop",
+  eventName: "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "SubagentStart" | "SubagentStop",
   otlpBaseUrl: string,
   authToken: string | undefined
 ): Record<string, unknown> {
@@ -1526,26 +1712,48 @@ function codexHooksValue(
   capturePrompts: boolean,
   captureTools: boolean
 ): TomlTable | undefined {
-  const hooks = removeCodexHooks(currentHooks) ?? {};
-  const command = codexHookRelayCommand(relayPath, `${otlpBaseUrl}/v1/provider-hooks/codex`, authToken);
-  if (capturePrompts) {
-    hooks.UserPromptSubmit = [
-      ...eventHookGroups(hooks.UserPromptSubmit),
-      { hooks: [{ type: "command", command, timeout: 10 }] }
-    ];
-  }
-  if (captureTools) {
-    hooks.PostToolUse = [
-      ...eventHookGroups(hooks.PostToolUse),
-      { matcher: ".*", hooks: [{ type: "command", command, timeout: 10 }] }
-    ];
+  const hooks = isRecord(currentHooks) ? { ...currentHooks } : {};
+  for (const eventName of CODEX_MANAGED_HOOK_EVENTS) {
+    const command = codexHookRelayCommand(
+      relayPath,
+      `${otlpBaseUrl}/v1/provider-hooks/codex`,
+      authToken,
+      eventName
+    );
+    const lifecycle = (CODEX_LIFECYCLE_HOOK_EVENTS as readonly string[]).includes(eventName);
+    const activity = (CODEX_ACTIVITY_HOOK_EVENTS as readonly string[]).includes(eventName);
+    const desired = lifecycle && capturePrompts
+      ? { hooks: [{ type: "command", command, timeout: 10 }] }
+      : activity && captureTools
+        ? { matcher: ".*", hooks: [{ type: "command", command, timeout: 10 }] }
+        : undefined;
+    const groups = upsertCodexManagedHookGroup(hooks[eventName], desired, command);
+    if (groups.length > 0) {
+      hooks[eventName] = groups;
+    } else {
+      delete hooks[eventName];
+    }
   }
   return Object.keys(hooks).length > 0 ? hooks as TomlTable : undefined;
 }
 
+const CODEX_LIFECYCLE_HOOK_EVENTS = [
+  "UserPromptSubmit",
+  "Stop",
+  "SubagentStart",
+  "SubagentStop"
+] as const;
+
+const CODEX_ACTIVITY_HOOK_EVENTS = ["PostToolUse"] as const;
+const CODEX_MANAGED_HOOK_EVENTS = [
+  ...CODEX_LIFECYCLE_HOOK_EVENTS,
+  ...CODEX_ACTIVITY_HOOK_EVENTS,
+  "PostToolUseFailure"
+] as const;
+
 function removeCodexHooks(currentHooks: unknown): Record<string, unknown> | undefined {
   const hooks = isRecord(currentHooks) ? { ...currentHooks } : {};
-  for (const eventName of ["UserPromptSubmit", "PostToolUse"] as const) {
+  for (const eventName of CODEX_MANAGED_HOOK_EVENTS) {
     const remaining = eventHookGroups(hooks[eventName]).filter((group) => !isCodexManagedHookGroup(group));
     if (remaining.length > 0) {
       hooks[eventName] = remaining;
@@ -1556,7 +1764,13 @@ function removeCodexHooks(currentHooks: unknown): Record<string, unknown> | unde
   return Object.keys(hooks).length > 0 ? hooks : undefined;
 }
 
-function codexHookShape(currentHooks: unknown, relayPath: string, otlpBaseUrl: string): {
+function codexHookShape(
+  currentHooks: unknown,
+  relayPath: string,
+  otlpBaseUrl: string,
+  authToken?: string,
+  allowStaleAuth = false
+): {
   promptHooksConfigured: boolean;
   toolHooksConfigured: boolean;
   localTirionShape: boolean;
@@ -1564,17 +1778,54 @@ function codexHookShape(currentHooks: unknown, relayPath: string, otlpBaseUrl: s
   const hooks = isRecord(currentHooks) ? currentHooks : {};
   const expectedUrl = `${otlpBaseUrl}/v1/provider-hooks/codex`;
   const relayScriptPresent = existsSync(relayPath);
-  const promptHooksConfigured = relayScriptPresent && eventHookGroups(hooks.UserPromptSubmit).some((group) =>
-    isCodexManagedHookGroup(group, relayPath, expectedUrl)
+  const managedEventConfigured = (eventName: string) => eventHookGroups(hooks[eventName]).some((group) =>
+    allowStaleAuth
+      ? isCodexManagedHookGroup(group, relayPath, expectedUrl)
+      : isExactCodexManagedHookGroup(
+        group,
+        codexHookRelayCommand(relayPath, expectedUrl, authToken, eventName)
+      )
   );
-  const toolHooksConfigured = relayScriptPresent && eventHookGroups(hooks.PostToolUse).some((group) =>
-    isCodexManagedHookGroup(group, relayPath, expectedUrl)
-  );
+  const promptHooksConfigured = relayScriptPresent
+    && CODEX_LIFECYCLE_HOOK_EVENTS.every(managedEventConfigured);
+  const toolHooksConfigured = relayScriptPresent
+    && CODEX_ACTIVITY_HOOK_EVENTS.every(managedEventConfigured);
   return {
     promptHooksConfigured,
     toolHooksConfigured,
     localTirionShape: promptHooksConfigured || toolHooksConfigured
   };
+}
+
+function upsertCodexManagedHookGroup(
+  current: unknown,
+  desired: Record<string, unknown> | undefined,
+  expectedCommand: string
+): Record<string, unknown>[] {
+  const groups = eventHookGroups(current);
+  let preserved = false;
+  const next = groups.flatMap((group) => {
+    if (!isCodexManagedHookGroup(group)) {
+      return [group];
+    }
+    if (desired && !preserved && isExactCodexManagedHookGroup(group, expectedCommand)) {
+      preserved = true;
+      return [group];
+    }
+    return [];
+  });
+  if (desired && !preserved) {
+    next.push(desired);
+  }
+  return next;
+}
+
+function isExactCodexManagedHookGroup(group: Record<string, unknown>, expectedCommand: string): boolean {
+  const handlers = Array.isArray(group.hooks) ? group.hooks.filter(isRecord) : [];
+  return handlers.some((handler) =>
+    handler.type === "command"
+    && handler.command === expectedCommand
+    && handler.timeout === 10);
 }
 
 function isCodexManagedHookGroup(
@@ -1591,12 +1842,18 @@ function isCodexManagedHookGroup(
     && (expectedUrl == null || handler.command.includes(expectedUrl)));
 }
 
-function codexHookRelayCommand(relayPath: string, url: string, authToken: string | undefined): string {
+function codexHookRelayCommand(
+  relayPath: string,
+  url: string,
+  authToken: string | undefined,
+  eventName: string
+): string {
   return [
     shellQuote(process.execPath),
     shellQuote(relayPath),
     shellQuote(url),
-    shellQuote(authToken ?? "")
+    shellQuote(authToken ?? ""),
+    shellQuote(eventName)
   ].join(" ");
 }
 
@@ -1608,7 +1865,7 @@ function codexHookRelayScript(): string {
     "const { URL } = require(\"node:url\");",
     "",
     "async function main() {",
-    "  const [urlString, authToken] = process.argv.slice(2);",
+    "  const [urlString, authToken, configuredEventName] = process.argv.slice(2);",
     "  if (!urlString) {",
     "    return;",
     "  }",
@@ -1616,8 +1873,35 @@ function codexHookRelayScript(): string {
     "  for await (const chunk of process.stdin) {",
     "    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));",
     "  }",
-    "  const body = Buffer.concat(chunks);",
+    "  const body = withHookContext(Buffer.concat(chunks), configuredEventName);",
     "  await post(urlString, body, authToken || \"\").catch(() => undefined);",
+    "}",
+    "",
+    "function withHookContext(body, configuredEventName) {",
+    "  try {",
+    "    const parsed = JSON.parse(body.toString(\"utf8\"));",
+    "    if (!isRecord(parsed)) {",
+    "      return body;",
+    "    }",
+    "    const payload = { ...parsed };",
+    "    if (!hasText(payload.hook_event_name) && hasText(configuredEventName)) {",
+    "      payload.hook_event_name = configuredEventName;",
+    "    }",
+    "    if (!hasText(payload.cwd)) {",
+    "      payload.cwd = process.cwd();",
+    "    }",
+    "    return Buffer.from(JSON.stringify(payload));",
+    "  } catch {",
+    "    return body;",
+    "  }",
+    "}",
+    "",
+    "function isRecord(value) {",
+    "  return typeof value === \"object\" && value !== null && !Array.isArray(value);",
+    "}",
+    "",
+    "function hasText(value) {",
+    "  return typeof value === \"string\" && value.trim() !== \"\";",
     "}",
     "",
     "function post(urlString, body, authToken) {",
@@ -1679,8 +1963,13 @@ function cursorHooksValue(
   captureActivity: boolean
 ): Record<string, unknown> {
   const hooks = removeCursorHooks(current) ?? {};
-  const command = cursorHookRelayCommand(relayPath, `${otlpBaseUrl}/v1/provider-hooks/cursor`, authToken);
   for (const eventName of CURSOR_LIFECYCLE_HOOK_EVENTS) {
+    const command = cursorHookRelayCommand(
+      relayPath,
+      `${otlpBaseUrl}/v1/provider-hooks/cursor`,
+      authToken,
+      eventName
+    );
     hooks[eventName] = [
       ...eventHookGroups(hooks[eventName]),
       { command }
@@ -1688,6 +1977,12 @@ function cursorHooksValue(
   }
   if (captureActivity) {
     for (const eventName of CURSOR_ACTIVITY_HOOK_EVENTS) {
+      const command = cursorHookRelayCommand(
+        relayPath,
+        `${otlpBaseUrl}/v1/provider-hooks/cursor`,
+        authToken,
+        eventName
+      );
       hooks[eventName] = [
         ...eventHookGroups(hooks[eventName]),
         { command }
@@ -1738,15 +2033,16 @@ function cursorManagedHookCommands(
   authToken: string | undefined
 ): { command: string; matchesAuth: boolean }[] {
   const hooks = isRecord(current.hooks) ? current.hooks : {};
-  const expectedCommand = cursorHookRelayCommand(relayPath, expectedUrl, authToken);
   return [...CURSOR_LIFECYCLE_HOOK_EVENTS, ...CURSOR_ACTIVITY_HOOK_EVENTS]
-    .flatMap((eventName) => eventHookGroups(hooks[eventName]))
-    .flatMap((group) => {
+    .flatMap((eventName) => eventHookGroups(hooks[eventName]).flatMap((group) => {
       const command = typeof group.command === "string" ? group.command : undefined;
       return command && isCursorManagedCommand(command, relayPath, expectedUrl)
-        ? [{ command, matchesAuth: command === expectedCommand }]
+        ? [{
+            command,
+            matchesAuth: command === cursorHookRelayCommand(relayPath, expectedUrl, authToken, eventName)
+          }]
         : [];
-    });
+    }));
 }
 
 function isStaleCursorHookShape(current: Record<string, unknown>, relayPath: string): boolean {
@@ -1774,8 +2070,25 @@ function isCursorManagedCommand(command: string, relayPath?: string, expectedUrl
     && (expectedUrl == null || command.includes(expectedUrl));
 }
 
-function cursorHookRelayCommand(relayPath: string, url: string, authToken: string | undefined): string {
-  return codexHookRelayCommand(relayPath, url, authToken);
+function cursorHookRelayCommand(
+  relayPath: string,
+  url: string,
+  authToken: string | undefined,
+  eventName: string
+): string {
+  return codexHookRelayCommand(relayPath, url, authToken, eventName);
+}
+
+function relayScriptRequired(captureTools: boolean, capturePrompts: boolean): boolean {
+  return captureTools || capturePrompts;
+}
+
+function privateFileMatches(path: string, expected: string): boolean {
+  try {
+    return readFileSync(path, "utf8") === expected;
+  } catch {
+    return false;
+  }
 }
 
 function shellQuote(value: string): string {

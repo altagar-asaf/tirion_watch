@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -10,7 +11,8 @@ const execFileAsync = promisify(execFile);
 const EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const READ_ONLY_GIT_ENV = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
 export const MAX_WORKTREE_SNAPSHOT_ARTIFACTS = 100;
-const STATUS_ENTRY_STAT_CONCURRENCY = 64;
+const MAX_STATUS_ENTRY_STAT_CANDIDATES = MAX_WORKTREE_SNAPSHOT_ARTIFACTS * 4;
+const STATUS_ENTRY_STAT_CONCURRENCY = 16;
 
 export type GitRepository = {
   root: string;
@@ -27,6 +29,8 @@ export type GitRefSnapshot = {
   refKey: string;
   head: string;
 };
+
+type StatusEntryStat = (path: string) => Promise<Stats>;
 
 export type GitArtifactSnapshot = {
   identifier: string;
@@ -48,6 +52,8 @@ export type GitWorktreeSnapshot = {
   branch?: string;
   dirty: boolean;
   dirtyKnown: boolean;
+  /** Whether every dirty artifact is represented in the bounded snapshot. */
+  artifactCoverage: "complete" | "partial";
   capturedAt: string;
   artifacts: GitArtifactSnapshot[];
 };
@@ -66,7 +72,10 @@ export type GitCommitSnapshot = {
 };
 
 export class GitCli {
-  constructor(private readonly hasher: AttributionHasher) {}
+  constructor(
+    private readonly hasher: AttributionHasher,
+    private readonly statusEntryStat: StatusEntryStat = async (filePath) => await fs.stat(filePath)
+  ) {}
 
   async discoverRepositories(workspaceFolders: string[]): Promise<GitDiscovery> {
     const repositories = new Map<string, GitRepository>();
@@ -96,7 +105,7 @@ export class GitCli {
       this.gitOptional(repo.root, ["diff", "--numstat", "HEAD", "--"])
     ]);
     const changedEntries = parseStatusEntries(statusOutput ?? "");
-    const prioritizedEntries = await prioritizeStatusEntries(repo.root, changedEntries);
+    const prioritizedEntries = await prioritizeStatusEntries(repo.root, changedEntries, this.statusEntryStat);
     const statsByIdentifier = parseNumstat(numstatOutput ?? "");
     const artifacts: GitArtifactSnapshot[] = [];
 
@@ -110,6 +119,7 @@ export class GitCli {
       branch,
       dirty: changedEntries.length > 0,
       dirtyKnown: statusOutput != null,
+      artifactCoverage: artifacts.length === changedEntries.length ? "complete" : "partial",
       capturedAt,
       artifacts
     };
@@ -298,13 +308,18 @@ export class GitCli {
   }
 }
 
-async function prioritizeStatusEntries(root: string, entries: GitStatusEntry[]): Promise<GitStatusEntry[]> {
-  if (entries.length <= MAX_WORKTREE_SNAPSHOT_ARTIFACTS) {
-    return entries;
+async function prioritizeStatusEntries(
+  root: string,
+  entries: GitStatusEntry[],
+  statFile: StatusEntryStat
+): Promise<GitStatusEntry[]> {
+  const candidates = boundedStatusEntryCandidates(entries);
+  if (candidates.length <= MAX_WORKTREE_SNAPSHOT_ARTIFACTS) {
+    return candidates;
   }
-  const ranked = await mapConcurrent(entries, STATUS_ENTRY_STAT_CONCURRENCY, async (entry, index) => {
+  const ranked = await mapConcurrent(candidates, STATUS_ENTRY_STAT_CONCURRENCY, async (entry, index) => {
     const absolute = path.resolve(root, entry.identifier);
-    const stat = await fs.stat(absolute).catch(() => undefined);
+    const stat = await statFile(absolute).catch(() => undefined);
     return {
       entry,
       index,
@@ -317,6 +332,44 @@ async function prioritizeStatusEntries(root: string, entries: GitStatusEntry[]):
       || left.entry.identifier.localeCompare(right.entry.identifier)
       || left.index - right.index)
     .map((item) => item.entry);
+}
+
+function boundedStatusEntryCandidates(entries: GitStatusEntry[]): GitStatusEntry[] {
+  if (entries.length <= MAX_STATUS_ENTRY_STAT_CANDIDATES) {
+    return entries;
+  }
+  const direct: Array<{ entry: GitStatusEntry; index: number }> = [];
+  const nested: Array<{ entry: GitStatusEntry; index: number }> = [];
+  entries.forEach((entry, index) => {
+    (entry.identifier.includes("/") ? nested : direct).push({ entry, index });
+  });
+  const directBudget = Math.min(direct.length, Math.ceil(MAX_STATUS_ENTRY_STAT_CANDIDATES / 2));
+  const nestedBudget = Math.min(nested.length, MAX_STATUS_ENTRY_STAT_CANDIDATES - directBudget);
+  const remainingBudget = MAX_STATUS_ENTRY_STAT_CANDIDATES - directBudget - nestedBudget;
+  const directCount = Math.min(direct.length, directBudget + remainingBudget);
+  const nestedCount = Math.min(nested.length, nestedBudget + Math.max(0, remainingBudget - (directCount - directBudget)));
+  return [
+    ...sampleStatusEntries(direct, directCount),
+    ...sampleStatusEntries(nested, nestedCount)
+  ]
+    .sort((left, right) => left.index - right.index)
+    .map((item) => item.entry);
+}
+
+function sampleStatusEntries<T>(entries: T[], count: number): T[] {
+  if (count >= entries.length) {
+    return entries;
+  }
+  if (count <= 0 || entries.length === 0) {
+    return [];
+  }
+  if (count === 1) {
+    return [entries[0]];
+  }
+  return Array.from({ length: count }, (_, index) => {
+    const selected = Math.floor(index * (entries.length - 1) / (count - 1));
+    return entries[selected];
+  });
 }
 
 async function mapConcurrent<T, R>(

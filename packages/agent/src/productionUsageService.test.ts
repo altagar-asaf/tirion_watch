@@ -89,14 +89,14 @@ describe("production usage service", () => {
     const usageStarts: string[] = [];
     const activityStarts: string[] = [];
     let occurrenceReadCount = 0;
-    let replacedRuns: ProductionRunV1[] = [];
+    let persistedRuns: ProductionRunV1[] = [productionRun("existing", "2026-04-10T00:00:00.000Z")];
     const storage = {
       productionUsageEpoch: async () => ({
         schemaVersion: 1,
         epochId: "usage_epoch_12345678",
         startedAt: "2026-04-01T00:00:00.000Z"
       }),
-      listProductionRuns: async () => [productionRun("existing", "2026-04-10T00:00:00.000Z")],
+      listProductionRuns: async () => persistedRuns,
       listSafeUsageAtomsSince: async (startedAt: string) => {
         usageStarts.push(startedAt);
         return [];
@@ -109,8 +109,10 @@ describe("production usage service", () => {
         activityStarts.push(startedAt);
         return [];
       },
-      replaceProductionRuns: async (runs: ProductionRunV1[]) => {
-        replacedRuns = runs;
+      upsertProductionRuns: async (runs: ProductionRunV1[]) => {
+        const byId = new Map(persistedRuns.map((run) => [run.runId, run]));
+        runs.forEach((run) => byId.set(run.runId, run));
+        persistedRuns = [...byId.values()];
       }
     } as unknown as AgentStorageClient;
     const service = new ProductionUsageService(
@@ -124,9 +126,136 @@ describe("production usage service", () => {
     expect(usageStarts).toEqual(["2026-06-23T00:00:00.000Z"]);
     expect(occurrenceReadCount).toBe(1);
     expect(activityStarts).toEqual(["2026-06-23T00:00:00.000Z"]);
-    expect(replacedRuns).toEqual([
+    expect(persistedRuns).toEqual([
       expect.objectContaining({ runId: "run_existing_12345678" })
     ]);
+  });
+
+  it("projects one completed query family without waiting for a global rebuild", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-production-terminal-family-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertSource({
+      schemaVersion: 1,
+      sourceId: "source_terminal_family",
+      sourceKind: "otlp-http-json",
+      provider: "codex",
+      runtime: "codex",
+      environmentId: metadata.environmentId,
+      profileVersion: "codex-terminal-family-v1",
+      granularity: ["turn"],
+      tokenDimensions: ["input", "output"],
+      billingEvidence: ["model"],
+      durability: "at_least_once",
+      contentRisk: "content_expected",
+      compatibility: "supported",
+      evidenceGrade: "estimated_usage_cost_unattributed"
+    }, "2026-06-08T00:00:00.000Z");
+    await storage.appendSafeObservation({
+      schemaVersion: 1,
+      observationId: "observation_terminal_family",
+      sourceId: "source_terminal_family",
+      provider: "codex",
+      runtime: "codex",
+      signal: "traces",
+      profileVersion: "codex-terminal-family-v1",
+      resourceCount: 1,
+      recordCount: 5,
+      observedAt: "2026-06-08T00:00:03.000Z",
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId: "qry_terminal_root",
+        sessionId: "ses_terminal_root",
+        lifecycleVisibility: "customer",
+        provider: "codex",
+        runtime: "codex",
+        startedAt: "2026-06-08T00:00:01.000Z",
+        completedAt: "2026-06-08T00:00:03.000Z",
+        completionEvidence: "stop_hook",
+        repositoryKey: "repo_terminal_family",
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }, {
+        schemaVersion: 1,
+        queryId: "qry_terminal_child",
+        sessionId: "ses_terminal_child",
+        lifecycleVisibility: "customer",
+        provider: "codex",
+        runtime: "codex",
+        startedAt: "2026-06-08T00:00:02.000Z",
+        completedAt: "2026-06-08T00:00:02.500Z",
+        completionEvidence: "provider_completed_event",
+        repositoryKey: "repo_terminal_family",
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }],
+      usageAtoms: [{
+        schemaVersion: 1,
+        atomId: "atom_terminal_root",
+        correlationId: "qry_terminal_root",
+        queryId: "qry_terminal_root",
+        sessionId: "ses_terminal_root",
+        provider: "codex",
+        runtime: "codex",
+        authority: "request",
+        model: "gpt-5.5",
+        inputTokens: 10,
+        outputTokens: 2,
+        startedAt: "2026-06-08T00:00:01.000Z",
+        endedAt: "2026-06-08T00:00:02.900Z"
+      }, {
+        schemaVersion: 1,
+        atomId: "atom_terminal_child",
+        correlationId: "qry_terminal_child",
+        queryId: "qry_terminal_child",
+        sessionId: "ses_terminal_child",
+        provider: "codex",
+        runtime: "codex",
+        authority: "turn",
+        model: "gpt-5.5",
+        inputTokens: 5,
+        outputTokens: 1,
+        startedAt: "2026-06-08T00:00:02.000Z",
+        endedAt: "2026-06-08T00:00:02.500Z"
+      }],
+      activityAtoms: [{
+        schemaVersion: 1,
+        activityId: "activity_terminal_subagent",
+        queryId: "qry_terminal_root",
+        sessionId: "ses_terminal_root",
+        childSessionId: "ses_terminal_child",
+        provider: "codex",
+        runtime: "codex",
+        kind: "subagent",
+        name: "explorer",
+        outcome: "success",
+        startedAt: "2026-06-08T00:00:02.000Z",
+        endedAt: "2026-06-08T00:00:02.500Z"
+      }]
+    });
+    const service = new ProductionUsageService(storage, () => new Date("2026-06-08T00:00:04.000Z"));
+    await service.startCleanEpoch("2026-06-08T00:00:00.000Z");
+
+    expect(await service.projectCompletedQuery("agent_full_owner", "qry_terminal_root")).toEqual([
+      expect.objectContaining({
+        queryId: "qry_terminal_root",
+        inputTokens: 15,
+        outputTokens: 3,
+        totalTokens: 18,
+        breakdown: expect.arrayContaining([
+          expect.objectContaining({ kind: "subagent", name: "explorer", totalTokens: 6 })
+        ])
+      })
+    ]);
+    expect(await storage.listProductionRuns()).toEqual([
+      expect.objectContaining({ queryId: "qry_terminal_root", totalTokens: 18 })
+    ]);
+    await storage.close();
   });
 
   it("keeps incomplete usage out of the durable ledger, totals, and completed-run queries", async () => {

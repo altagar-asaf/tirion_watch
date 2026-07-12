@@ -42,6 +42,22 @@ describe("DefaultWorkspaceChangeTracker", () => {
     expect(emitted).toHaveLength(2);
   });
 
+  it("fails closed for commit attribution when the baseline snapshot is sampled", async () => {
+    const observations = new FakeRepositoryObservation(snapshot([], 1, { artifactCoverage: "partial" }));
+    const ledger = new MemoryEvidenceLedger();
+    const tracker = new DefaultWorkspaceChangeTracker(observations, ledger);
+    await tracker.start();
+
+    await tracker.observeRun(runningRun("query-partial-baseline"));
+
+    const [evidence] = await ledger.listEvidence();
+    expect(evidence).toMatchObject({
+      baselineTrusted: false,
+      baselineReasons: expect.arrayContaining(["clean_baseline", "artifact_state_coverage_partial"])
+    });
+    await tracker.stop();
+  });
+
   it("binds the current repository baseline without blocking on a full refresh", async () => {
     let releaseRefresh!: () => void;
     let refreshStarted = false;
@@ -102,6 +118,29 @@ describe("DefaultWorkspaceChangeTracker", () => {
         repoCount: 2
       })
     }));
+  });
+
+  it("uses an opaque ingress repository key to open only the matching baseline", async () => {
+    const observations = new FakeRepositoryObservation([
+      snapshot([], 1, { repoKey: "repo-a", epochId: "epoch-a", headCommit: "base-a" }),
+      snapshot([], 1, { repoKey: "repo-b", epochId: "epoch-b", headCommit: "base-b" })
+    ]);
+    const emitted: QueryWorkEvidence[] = [];
+    const tracker = new DefaultWorkspaceChangeTracker(
+      observations,
+      new MemoryEvidenceLedger(),
+      () => undefined,
+      (evidence) => emitted.push(...evidence)
+    );
+    await tracker.start();
+
+    await tracker.observeRun({ ...runningRun("query-bound"), repoKey: "repo-b" });
+
+    expect(emitted).toEqual([expect.objectContaining({
+      queryId: "query-bound",
+      repoKey: "repo-b",
+      headCommitAtStart: "base-b"
+    })]);
   });
 
   it("records index and worktree states independently for partial staging", async () => {
@@ -432,6 +471,7 @@ function snapshot(
     observedSequence,
     dirty: artifactStates.length > 0,
     dirtyKnown: true,
+    artifactCoverage: overrides.artifactCoverage,
     artifactStates
   };
 }

@@ -55,6 +55,7 @@ import {
   WebhookUrlConfigurationV1
 } from "@tirion/agent-contract";
 import { AgentMetadata, AgentStorageClient } from "@tirion/agent-storage";
+import { isClosedAuthoritativeRunBoundaryAtom } from "@tirion/engine";
 import {
   type CommitAttributionChange,
   constructLifecycleDetails,
@@ -76,12 +77,16 @@ import { ShadowUsageService } from "./shadowUsageService";
 import { ProductionUsageService } from "./productionUsageService";
 import { ExecutionEvidenceService } from "./executionEvidenceService";
 import { RepositoryScopeManagement } from "./repositoryScopeManagement";
-import { AgentRepositoryObservationService } from "./repositoryObservationService";
+import {
+  AgentRepositoryObservationService,
+  MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES
+} from "./repositoryObservationService";
 import { AgentVerifiedAttributionService } from "./productionRunAttribution";
 import { AgentBudgetWarningsService, parseAgentBudgetThresholds } from "./budgetWarningsService";
 import { AgentDiagnosticsService } from "./diagnosticsService";
 import { ExternalWebhookDispatchService } from "./externalWebhookDispatch";
 import {
+  type CodexHookReadinessProbe,
   resolveSourceConfigurationPaths,
   SourceConfigurationPaths,
   SourceConfigurationService
@@ -95,26 +100,37 @@ export const LEGACY_ENGINE_LEASE_TTL_MS = 20_000;
 export const LEGACY_ENGINE_OBSERVATION_WINDOW_MS = 30_000;
 export const SAFE_JOURNAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const SAFE_JOURNAL_MAX_OBSERVATIONS = 10_000;
+export const SAFE_EXECUTION_NODE_MAX_DOCUMENTS = 50_000;
 export const WORKSPACE_LEASE_TTL_MS = 60_000;
 export const WORKSPACE_LEASE_SWEEP_MS = 15_000;
 export const PRODUCT_RETENTION_DAYS = 180;
 export const PRODUCT_RETENTION_SWEEP_MS = 24 * 60 * 60 * 1000;
 export const USAGE_RECONCILIATION_SWEEP_MS = 30_000;
+export const LIVE_USAGE_PROJECTION_QUIET_MS = 5_000;
+export const LIVE_TERMINAL_USAGE_PROJECTION_RETENTION_MS = 15_000;
 export const LIVE_RECOVERY_WINDOW_MS = 15 * 60 * 1000;
 export const DIAGNOSTIC_REFRESH_WAIT_MS = 100;
 export const USAGE_PROJECTION_READ_WAIT_MS = 250;
 export const LIVE_REPOSITORY_OBSERVATION_WINDOW_MS = 30_000;
 export const LIVE_REPOSITORY_OBSERVATION_POLL_MS = 500;
-export const WEBHOOK_LIFECYCLE_PROJECTION_BATCH_SIZE = 25;
 
 export type AgentRuntimeOptions = {
   paths?: AgentPaths;
   now?: () => Date;
   otlpPort?: number | false;
   sourceConfigurationPaths?: SourceConfigurationPaths;
+  codexHookReadinessProbe?: CodexHookReadinessProbe;
   initialOwnershipState?: OwnershipState;
   otlpAuthToken?: string | false;
   otlpMaxRequestsPerSecond?: number;
+  usageProjectionQuietMs?: number;
+};
+
+type PendingWebhookLifecycleProjection = {
+  run: ProductionRunV1;
+  priority: boolean;
+  sequence: number;
+  queuedAtMs: number;
 };
 
 type FullOwnerBootstrapState = "not_required" | "deferred" | "running" | "ready" | "failed";
@@ -185,14 +201,28 @@ export class AgentRuntime {
   private workspaceLeaseSweep?: NodeJS.Timeout;
   private productRetentionSweep?: NodeJS.Timeout;
   private usageReconciliationSweep?: NodeJS.Timeout;
+  private usageProjectionTimer?: NodeJS.Timeout;
+  private lastLiveMeasurementAtMs?: number;
   private usageRebuildRunning = false;
   private usageRebuildRequested = false;
   private productRetentionQueue: Promise<void> = Promise.resolve();
   private repositoryRefreshQueue: Promise<void> = Promise.resolve();
   private usageRebuildQueue: Promise<ProductionRunV1[]> = Promise.resolve([]);
   private readonly runtimeWork = new RuntimeWorkScheduler();
-  private pendingLiveObservations: SafeObservationV1[] = [];
-  private readonly pendingWebhookLifecycleProjectionRuns = new Map<string, ProductionRunV1>();
+  private readonly usageProjectionQuietMs: number;
+  private pendingPriorityLiveWebhookObservations: SafeObservationV1[] = [];
+  private pendingLiveWebhookObservations: SafeObservationV1[] = [];
+  private pendingWorkspaceEvidenceObservations: SafeObservationV1[] = [];
+  private readonly terminalUsageProjectionTimers = new Map<string, NodeJS.Timeout>();
+  private readonly recentTerminalUsageSessions = new Map<string, {
+    queryId: string;
+    expiresAt: number;
+    authorityTriggered: boolean;
+  }>();
+  private readonly pendingPriorityWebhookLifecycleProjectionRuns = new Map<string, PendingWebhookLifecycleProjection>();
+  private readonly pendingHistoricalWebhookLifecycleProjectionRuns = new Map<string, PendingWebhookLifecycleProjection>();
+  private webhookLifecycleProjectionSequence = 0;
+  private webhookLifecycleProjectionInFlight = 0;
   private pendingWebhookLifecycleCommitReconcile = false;
   private historicalWebhookLifecycleProjectionScheduled = false;
 
@@ -200,12 +230,18 @@ export class AgentRuntime {
     this.paths = options.paths ?? resolveAgentPaths();
     this.now = options.now ?? (() => new Date());
     this.otlpPort = options.otlpPort ?? Number(process.env.TIRION_AGENT_OTLP_PORT ?? 4318);
-    this.sourceConfiguration = new SourceConfigurationService(options.sourceConfigurationPaths ?? resolveSourceConfigurationPaths(
-      `${this.paths.stateDir}/source-configuration-restore.json`
-    ));
+    this.sourceConfiguration = new SourceConfigurationService(
+      options.sourceConfigurationPaths ?? resolveSourceConfigurationPaths(
+        `${this.paths.stateDir}/source-configuration-restore.json`
+      ),
+      options.codexHookReadinessProbe
+    );
     this.initialOwnershipState = options.initialOwnershipState ?? "agent_full_owner";
     this.configuredOtlpAuthToken = options.otlpAuthToken;
     this.otlpMaxRequestsPerSecond = options.otlpMaxRequestsPerSecond;
+    this.usageProjectionQuietMs = Number.isFinite(options.usageProjectionQuietMs)
+      ? Math.max(0, options.usageProjectionQuietMs ?? 0)
+      : LIVE_USAGE_PROJECTION_QUIET_MS;
   }
 
   async start(): Promise<void> {
@@ -245,6 +281,8 @@ export class AgentRuntime {
       this.executionEvidence = new ExecutionEvidenceService(this.storage, this.productionUsage);
       this.budgetWarnings = new AgentBudgetWarningsService(this.storage);
       this.diagnostics = new AgentDiagnosticsService(this.storage, this.paths.logPath ?? `${this.paths.stateDir}/agent.log.jsonl`);
+      // Bound raw execution evidence before any full-owner startup work can read it.
+      await this.applyStartupExecutionEvidenceBound();
       this.repositoryScopes = new RepositoryScopeManagement(
         this.storage,
         this.paths.repositoryLocatorKeyPath,
@@ -295,7 +333,11 @@ export class AgentRuntime {
           },
           (event) => this.recordTelemetryIngressEvent(event),
           this.otlpAuthToken,
-          this.otlpMaxRequestsPerSecond
+          this.otlpMaxRequestsPerSecond,
+          async (workspacePath, artifactPaths) => await this.repositoryObservation?.resolveWorkspaceEvidence(
+            workspacePath,
+            artifactPaths
+          )
         );
         for (const provider of MEASUREMENT_PROVIDERS) {
           this.otlp.setPromptCapture(provider, await this.promptCaptureEnabled(provider));
@@ -309,7 +351,11 @@ export class AgentRuntime {
         async (observation) => {
           this.scheduleLiveIngestProcessing(observation);
         },
-        (event) => this.recordTelemetryIngressEvent(event)
+        (event) => this.recordTelemetryIngressEvent(event),
+        async (workspacePath, artifactPaths) => await this.repositoryObservation?.resolveWorkspaceEvidence(
+          workspacePath,
+          artifactPaths
+        )
       );
       this.copilotSpanDb.setPromptCapture(await this.promptCaptureEnabled("github-copilot"));
       await this.copilotSpanDb.configure(await this.readCopilotSpanDbConfiguration());
@@ -699,6 +745,7 @@ export class AgentRuntime {
         if (!hasCapability(auth, "execution:read")) {
           return sendError(response, 403, "authorization_denied");
         }
+        await this.waitForRuntimeWork("usage_projection", USAGE_PROJECTION_READ_WAIT_MS);
         const owner = this.requireMetadata().ownershipState;
         const body: ExecutionRunListV1 = await this.requireExecutionEvidence().listRuns(owner, boundedLimit(request.url));
         return send(response, 200, body);
@@ -711,6 +758,7 @@ export class AgentRuntime {
         if (!hasCapability(auth, "execution:read")) {
           return sendError(response, 403, "authorization_denied");
         }
+        await this.waitForRuntimeWork("usage_projection", USAGE_PROJECTION_READ_WAIT_MS);
         const owner = this.requireMetadata().ownershipState;
         const body: ExecutionRunTreeResponseV1 | undefined = await this.requireExecutionEvidence().tree(owner, executionTreeMatch[1]);
         return body ? send(response, 200, body) : sendError(response, 404, "invalid_request");
@@ -764,6 +812,7 @@ export class AgentRuntime {
         if (!hasCapability(auth, "runs:export")) {
           return sendError(response, 403, "authorization_denied");
         }
+        await this.waitForRuntimeWork("usage_projection", USAGE_PROJECTION_READ_WAIT_MS);
         const format = request.url?.includes("format=csv") ? "csv" : "json";
         return send(response, 200, await this.requireProductionUsage().export(this.requireMetadata().ownershipState, format));
       }
@@ -1379,11 +1428,28 @@ export class AgentRuntime {
     return `http://${address.host}:${address.port}`;
   }
 
-  private async providerSourceStatus(provider: SupportedProvider, otlpBaseUrl: string): Promise<ProviderSourceStatusV1> {
+  private async providerSourceStatus(
+    provider: SupportedProvider,
+    otlpBaseUrl: string,
+    cwd = process.cwd()
+  ): Promise<ProviderSourceStatusV1> {
     if (provider === "github-copilot") {
       return await this.copilotProviderSourceStatus();
     }
     const configuration = this.sourceConfiguration.status(provider, otlpBaseUrl, this.otlpAuthToken);
+    const codexHookReadiness = provider === "codex" && configuration.configurationState === "configured"
+      ? await this.sourceConfiguration.codexHookReadiness(cwd, otlpBaseUrl)
+      : undefined;
+    const hookReadinessReason = codexHookReadiness === "review_required"
+      ? "hook_trust_required" as const
+      : codexHookReadiness === "disabled"
+        ? "hooks_disabled" as const
+        : codexHookReadiness === "unavailable"
+          ? "hook_trust_status_unavailable" as const
+          : undefined;
+    const configurationState = codexHookReadiness === "review_required" || codexHookReadiness === "disabled"
+      ? "partial" as const
+      : configuration.configurationState;
     const sources = (await this.requireStorage().listSources())
       .filter((source) => source.provider === provider && (
         source.sourceKind === "otlp-http-json"
@@ -1392,8 +1458,11 @@ export class AgentRuntime {
     const lastReceiptAt = maxIsoString(await Promise.all(sources.map(async (source) =>
       await this.requireStorage().lastSourceObservationAt(source.sourceId)
     )));
-    const measurementReady = configuration.logsEnabled && configuration.tracesEnabled && configuration.configurationState !== "conflict";
+    const measurementReady = configuration.logsEnabled && configuration.tracesEnabled && configurationState === "configured";
     const reasonCodes: ProviderSourceStatusV1["reasonCodes"] = [...configuration.reasonCodes];
+    if (hookReadinessReason && !reasonCodes.includes(hookReadinessReason)) {
+      reasonCodes.push(hookReadinessReason);
+    }
     if (!lastReceiptAt && measurementReady) {
       reasonCodes.push("no_recent_receipt");
     }
@@ -1401,19 +1470,21 @@ export class AgentRuntime {
       schemaVersion: 1,
       provider,
       profileVersion: configuration.profileVersion,
-      configurationState: configuration.configurationState,
+      configurationState,
       ownershipState: configuration.ownershipState,
       promptCaptureEnabled: configuration.promptCaptureEnabled,
       logsEnabled: configuration.logsEnabled,
       tracesEnabled: configuration.tracesEnabled,
       toolDetailsSupported: configuration.toolDetailsSupported,
-      toolDetailsEnabled: configuration.toolDetailsEnabled,
+      toolDetailsEnabled: configuration.toolDetailsEnabled
+        && codexHookReadiness !== "review_required"
+        && codexHookReadiness !== "disabled",
       toolContentSupported: configuration.toolContentSupported,
       toolContentEnabled: configuration.toolContentEnabled,
       responseContentSupported: configuration.responseContentSupported,
       responseContentEnabled: configuration.responseContentEnabled,
       ...(lastReceiptAt ? { lastReceiptAt } : {}),
-      measurementState: lastReceiptAt ? "complete" : measurementReady ? "awaiting_receipts" : "unavailable",
+      measurementState: !measurementReady ? "unavailable" : lastReceiptAt ? "complete" : "awaiting_receipts",
       reasonCodes
     };
   }
@@ -1500,7 +1571,7 @@ export class AgentRuntime {
       ? MEASUREMENT_PROVIDERS
       : ["github-copilot"];
     const statusesBefore = await Promise.all(statusProviders.map(async (provider) =>
-      await this.providerSourceStatus(provider, otlpBaseUrl ?? "")
+      await this.providerSourceStatus(provider, otlpBaseUrl ?? "", request.path)
     ));
     const provider = this.selectActivationProvider(request.provider, statusesBefore);
     if (provider !== "github-copilot" && !otlpBaseUrl) {
@@ -1523,7 +1594,11 @@ export class AgentRuntime {
       || sourceStatus.ownershipState === "managed_drifted"
       || sourceStatus.ownershipState === "adoptable_local";
     const measurementNeedsConfiguration = !sourceStatus.logsEnabled || !sourceStatus.tracesEnabled;
-    if (provider !== "github-copilot" && (ownershipNeedsRepair || measurementNeedsConfiguration || sourceStatus.configurationState === "not_configured")) {
+    const trustNeedsUserAction = sourceStatus.reasonCodes.includes("hook_trust_required")
+      || sourceStatus.reasonCodes.includes("hooks_disabled");
+    const configurationShapeNeedsRepair = sourceStatus.configurationState === "not_configured"
+      || (sourceStatus.configurationState === "partial" && !trustNeedsUserAction);
+    if (provider !== "github-copilot" && (ownershipNeedsRepair || measurementNeedsConfiguration || configurationShapeNeedsRepair)) {
       if (!otlpBaseUrl) {
         throw new Error("unsupported_capability");
       }
@@ -1533,8 +1608,8 @@ export class AgentRuntime {
         ...(request.captureToolDetails != null ? { captureToolDetails: request.captureToolDetails } : {}),
         ...(request.captureToolContent != null ? { captureToolContent: request.captureToolContent } : {}),
         ...(request.captureResponseContent != null ? { captureResponseContent: request.captureResponseContent } : {})
-      });
-      sourceStatus = await this.providerSourceStatus(provider, otlpBaseUrl);
+      }, request.path);
+      sourceStatus = await this.providerSourceStatus(provider, otlpBaseUrl, request.path);
     }
 
     const reasonCodes: RepositoryActivationV1["reasonCodes"] = ["repository_scope_active"];
@@ -1544,7 +1619,7 @@ export class AgentRuntime {
     if (configurationResult?.status === "configured") {
       reasonCodes.push("provider_configuration_applied");
     }
-    if (sourceStatus.logsEnabled && sourceStatus.tracesEnabled) {
+    if (sourceStatus.logsEnabled && sourceStatus.tracesEnabled && sourceStatus.configurationState === "configured") {
       reasonCodes.push("provider_configuration_ready");
     }
     if (sourceStatus.measurementState === "awaiting_receipts") {
@@ -1562,12 +1637,17 @@ export class AgentRuntime {
     if (sourceStatus.ownershipState === "unavailable") {
       reasonCodes.push("source_configuration_unavailable");
     }
+    for (const reason of ["hook_trust_required", "hooks_disabled", "hook_trust_status_unavailable"] as const) {
+      if (sourceStatus.reasonCodes.includes(reason)) {
+        reasonCodes.push(reason);
+      }
+    }
     const activationState = sourceStatus.ownershipState === "foreign_managed"
       || sourceStatus.ownershipState === "managed_drifted"
       || sourceStatus.configurationState === "conflict"
       || sourceStatus.configurationState === "unavailable"
       ? "blocked"
-      : sourceStatus.logsEnabled && sourceStatus.tracesEnabled
+      : sourceStatus.logsEnabled && sourceStatus.tracesEnabled && sourceStatus.configurationState === "configured"
         ? "ready"
         : "attention_required";
 
@@ -1606,9 +1686,23 @@ export class AgentRuntime {
   private async configureProviderSource(
     provider: ConfigurableProvider,
     otlpBaseUrl: string,
-    request: ProviderConfigurationRequestV1
+    request: ProviderConfigurationRequestV1,
+    cwd = process.cwd()
   ) {
-    const result = this.sourceConfiguration.configure(provider, otlpBaseUrl, this.otlpAuthToken, request);
+    let result = this.sourceConfiguration.configure(provider, otlpBaseUrl, this.otlpAuthToken, request);
+    if (provider === "codex" && (result.status === "configured" || result.status === "already_configured")) {
+      const readiness = await this.sourceConfiguration.codexHookReadiness(cwd, otlpBaseUrl);
+      const reason = readiness === "review_required"
+        ? "hook_trust_required" as const
+        : readiness === "disabled"
+          ? "hooks_disabled" as const
+          : readiness === "unavailable"
+            ? "hook_trust_status_unavailable" as const
+            : undefined;
+      if (reason && !result.reasonCodes.includes(reason)) {
+        result = { ...result, reasonCodes: [...result.reasonCodes, reason] };
+      }
+    }
     if (result.status === "configured" || result.status === "already_configured") {
       await this.setPromptCapture(provider, result.promptCaptureEnabled);
     }
@@ -1713,12 +1807,14 @@ export class AgentRuntime {
     this.emitEvent("webhook_changed");
   }
 
-  private handleWorkspaceEvidenceBound(): void {
+  private handleWorkspaceEvidenceBound(evidence: import("@tirion/engine/production").QueryWorkEvidence[]): void {
+    const queryIds = new Set(evidence.map((item) => item.queryId));
     this.runtimeWork.enqueue("webhook_evidence_projection", async () => {
       if (this.requireMetadata().ownershipState !== "agent_full_owner") {
         return;
       }
-      const runs = await this.requireProductionUsage().runs("agent_full_owner");
+      const runs = (await this.requireProductionUsage().runs("agent_full_owner"))
+        .filter((run) => queryIds.has(run.queryId ?? run.correlationId));
       this.scheduleWebhookLifecycleProjection(runs, { reconcileCommitEvents: true });
     });
   }
@@ -1798,8 +1894,8 @@ export class AgentRuntime {
     this.attributionSyncUnsubscribe?.();
     this.attributionSyncUnsubscribe = this.requireVerifiedAttribution().onDidChange((change) => this.handleVerifiedAttributionChange(change));
     this.workspaceEvidenceSyncUnsubscribe?.();
-    this.workspaceEvidenceSyncUnsubscribe = this.requireVerifiedAttribution().onWorkspaceEvidenceBound(async () => {
-      this.handleWorkspaceEvidenceBound();
+    this.workspaceEvidenceSyncUnsubscribe = this.requireVerifiedAttribution().onWorkspaceEvidenceBound(async (evidence) => {
+      this.handleWorkspaceEvidenceBound(evidence);
     });
     if (!this.webhookDispatch) {
       await this.startWebhookDispatch();
@@ -1892,9 +1988,13 @@ export class AgentRuntime {
     if (!this.shouldContinueFullOwnerBootstrap()) {
       return;
     }
-    const completedRuns = productionRuns.filter((run) => Boolean(run.endedAt && run.endedAt >= run.startedAt));
-    await this.webhookDispatch?.observeCompletedRuns(completedRuns);
-    await this.webhookDispatch?.reconcileCommitEvents();
+    // Durable outbox recovery and the bounded live-recovery rebuild already own
+    // lifecycle replay. Full attribution bootstrap must not re-project every
+    // historical run and contend with fresh terminal corrections.
+    this.scheduleWebhookLifecycleProjection([], {
+      reconcileCommitEvents: true,
+      priority: false
+    });
   }
 
   private shouldContinueFullOwnerBootstrap(): boolean {
@@ -2070,6 +2170,11 @@ export class AgentRuntime {
     if (timeoutMs <= 0) {
       return;
     }
+    if (key === "usage_projection" && this.usageProjectionTimer) {
+      clearTimeout(this.usageProjectionTimer);
+      this.usageProjectionTimer = undefined;
+      this.enqueueUsageProjection();
+    }
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([
       this.runtimeWork.drainKey(key),
@@ -2097,18 +2202,14 @@ export class AgentRuntime {
     const metadata = this.requireMetadata();
     const storage = this.requireStorage();
     const repositoryObservation = this.repositoryObservation;
-    const verifiedAttribution = this.verifiedAttribution;
     const telemetryBaseUrl = this.otlp ? `http://${this.otlp.address().host}:${this.otlp.address().port}` : undefined;
     const repositoryCandidates = safeCollect(async () => repositoryObservation?.requireObservation().listCandidates() ?? []);
-    const workspaceEvidence = safeCollect(async () => verifiedAttribution?.listWorkspaceEvidence() ?? []);
-    const workEpisodes = safeCollect(async () => verifiedAttribution?.listWorkEpisodes() ?? []);
-    const [webhook, snapshots, candidates, attributions, evidence, episodes, sources, repositoryScopes, safeObservationCount, recentEvents] = await Promise.all([
+    const [webhook, snapshots, candidates, attributions, attributionSummary, sources, repositoryScopes, safeObservationCount, recentEvents] = await Promise.all([
       this.webhookDispatch?.status().catch(() => undefined),
       safeCollect(async () => repositoryObservation?.listSnapshots() ?? []),
       repositoryCandidates,
       storage.listAgentDocuments("query_attribution").catch(() => []),
-      workspaceEvidence,
-      workEpisodes,
+      storage.attributionDocumentSummary().catch(() => undefined),
       storage.listSources().catch(() => []),
       storage.listRepositoryScopes().catch(() => []),
       storage.safeObservationCount().catch(() => 0),
@@ -2122,8 +2223,11 @@ export class AgentRuntime {
     const latestSnapshotAt = snapshots.at(-1)?.observedAt;
     const candidateCounts = countBy(candidates, (candidate) => candidate.decision);
     const attributionCounts = countBy(queryAttributions, (attribution) => attribution.status ?? "unknown");
-    const evidenceCounts = countBy(evidence, (item) => item.status);
-    const episodeCounts = countBy(episodes, (episode) => episode.status);
+    const evidenceCounts = attributionSummary?.workspaceEvidence.statusCounts ?? {};
+    const episodeCounts = attributionSummary?.workEpisodes.statusCounts ?? {};
+    const evidenceCount = attributionSummary?.workspaceEvidence.totalCount ?? 0;
+    const episodeCount = attributionSummary?.workEpisodes.totalCount ?? 0;
+    const unboundEpisodeCount = attributionSummary?.workEpisodes.unboundCount ?? 0;
     const telemetryStatusProviders: readonly SupportedProvider[] = telemetryBaseUrl ? MEASUREMENT_PROVIDERS : ["github-copilot"];
     const telemetrySourceStatuses = await Promise.all(telemetryStatusProviders.map((provider) =>
       this.providerSourceStatus(provider, telemetryBaseUrl ?? "")
@@ -2277,11 +2381,11 @@ export class AgentRuntime {
       {
         schemaVersion: 1,
         construct: "WorkspaceChangeTracker",
-        state: evidence.length > 0 ? "tracking" : "idle",
+        state: evidenceCount > 0 ? "tracking" : "idle",
         health: "healthy",
         updatedAt,
         details: {
-          evidenceCount: evidence.length,
+          evidenceCount,
           activeEvidenceCount: evidenceCounts.active ?? 0,
           settlingEvidenceCount: evidenceCounts.settling ?? 0,
           completedEvidenceCount: evidenceCounts.completed ?? 0
@@ -2290,16 +2394,16 @@ export class AgentRuntime {
       {
         schemaVersion: 1,
         construct: "AgenticWorkEpisode",
-        state: episodes.length > 0 ? "tracking" : "idle",
+        state: episodeCount > 0 ? "tracking" : "idle",
         health: "healthy",
         updatedAt,
         details: {
-          episodeCount: episodes.length,
+          episodeCount,
           openEpisodeCount: episodeCounts.open ?? 0,
           claimedEpisodeCount: episodeCounts.claimed ?? 0,
           staleEpisodeCount: episodeCounts.stale ?? 0,
           expiredEpisodeCount: episodeCounts.expired ?? 0,
-          unboundEpisodeCount: episodes.filter((episode) => (episode.repoKeys ?? []).length === 0).length
+          unboundEpisodeCount
         }
       },
       {
@@ -2366,54 +2470,281 @@ export class AgentRuntime {
   private async applySafeJournalRetention(): Promise<void> {
     const storage = this.requireStorage();
     const retainAfter = new Date(this.now().getTime() - SAFE_JOURNAL_RETENTION_MS).toISOString();
-    const result = await storage.applySafeObservationRetention(retainAfter, SAFE_JOURNAL_MAX_OBSERVATIONS);
-    if (result.removedByAge === 0 && result.removedByOverflow === 0) {
+    const [result, executionNodes] = await Promise.all([
+      storage.applySafeObservationRetention(retainAfter, SAFE_JOURNAL_MAX_OBSERVATIONS),
+      storage.applyExecutionNodeRetention(retainAfter, SAFE_EXECUTION_NODE_MAX_DOCUMENTS)
+    ]);
+    const at = this.now().toISOString();
+    if (result.removedByAge > 0 || result.removedByOverflow > 0) {
+      const existing = (await storage.listAgentDocuments<{ pruned: number; overflow: number }>("journal_state"))
+        .find((item) => item.key === "retention")?.value;
+      await storage.upsertAgentDocument("journal_state", {
+        key: "retention",
+        sortAt: at,
+        value: {
+          pruned: (existing?.pruned ?? 0) + result.removedByAge,
+          overflow: (existing?.overflow ?? 0) + result.removedByOverflow
+        }
+      });
+      await this.requireDiagnostics().record("safe_journal_pruned", "info", at);
+    }
+    if (executionNodes.removedByAge > 0 || executionNodes.removedByOverflow > 0) {
+      await this.requireDiagnostics().record("execution_node_evidence_pruned", "info", at, {
+        details: {
+          removedByAge: executionNodes.removedByAge,
+          removedByOverflow: executionNodes.removedByOverflow,
+          retainedCount: executionNodes.retainedCount
+        }
+      });
+    }
+  }
+
+  private async applyStartupExecutionEvidenceBound(): Promise<void> {
+    const storage = this.requireStorage();
+    const [result, removedLegacySnapshots, sanitizedAttributionDocuments] = await Promise.all([
+      storage.applyExecutionNodeRetention(new Date(0).toISOString(), SAFE_EXECUTION_NODE_MAX_DOCUMENTS),
+      storage.pruneRepositorySnapshotDocuments(MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES),
+      storage.sanitizeOversizedAttributionDocuments(MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES)
+    ]);
+    const compacted = await storage.compactIfFragmented();
+    const at = this.now().toISOString();
+    if (result.removedByOverflow > 0) {
+      await this.requireDiagnostics().record("execution_node_evidence_pruned", "info", at, {
+        details: {
+          removedByAge: result.removedByAge,
+          removedByOverflow: result.removedByOverflow,
+          retainedCount: result.retainedCount
+        }
+      });
+    }
+    if (!compacted.compacted) {
+      if (sanitizedAttributionDocuments.workspaceEvidenceSanitized > 0 || sanitizedAttributionDocuments.workEpisodesSanitized > 0) {
+        await this.requireDiagnostics().record("attribution_evidence_sanitized", "warning", at, {
+          details: {
+            workspaceEvidenceSanitized: sanitizedAttributionDocuments.workspaceEvidenceSanitized,
+            workEpisodesSanitized: sanitizedAttributionDocuments.workEpisodesSanitized,
+            maxArtifactStates: MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES
+          }
+        });
+      }
       return;
     }
-    const existing = (await storage.listAgentDocuments<{ pruned: number; overflow: number }>("journal_state"))
-      .find((item) => item.key === "retention")?.value;
-    const at = this.now().toISOString();
-    await storage.upsertAgentDocument("journal_state", {
-      key: "retention",
-      sortAt: at,
-      value: {
-        pruned: (existing?.pruned ?? 0) + result.removedByAge,
-        overflow: (existing?.overflow ?? 0) + result.removedByOverflow
+    if (sanitizedAttributionDocuments.workspaceEvidenceSanitized > 0 || sanitizedAttributionDocuments.workEpisodesSanitized > 0) {
+      await this.requireDiagnostics().record("attribution_evidence_sanitized", "warning", at, {
+        details: {
+          workspaceEvidenceSanitized: sanitizedAttributionDocuments.workspaceEvidenceSanitized,
+          workEpisodesSanitized: sanitizedAttributionDocuments.workEpisodesSanitized,
+          maxArtifactStates: MAX_REPOSITORY_SNAPSHOT_ARTIFACT_STATES
+        }
+      });
+    }
+    await this.requireDiagnostics().record("storage_compacted", "info", at, {
+      details: {
+        pageCountBefore: compacted.pageCountBefore,
+        freePageCountBefore: compacted.freePageCountBefore,
+        pageCountAfter: compacted.pageCountAfter,
+        freePageCountAfter: compacted.freePageCountAfter,
+        removedExecutionNodeCount: result.removedByAge + result.removedByOverflow,
+        removedRepositorySnapshotCount: removedLegacySnapshots
       }
     });
-    await this.requireDiagnostics().record("safe_journal_pruned", "info", at);
   }
 
   private scheduleLiveIngestProcessing(observation?: SafeObservationV1): void {
-    if (observation && this.metadata?.ownershipState === "agent_full_owner") {
-      this.pendingLiveObservations.push(observation);
+    const hasMeasurementEvidence = !observation || hasLiveMeasurementEvidence(observation);
+    if (observation && hasMeasurementEvidence) {
+      this.lastLiveMeasurementAtMs = this.now().getTime();
+      this.scheduleTerminalUsageProjection(observation);
     }
+    if (observation && hasMeasurementEvidence && this.metadata?.ownershipState === "agent_full_owner") {
+      const queue = hasPriorityLiveLifecycleEvidence(observation)
+        ? this.pendingPriorityLiveWebhookObservations
+        : this.pendingLiveWebhookObservations;
+      queue.push(observation);
+      this.runtimeWork.enqueue("webhook_live_projection", async () => {
+        await this.drainLiveWebhookProjection();
+      });
+      if ((observation.queryOccurrences?.length ?? 0) > 0) {
+        this.pendingWorkspaceEvidenceObservations.push(observation);
+        if (hasRepositoryObservationDemand(observation)) {
+          this.repositoryObservation?.requestActiveObservationWindow(
+            LIVE_REPOSITORY_OBSERVATION_WINDOW_MS,
+            LIVE_REPOSITORY_OBSERVATION_POLL_MS
+          );
+        }
+        this.runtimeWork.enqueue("workspace_evidence_projection", async () => {
+          await this.drainLiveWorkspaceEvidenceProjection();
+        });
+      }
+    }
+    if (!hasMeasurementEvidence) {
+      return;
+    }
+    if (observation) {
+      this.scheduleUsageProjectionAfterQuietPeriod();
+      return;
+    }
+    this.enqueueUsageProjection();
+  }
+
+  private enqueueUsageProjection(): void {
     this.runtimeWork.enqueue("usage_projection", async () => {
-      await this.drainLiveIngestProcessing();
+      await this.queueUsageRebuild().catch(() => []);
     });
   }
 
-  private async drainLiveIngestProcessing(): Promise<void> {
-    const observations = this.pendingLiveObservations.splice(0);
-    if (this.metadata?.ownershipState === "agent_full_owner") {
-      if (observations.length > 0) {
-        this.repositoryObservation?.requestActiveObservationWindow(
-          LIVE_REPOSITORY_OBSERVATION_WINDOW_MS,
-          LIVE_REPOSITORY_OBSERVATION_POLL_MS
-        );
-      }
-      for (const observation of observations) {
-        await this.verifiedAttribution?.observeSafeObservation(observation).catch(() => undefined);
-        await this.webhookDispatch?.observeSafeObservation(observation).catch(() => undefined);
-      }
-      if (observations.length > 0) {
-        this.emitEvent("webhook_changed");
+  private scheduleTerminalUsageProjection(observation: SafeObservationV1): void {
+    const now = this.now().getTime();
+    for (const [sessionId, state] of this.recentTerminalUsageSessions) {
+      if (state.expiresAt <= now) {
+        this.recentTerminalUsageSessions.delete(sessionId);
       }
     }
-    await this.queueUsageRebuild().catch(() => []);
+    for (const occurrence of observation.queryOccurrences ?? []) {
+      if (!isExplicitTerminalOccurrence(occurrence)) {
+        continue;
+      }
+      const completedAt = Date.parse(occurrence.completedAt);
+      const dueAt = Math.max(now, Number.isFinite(completedAt) ? completedAt + this.usageProjectionQuietMs : now);
+      const existingSession = this.recentTerminalUsageSessions.get(occurrence.sessionId);
+      this.recentTerminalUsageSessions.set(occurrence.sessionId, {
+        queryId: occurrence.queryId,
+        expiresAt: Math.max(
+          existingSession?.expiresAt ?? 0,
+          dueAt + LIVE_TERMINAL_USAGE_PROJECTION_RETENTION_MS
+        ),
+        authorityTriggered: existingSession?.authorityTriggered ?? false
+      });
+      if (this.terminalUsageProjectionTimers.has(occurrence.queryId)) {
+        continue;
+      }
+      const timer = setTimeout(() => {
+        this.terminalUsageProjectionTimers.delete(occurrence.queryId);
+        this.enqueueTerminalUsageProjection(occurrence.queryId);
+      }, Math.max(0, dueAt - now));
+      timer.unref?.();
+      this.terminalUsageProjectionTimers.set(occurrence.queryId, timer);
+    }
+    for (const atom of observation.usageAtoms.filter(isClosedAuthoritativeRunBoundaryAtom)) {
+      if (!atom.sessionId) {
+        continue;
+      }
+      const terminal = this.recentTerminalUsageSessions.get(atom.sessionId);
+      if (!terminal || terminal.expiresAt <= now || terminal.authorityTriggered) {
+        continue;
+      }
+      terminal.authorityTriggered = true;
+      this.enqueueTerminalUsageProjection(terminal.queryId);
+    }
+  }
+
+  private enqueueTerminalUsageProjection(queryId: string): void {
+    const owner = this.metadata?.ownershipState;
+    if (owner !== "agent_usage_owner" && owner !== "agent_full_owner") {
+      this.enqueueUsageProjection();
+      return;
+    }
+    this.runtimeWork.enqueue(`terminal_usage_projection:${queryId}`, async () => {
+      const startedAtMs = Date.now();
+      try {
+        const runs = await this.requireProductionUsage().projectCompletedQuery(owner, queryId);
+        if (owner === "agent_full_owner" && runs.length > 0) {
+          this.scheduleWebhookLifecycleProjection(runs, { reconcileCommitEvents: true, priority: true });
+        }
+        if (runs.length > 0) {
+          this.emitEvent("usage_changed");
+          this.emitEvent("webhook_changed");
+        }
+        this.recordLivePipelineEvent({
+          kind: "constructLifecycle",
+          construct: "UsageProjection",
+          operation: "terminal_projection",
+          state: "completed",
+          reason: "query_scoped_terminal_projection_completed",
+          queryId,
+          details: {
+            projectedRunCount: runs.length,
+            durationMs: Date.now() - startedAtMs
+          }
+        });
+      } catch (error) {
+        this.recordLivePipelineEvent({
+          kind: "constructLifecycle",
+          construct: "UsageProjection",
+          operation: "terminal_projection",
+          state: "failed",
+          reason: "query_scoped_terminal_projection_failed",
+          severity: "warning",
+          queryId,
+          details: {
+            errorCode: safeErrorCode(error),
+            durationMs: Date.now() - startedAtMs
+          }
+        });
+      }
+    });
+  }
+
+  private scheduleUsageProjectionAfterQuietPeriod(): void {
+    if (this.usageProjectionTimer) {
+      clearTimeout(this.usageProjectionTimer);
+      this.usageProjectionTimer = undefined;
+    }
+    const delayMs = this.remainingUsageProjectionQuietMs();
+    if (delayMs <= 0) {
+      this.enqueueUsageProjection();
+      return;
+    }
+    this.usageProjectionTimer = setTimeout(() => {
+      this.usageProjectionTimer = undefined;
+      this.scheduleUsageProjectionAfterQuietPeriod();
+    }, delayMs);
+    this.usageProjectionTimer.unref?.();
+  }
+
+  private remainingUsageProjectionQuietMs(): number {
+    if (this.lastLiveMeasurementAtMs == null) {
+      return 0;
+    }
+    return Math.max(0, this.lastLiveMeasurementAtMs + this.usageProjectionQuietMs - this.now().getTime());
+  }
+
+  private async drainLiveWebhookProjection(): Promise<void> {
+    if (this.metadata?.ownershipState !== "agent_full_owner" || !this.webhookDispatch) {
+      this.pendingPriorityLiveWebhookObservations = [];
+      this.pendingLiveWebhookObservations = [];
+      return;
+    }
+    let projected = false;
+    for (;;) {
+      const observation = this.pendingPriorityLiveWebhookObservations.shift()
+        ?? this.pendingLiveWebhookObservations.shift();
+      if (!observation) {
+        break;
+      }
+      await this.webhookDispatch.observeSafeObservation(observation).catch(() => undefined);
+      projected = true;
+    }
+    if (projected) {
+      this.emitEvent("webhook_changed");
+    }
+  }
+
+  private async drainLiveWorkspaceEvidenceProjection(): Promise<void> {
+    const observations = this.pendingWorkspaceEvidenceObservations.splice(0);
+    if (this.metadata?.ownershipState !== "agent_full_owner" || !this.verifiedAttribution) {
+      return;
+    }
+    for (const observation of observations) {
+      await this.verifiedAttribution.observeSafeObservation(observation).catch(() => undefined);
+    }
   }
 
   private async runPeriodicUsageMaintenance(): Promise<void> {
+    if (this.remainingUsageProjectionQuietMs() > 0) {
+      this.scheduleUsageProjectionAfterQuietPeriod();
+      return;
+    }
     await this.queueUsageRebuild().catch(() => []);
     await this.applySafeJournalRetention().catch(() => undefined);
   }
@@ -2461,13 +2792,15 @@ export class AgentRuntime {
     this.emitEvent("warnings_changed");
     if (owner === "agent_full_owner") {
       const completedRuns = runs.filter(isCompletedProductionRun);
-      const completedRunsForLifecycleProjection = this.historicalWebhookLifecycleProjectionScheduled
+      const historicalProjectionAlreadyScheduled = this.historicalWebhookLifecycleProjectionScheduled;
+      const completedRunsForLifecycleProjection = historicalProjectionAlreadyScheduled
         ? completedRuns.filter((run) => previousCompletedSignatures.get(run.runId) !== productionRunProjectionSignature(run))
-        : completedRuns;
+        : completedRuns.filter((run) => run.endedAt != null && run.endedAt >= this.liveRecoveryCutoffAt());
       this.historicalWebhookLifecycleProjectionScheduled = true;
-      if (completedRuns.length > 0) {
+      if (completedRunsForLifecycleProjection.length > 0) {
         this.scheduleWebhookLifecycleProjection(completedRunsForLifecycleProjection, {
-          reconcileCommitEvents: true
+          reconcileCommitEvents: true,
+          priority: historicalProjectionAlreadyScheduled
         });
       }
       const attribution = this.verifiedAttributionReady ? this.verifiedAttribution : undefined;
@@ -2480,8 +2813,8 @@ export class AgentRuntime {
         const incremental = await attribution.observeCompletedRunsIncrementally(runs);
         processedCount = incremental.processedCount;
         deferredCount = incremental.deferredCount;
-        if (incremental.processedCount > 0 && completedRuns.length > 0) {
-          this.scheduleWebhookLifecycleProjection(completedRuns, {
+        if (incremental.processedCount > 0 && incremental.processedRuns.length > 0) {
+          this.scheduleWebhookLifecycleProjection(incremental.processedRuns, {
             reconcileCommitEvents: true
           });
         }
@@ -2508,47 +2841,91 @@ export class AgentRuntime {
 
   private scheduleWebhookLifecycleProjection(
     runs: ProductionRunV1[],
-    options: { reconcileCommitEvents?: boolean } = {}
+    options: { reconcileCommitEvents?: boolean; priority?: boolean } = {}
   ): void {
+    const priority = options.priority !== false;
     for (const run of runs.filter(isCompletedProductionRun)) {
-      this.pendingWebhookLifecycleProjectionRuns.set(run.runId, run);
+      const existingPriority = this.pendingPriorityWebhookLifecycleProjectionRuns.get(run.runId);
+      if (!priority && existingPriority) {
+        continue;
+      }
+      if (priority) {
+        this.pendingHistoricalWebhookLifecycleProjectionRuns.delete(run.runId);
+      }
+      const target = priority
+        ? this.pendingPriorityWebhookLifecycleProjectionRuns
+        : this.pendingHistoricalWebhookLifecycleProjectionRuns;
+      target.set(run.runId, {
+        run,
+        priority,
+        sequence: ++this.webhookLifecycleProjectionSequence,
+        queuedAtMs: Date.now()
+      });
     }
     this.pendingWebhookLifecycleCommitReconcile ||= options.reconcileCommitEvents !== false;
-    if (this.pendingWebhookLifecycleProjectionRuns.size === 0 && !this.pendingWebhookLifecycleCommitReconcile) {
+    const pendingRunCount = this.pendingPriorityWebhookLifecycleProjectionRuns.size
+      + this.pendingHistoricalWebhookLifecycleProjectionRuns.size;
+    if (pendingRunCount === 0 && !this.pendingWebhookLifecycleCommitReconcile) {
       return;
     }
-    this.runtimeWork.enqueue("webhook_lifecycle_projection", async () => {
-      await this.drainWebhookLifecycleProjection();
+    const lane = priority
+      ? "webhook_lifecycle_priority_projection"
+      : "webhook_lifecycle_projection";
+    this.runtimeWork.enqueue(lane, async () => {
+      await this.drainWebhookLifecycleProjection(priority);
     });
   }
 
-  private async drainWebhookLifecycleProjection(): Promise<void> {
+  private async drainWebhookLifecycleProjection(priority: boolean): Promise<void> {
     if (this.requireMetadata().ownershipState !== "agent_full_owner" || !this.webhookDispatch) {
-      this.pendingWebhookLifecycleProjectionRuns.clear();
+      this.pendingPriorityWebhookLifecycleProjectionRuns.clear();
+      this.pendingHistoricalWebhookLifecycleProjectionRuns.clear();
       this.pendingWebhookLifecycleCommitReconcile = false;
       return;
     }
-    const pendingRuns = [...this.pendingWebhookLifecycleProjectionRuns.values()]
-      .sort((left, right) =>
-        (right.endedAt ?? right.startedAt).localeCompare(left.endedAt ?? left.startedAt));
-    const runs = pendingRuns.slice(0, WEBHOOK_LIFECYCLE_PROJECTION_BATCH_SIZE);
-    for (const run of runs) {
-      this.pendingWebhookLifecycleProjectionRuns.delete(run.runId);
+    const pendingRuns = priority
+      ? this.pendingPriorityWebhookLifecycleProjectionRuns
+      : this.pendingHistoricalWebhookLifecycleProjectionRuns;
+    const pending = [...pendingRuns.values()]
+      .sort(comparePendingWebhookLifecycleProjection);
+    const next = pending[0];
+    if (next) {
+      pendingRuns.delete(next.run.runId);
+      this.webhookLifecycleProjectionInFlight += 1;
     }
-    const reconcileCommitEvents = this.pendingWebhookLifecycleCommitReconcile
-      && this.pendingWebhookLifecycleProjectionRuns.size === 0;
-    if (reconcileCommitEvents) {
-      this.pendingWebhookLifecycleCommitReconcile = false;
-    }
+    let projected = false;
+    const projectionStartedAtMs = Date.now();
     try {
-      if (runs.length > 0) {
-        await this.webhookDispatch.observeCompletedRuns(runs);
-      }
-      if (reconcileCommitEvents) {
-        await this.webhookDispatch.reconcileCommitEvents();
-      }
-      if (runs.length > 0 || reconcileCommitEvents) {
-        this.emitEvent("webhook_changed");
+      if (next) {
+        this.recordLivePipelineEvent({
+          kind: "constructLifecycle",
+          construct: "ExternalWebhookDispatch",
+          operation: "projection",
+          state: "started",
+          reason: "webhook_lifecycle_projection_started",
+          runId: next.run.runId,
+          queryId: next.run.queryId ?? next.run.correlationId,
+          details: {
+            priority,
+            queueLatencyMs: projectionStartedAtMs - next.queuedAtMs
+          }
+        });
+        await this.webhookDispatch.observeCompletedRuns([next.run]);
+        projected = true;
+        this.recordLivePipelineEvent({
+          kind: "constructLifecycle",
+          construct: "ExternalWebhookDispatch",
+          operation: "projection",
+          state: "completed",
+          reason: "webhook_lifecycle_projection_completed",
+          runId: next.run.runId,
+          queryId: next.run.queryId ?? next.run.correlationId,
+          details: {
+            priority,
+            queueLatencyMs: projectionStartedAtMs - next.queuedAtMs,
+            durationMs: Date.now() - projectionStartedAtMs
+          }
+        });
       }
     } catch (error) {
       this.recordLivePipelineEvent({
@@ -2560,16 +2937,46 @@ export class AgentRuntime {
         severity: "warning",
         details: {
           errorCode: safeErrorCode(error),
-          pendingRunCount: this.pendingWebhookLifecycleProjectionRuns.size,
-          batchRunCount: runs.length
+          pendingRunCount: this.pendingPriorityWebhookLifecycleProjectionRuns.size
+            + this.pendingHistoricalWebhookLifecycleProjectionRuns.size,
+          batchRunCount: next ? 1 : 0,
+          priority
         }
       });
+    } finally {
+      if (next) {
+        this.webhookLifecycleProjectionInFlight -= 1;
+      }
     }
-    if (this.pendingWebhookLifecycleProjectionRuns.size > 0 || this.pendingWebhookLifecycleCommitReconcile) {
-      this.runtimeWork.enqueue("webhook_lifecycle_projection", async () => {
-        await this.drainWebhookLifecycleProjection();
+    const reconcileCommitEvents = this.pendingWebhookLifecycleCommitReconcile
+      && this.pendingPriorityWebhookLifecycleProjectionRuns.size === 0
+      && this.pendingHistoricalWebhookLifecycleProjectionRuns.size === 0
+      && this.webhookLifecycleProjectionInFlight === 0;
+    if (reconcileCommitEvents) {
+      this.pendingWebhookLifecycleCommitReconcile = false;
+      this.scheduleWebhookCommitReconciliation();
+    }
+    if (projected || reconcileCommitEvents) {
+      this.emitEvent("webhook_changed");
+    }
+    if (pendingRuns.size > 0) {
+      const lane = priority
+        ? "webhook_lifecycle_priority_projection"
+        : "webhook_lifecycle_projection";
+      this.runtimeWork.enqueue(lane, async () => {
+        await this.drainWebhookLifecycleProjection(priority);
       });
     }
+  }
+
+  private scheduleWebhookCommitReconciliation(): void {
+    this.runtimeWork.enqueue("webhook_commit_projection", async () => {
+      if (this.requireMetadata().ownershipState !== "agent_full_owner" || !this.webhookDispatch) {
+        return;
+      }
+      await this.webhookDispatch.reconcileCommitEvents().catch(() => undefined);
+      this.emitEvent("webhook_changed");
+    });
   }
 
   private async promptCaptureEnabled(provider: SupportedProvider): Promise<boolean> {
@@ -2645,6 +3052,15 @@ export class AgentRuntime {
       clearInterval(this.usageReconciliationSweep);
       this.usageReconciliationSweep = undefined;
     }
+    if (this.usageProjectionTimer) {
+      clearTimeout(this.usageProjectionTimer);
+      this.usageProjectionTimer = undefined;
+    }
+    for (const timer of this.terminalUsageProjectionTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.terminalUsageProjectionTimers.clear();
+    this.recentTerminalUsageSessions.clear();
     this.usageRebuildRequested = false;
     await this.productRetentionQueue.catch(() => undefined);
     await this.repositoryRefreshQueue.catch(() => undefined);
@@ -3183,6 +3599,53 @@ function isCompletedProductionRun(run: ProductionRunV1): boolean {
 
 function productionRunProjectionSignature(run: ProductionRunV1): string {
   return createHash("sha256").update(JSON.stringify(run)).digest("hex");
+}
+
+function comparePendingWebhookLifecycleProjection(
+  left: PendingWebhookLifecycleProjection,
+  right: PendingWebhookLifecycleProjection
+): number {
+  if (left.priority !== right.priority) {
+    return left.priority ? -1 : 1;
+  }
+  if (left.priority && left.sequence !== right.sequence) {
+    return right.sequence - left.sequence;
+  }
+  return (right.run.endedAt ?? right.run.startedAt)
+    .localeCompare(left.run.endedAt ?? left.run.startedAt);
+}
+
+function hasLiveMeasurementEvidence(observation: SafeObservationV1): boolean {
+  return (observation.queryOccurrences?.length ?? 0) > 0
+    || (observation.activityAtoms?.length ?? 0) > 0
+    || (observation.executionNodes?.length ?? 0) > 0
+    || observation.usageAtoms.length > 0;
+}
+
+function hasPriorityLiveLifecycleEvidence(observation: SafeObservationV1): boolean {
+  return Boolean(observation.queryOccurrences?.some((occurrence) =>
+    occurrence.lifecycleVisibility !== "internal"));
+}
+
+function isExplicitTerminalOccurrence(
+  occurrence: NonNullable<SafeObservationV1["queryOccurrences"]>[number]
+): occurrence is NonNullable<SafeObservationV1["queryOccurrences"]>[number] & { completedAt: string } {
+  return typeof occurrence.completedAt === "string"
+    && occurrence.completedAt.trim() !== ""
+    && occurrence.lifecycleVisibility !== "internal"
+    && occurrence.completionEvidence != null
+    && occurrence.completionEvidence !== "inactivity";
+}
+
+function hasRepositoryObservationDemand(observation: SafeObservationV1): boolean {
+  const hasCustomerEvidence = Boolean(observation.queryOccurrences?.some((occurrence) =>
+    occurrence.lifecycleVisibility !== "internal"))
+    || (observation.activityAtoms?.length ?? 0) > 0
+    || (observation.executionNodes?.length ?? 0) > 0
+    || observation.usageAtoms.length > 0;
+  return hasCustomerEvidence && (Boolean(observation.repositoryKey)
+    || Boolean(observation.queryOccurrences?.some((occurrence) =>
+      occurrence.lifecycleVisibility !== "internal" && occurrence.repositoryKey)));
 }
 
 function listen(server: Server, socketPath: string): Promise<void> {

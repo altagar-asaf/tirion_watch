@@ -40,6 +40,7 @@ export const OTLP_MAX_SCOPES_PER_RESOURCE = 128;
 export const OTLP_MAX_RECORDS = 10_000;
 export const OTLP_MAX_ATTRIBUTES = 2_048;
 const MAX_ACTIVE_PROVIDER_QUERIES = 1_024;
+const CODEX_HOOK_RECONCILIATION_MS = 15_000;
 
 type ProviderHookSource = Extract<SafeObservationV1["provider"], "claude-code" | "codex" | "cursor">;
 type ActiveProviderQuery = {
@@ -48,7 +49,7 @@ type ActiveProviderQuery = {
 };
 type ActiveCodexQuery = ActiveProviderQuery & {
   session: string;
-  queryBasis: "explicit" | "fallback";
+  queryBasis: "hook" | "explicit" | "fallback";
 };
 type ActiveCursorTurn = ActiveProviderQuery & {
   session: string;
@@ -60,8 +61,12 @@ export class DefaultAgentPrivacyGuard {
   private readonly codexQueriesBySession = new Map<string, ActiveCodexQuery>();
   private readonly codexQueriesByQuery = new Map<string, ActiveCodexQuery>();
   private readonly claudeQueriesBySession = new Map<string, { query: string; startedAt: string }>();
+  private readonly claudeSubagentStarts = new Map<string, string>();
   private readonly cursorTurnsByGeneration = new Map<string, ActiveCursorTurn>();
   private readonly cursorOpenGenerationBySession = new Map<string, string>();
+  private readonly codexSubagentStarts = new Map<string, string>();
+  private readonly codexInternalQueries = new Set<string>();
+  private readonly codexInternalSessions = new Set<string>();
 
   constructor(
     private readonly capturePrompts: (provider: SafeObservationV1["provider"]) => boolean = () => false,
@@ -197,12 +202,21 @@ export class DefaultAgentPrivacyGuard {
       return usageRecords(resource, signal).flatMap((record): SafeActivityAtomV1[] => {
         const attributes = recordAttributes(resourceAttributes, record);
         const name = firstText(record.name, attributes["event.name"]) ?? "";
-        const descriptor = activityDescriptor(classification.provider, name, attributes);
+        const codexToolCallId = classification.provider === "codex"
+          && normalizedName(name) === "codex.tool_result"
+          ? firstText(attributes["call_id"], attributes["tool.call.id"], attributes["gen_ai.tool.call.id"])
+          : undefined;
+        const descriptor = classification.provider === "codex" && !codexToolCallId
+          ? undefined
+          : activityDescriptor(classification.provider, name, attributes);
         if (!descriptor) {
           return [];
         }
-        const identity = providerIdentity(classification.provider, record, attributes, name)
-          ?? this.codexActivityIdentity(classification.provider, attributes);
+        const providerScopedIdentity = providerIdentity(classification.provider, record, attributes, name);
+        const codexPromptIdentity = this.codexActivityIdentity(classification.provider, attributes);
+        const identity = classification.provider === "codex"
+          ? mergeCodexTraceIdentity(providerScopedIdentity, codexPromptIdentity)
+          : providerScopedIdentity ?? codexPromptIdentity;
         if (!identity) {
           return [];
         }
@@ -212,8 +226,15 @@ export class DefaultAgentPrivacyGuard {
         );
         const endedAt = optionalTimestampToIso(firstText(record.endTimeUnixNano, record.timeUnixNano));
         const traceId = firstText(record.traceId) ?? identity.query;
-        const spanId = firstText(record.spanId, attributes["tool_use_id"], attributes["call_id"], attributes["tool.call.id"])
+        const spanId = firstText(
+          attributes["tool_use_id"],
+          codexToolCallId,
+          attributes["call_id"],
+          attributes["tool.call.id"],
+          record.spanId
+        )
           ?? `${descriptor.name}|${startedAt}`;
+        const requestId = opaqueHash("req", `${classification.provider}|${spanId}`);
         const durationMs = nonnegativeInteger(firstText(attributes["duration_ms"]))
           ?? durationBetween(startedAt, endedAt);
         const resultSizeBytes = nonnegativeInteger(firstText(
@@ -230,15 +251,27 @@ export class DefaultAgentPrivacyGuard {
           activityId: activityIdFor(classification.provider, traceId, spanId),
           queryId: opaqueHash("qry", `${classification.provider}|${identity.query}`),
           sessionId: opaqueHash("ses", `${classification.provider}|${identity.session}`),
+          requestId,
           provider: classification.provider,
           runtime: classification.runtime,
           kind: descriptor.kind,
           name: descriptor.name,
-          outcome: activityOutcome(record, attributes),
+          outcome: providerActivityOutcome(
+            classification.provider,
+            name,
+            descriptor.name,
+            record,
+            attributes
+          ),
           durationMs,
           resultSizeBytes,
           providerReportedResultTokens,
-          ...(this.captureSensitiveAuditEvidence()
+          evidenceBasis: signal === "traces" ? "trace_span" : "otel_event",
+          evidenceSourceId: classification.sourceId,
+          evidenceProfileVersion: classification.profileVersion,
+          identityConfidence: "medium",
+          timingConfidence: "medium",
+          ...(this.captureSensitiveAuditEvidence() && classification.provider !== "codex"
             ? { sensitiveAuditEvidence: sensitiveAuditEvidence(attributes, startedAt, descriptor) }
             : {}),
           startedAt,
@@ -296,11 +329,33 @@ export class DefaultAgentPrivacyGuard {
           }];
         }
 
-        const descriptor = activityDescriptor(classification.provider, name, attributes);
+        const descriptor = classification.provider === "codex"
+          ? undefined
+          : activityDescriptor(classification.provider, name, attributes);
         const usage = tokenUsage(attributes);
+        // A Codex turn span is a cumulative accounting boundary, not another LLM
+        // request. Keep its usage atom authority, but do not expose it as activity.
+        if (
+          classification.provider === "codex"
+          && signal === "traces"
+          && usageAuthority(classification.provider, name) === "turn"
+        ) {
+          return [];
+        }
         const spanId = firstText(record.spanId);
         const traceId = firstText(record.traceId) ?? identity.request;
-        if (!descriptor && !spanId && !hasUsage(usage)) {
+        const model = safeModel(firstText(
+          attributes["gen_ai.request.model"],
+          attributes["gen_ai.response.model"],
+          attributes["model"],
+          attributes["llm.model_name"]
+        ));
+        // Codex copies the active model onto startup, transport, persistence, and
+        // response-plumbing records. Only token evidence makes those records
+        // customer-visible LLM work; other providers retain explicit model evidence.
+        const hasCustomerLlmEvidence = hasUsage(usage)
+          || (classification.provider !== "codex" && Boolean(model));
+        if (!descriptor && !hasCustomerLlmEvidence) {
           return [];
         }
         const nodeId = executionNodeId(classification.provider, queryId, traceId, spanId, startedAt, normalized || "event");
@@ -308,12 +363,6 @@ export class DefaultAgentPrivacyGuard {
         const parentNodeId = parentSpanId
           ? executionNodeId(classification.provider, queryId, traceId, parentSpanId)
           : promptNodeId(queryId);
-        const model = safeModel(firstText(
-          attributes["gen_ai.request.model"],
-          attributes["gen_ai.response.model"],
-          attributes["model"],
-          attributes["llm.model_name"]
-        ));
         const endedAt = optionalTimestampToIso(firstText(record.endTimeUnixNano, record.timeUnixNano));
         return [{
           schemaVersion: 1,
@@ -364,22 +413,31 @@ export class DefaultAgentPrivacyGuard {
           firstText(attributes["event.timestamp"], record.startTimeUnixNano, record.timeUnixNano),
           observedAt
         );
+        let occurrenceQuery = identity.query;
+        let occurrenceSession = identity.session;
+        let occurrenceStartedAt = startedAt;
+        let lifecycleVisibility: QueryOccurrenceV1["lifecycleVisibility"];
         if (classification.provider === "codex") {
-          this.rememberCodexQuery(identity.session, {
-            query: identity.query,
+          const active = this.rememberCodexPromptQuery(
+            identity,
             startedAt,
-            queryBasis: codexExplicitTurnId(attributes) ? "explicit" : "fallback"
-          });
+            codexExplicitTurnId(attributes) ? "explicit" : "fallback"
+          );
+          occurrenceQuery = active.query;
+          occurrenceSession = active.session;
+          occurrenceStartedAt = active.startedAt;
+          lifecycleVisibility = this.isInternalCodexIdentity(active) ? "internal" : undefined;
         } else if (classification.provider === "claude-code") {
           this.rememberClaudeQuery(identity.session, { query: identity.query, startedAt });
         }
         return [{
           schemaVersion: 1,
-          queryId: opaqueHash("qry", `${classification.provider}|${identity.query}`),
-          sessionId: opaqueHash("ses", `${classification.provider}|${identity.session}`),
+          queryId: opaqueHash("qry", `${classification.provider}|${occurrenceQuery}`),
+          sessionId: opaqueHash("ses", `${classification.provider}|${occurrenceSession}`),
+          ...(lifecycleVisibility ? { lifecycleVisibility } : {}),
           provider: classification.provider,
           runtime: classification.runtime,
-          startedAt,
+          startedAt: occurrenceStartedAt,
           promptState: "disabled",
           evidence: queryOccurrenceEvidence(classification.provider, signal, name)
         }];
@@ -417,11 +475,11 @@ export class DefaultAgentPrivacyGuard {
         if (isProviderPromptEvent("codex", name)) {
           const identity = providerIdentity("codex", record, attributes, name);
           if (identity) {
-            this.rememberCodexQuery(identity.session, {
-              query: identity.query,
-              startedAt: eventAt,
-              queryBasis: codexExplicitTurnId(attributes) ? "explicit" : "fallback"
-            });
+            this.rememberCodexPromptQuery(
+              identity,
+              eventAt,
+              codexExplicitTurnId(attributes) ? "explicit" : "fallback"
+            );
           }
           return [];
         }
@@ -439,12 +497,19 @@ export class DefaultAgentPrivacyGuard {
         if (!current) {
           return [];
         }
+        const request = firstText(
+          attributes["response.id"],
+          attributes["request.id"],
+          attributes["event.id"],
+          attributes["event.sequence"],
+          record.spanId
+        ) ?? `${current.query}|response.completed|${eventAt}`;
         return [safeAtom({
           classification,
-          identity: { query: current.query, session: current.session, request: current.query },
+          identity: { query: current.query, session: current.session, request },
           signal: "logs",
-          authority: "turn",
-          completionMode: "explicit",
+          authority: "request",
+          completionMode: "inactivity",
           billingContext: billingContextFrom("codex", attributes),
           model: safeModel(firstText(attributes["model"], attributes["slug"], attributes["gen_ai.request.model"])),
           reportedModelProvider: firstText(
@@ -454,7 +519,7 @@ export class DefaultAgentPrivacyGuard {
             attributes["llm.provider"]
           ),
           usage,
-          startedAt: current.startedAt,
+          startedAt: eventAt,
           endedAt: eventAt
         })];
       });
@@ -513,8 +578,76 @@ export class DefaultAgentPrivacyGuard {
     this.pruneCodexQueries();
   }
 
+  private rememberCodexHookQuery(session: string, query: string, startedAt: string): ActiveCodexQuery {
+    const previous = this.codexQueriesBySession.get(session);
+    if (
+      previous?.queryBasis === "fallback"
+      && Math.abs(Date.parse(startedAt) - Date.parse(previous.startedAt)) <= CODEX_HOOK_RECONCILIATION_MS
+    ) {
+      this.forgetCodexQuery(previous.query);
+      const active: ActiveCodexQuery = {
+        ...previous,
+        queryBasis: "hook"
+      };
+      this.codexQueriesBySession.set(session, active);
+      this.codexQueriesByQuery.set(active.query, active);
+      this.codexQueriesByQuery.set(query, active);
+      this.pruneCodexQueries();
+      return active;
+    }
+    this.rememberCodexQuery(session, { query, startedAt, queryBasis: "hook" });
+    return this.codexQueriesBySession.get(session)!;
+  }
+
+  private rememberCodexInternalQuery(session: string, query: string, startedAt: string): ActiveCodexQuery {
+    const remembered = this.codexRememberedQueryForIdentity({ query, session }, query);
+    if (!remembered) {
+      this.rememberCodexQuery(session, { query, startedAt, queryBasis: "fallback" });
+    }
+    const active = remembered ?? this.codexQueriesBySession.get(session)!;
+    this.codexInternalQueries.add(active.query);
+    this.codexInternalQueries.add(query);
+    this.codexInternalSessions.add(active.session);
+    this.codexInternalSessions.add(session);
+    this.pruneCodexInternalIdentities();
+    return active;
+  }
+
+  private isInternalCodexIdentity(identity: { query?: string; session?: string }): boolean {
+    return Boolean(
+      (identity.query && this.codexInternalQueries.has(identity.query))
+      || (identity.session && this.codexInternalSessions.has(identity.session))
+    );
+  }
+
+  private pruneCodexInternalIdentities(): void {
+    pruneInsertionOrderedSet(this.codexInternalQueries, MAX_ACTIVE_PROVIDER_QUERIES);
+    pruneInsertionOrderedSet(this.codexInternalSessions, MAX_ACTIVE_PROVIDER_QUERIES);
+  }
+
+  private rememberCodexPromptQuery(
+    identity: { query: string; session: string },
+    startedAt: string,
+    queryBasis: Exclude<ActiveCodexQuery["queryBasis"], "hook">
+  ): ActiveCodexQuery {
+    const previous = this.codexQueriesBySession.get(identity.session);
+    if (
+      queryBasis === "fallback"
+      && previous?.queryBasis === "hook"
+      && Math.abs(Date.parse(startedAt) - Date.parse(previous.startedAt)) <= 5_000
+    ) {
+      return previous;
+    }
+    this.rememberCodexQuery(identity.session, { query: identity.query, startedAt, queryBasis });
+    return this.codexQueriesBySession.get(identity.session)!;
+  }
+
   private rememberCodexSessionAlias(session: string | undefined, active: ActiveCodexQuery): void {
     if (!session || session === active.session) {
+      return;
+    }
+    const existing = this.codexQueriesBySession.get(session);
+    if (existing && existing.query !== active.query) {
       return;
     }
     this.codexQueriesBySession.delete(session);
@@ -523,9 +656,14 @@ export class DefaultAgentPrivacyGuard {
   }
 
   private forgetCodexQuery(query: string): void {
-    this.codexQueriesByQuery.delete(query);
+    const canonicalQuery = this.codexQueriesByQuery.get(query)?.query ?? query;
+    for (const [alias, candidate] of [...this.codexQueriesByQuery.entries()]) {
+      if (candidate.query === canonicalQuery) {
+        this.codexQueriesByQuery.delete(alias);
+      }
+    }
     for (const [session, candidate] of [...this.codexQueriesBySession.entries()]) {
-      if (candidate.query === query) {
+      if (candidate.query === canonicalQuery) {
         this.codexQueriesBySession.delete(session);
       }
     }
@@ -631,10 +769,24 @@ export class DefaultAgentPrivacyGuard {
       });
     }
     if (eventName === "stop") {
-      return undefined;
+      const session = firstText(raw.session_id);
+      const current = session ? this.claudeQueriesBySession.get(session) : undefined;
+      if (!session || !current) {
+        return undefined;
+      }
+      return completionHookObservation({
+        provider: "claude-code",
+        sourceId: "hook_claude_code_lifecycle",
+        profileVersion: "claude-code-hooks-v1",
+        observedAt,
+        query: current.query,
+        session,
+        startedAt: current.startedAt,
+        completionEvidence: "stop_hook"
+      });
     }
-    if (eventName === "subagentstop") {
-      return this.sanitizeClaudeSubagentStopHookObservation(raw, observedAt);
+    if (eventName === "subagentstart" || eventName === "subagentstop") {
+      return this.sanitizeClaudeSubagentHookObservation(raw, observedAt, eventName);
     }
     if (eventName !== "posttooluse" && eventName !== "posttoolusefailure") {
       return undefined;
@@ -692,9 +844,10 @@ export class DefaultAgentPrivacyGuard {
     });
   }
 
-  private sanitizeClaudeSubagentStopHookObservation(
+  private sanitizeClaudeSubagentHookObservation(
     raw: Record<string, unknown>,
-    observedAt: string
+    observedAt: string,
+    eventName: "subagentstart" | "subagentstop"
   ): SafeObservationV1 | undefined {
     const session = firstText(raw.session_id);
     const current = session ? this.claudeQueriesBySession.get(session) : undefined;
@@ -702,8 +855,18 @@ export class DefaultAgentPrivacyGuard {
       return undefined;
     }
     const name = safeActivityName(firstText(raw.subagent_type, raw.agent_name, raw.name)) ?? "subagent";
+    const childSession = firstText(raw.subagent_id, raw.agent_id);
+    const request = childSession ?? `subagent|${name}|${observedAt}`;
+    if (eventName === "subagentstart") {
+      this.claudeSubagentStarts.set(request, observedAt);
+    }
     const durationMs = nonnegativeInteger(firstText(raw.duration_ms));
-    const startedAt = subtractDurationMs(observedAt, durationMs) ?? observedAt;
+    const startedAt = this.claudeSubagentStarts.get(request)
+      ?? subtractDurationMs(observedAt, durationMs)
+      ?? observedAt;
+    if (eventName === "subagentstop") {
+      this.claudeSubagentStarts.delete(request);
+    }
     return hookObservation({
       provider: "claude-code",
       sourceId: "hook_claude_code_lifecycle",
@@ -711,19 +874,20 @@ export class DefaultAgentPrivacyGuard {
       observedAt,
       query: current.query,
       session,
-      request: firstText(raw.subagent_id) ?? `subagent|${name}|${startedAt}`,
+      request,
       activity: {
         kind: "subagent",
         name,
-        outcome: raw.error ? "failure" : "success",
-        durationMs
+        outcome: eventName === "subagentstart" ? "unknown" : raw.error ? "failure" : "success",
+        durationMs,
+        childSession
       },
       node: {
         nodeKind: "subagent",
         name,
-        outcome: raw.error ? "failure" : "success",
+        outcome: eventName === "subagentstart" ? "unknown" : raw.error ? "failure" : "success",
         startedAt,
-        endedAt: observedAt,
+        endedAt: eventName === "subagentstop" ? observedAt : undefined,
         durationMs
       }
     });
@@ -736,27 +900,111 @@ export class DefaultAgentPrivacyGuard {
     const eventName = normalizedName(firstText(raw.hook_event_name) ?? "");
     if (eventName === "userpromptsubmit") {
       const query = firstText(raw.turn_id);
-      const session = firstText(raw.session_id) ?? query;
+      const reportedSession = firstText(raw.session_id);
+      const session = codexHookSession(raw) ?? query;
       if (!query || !session) {
         return undefined;
       }
-      this.rememberCodexQuery(session, { query, startedAt: observedAt, queryBasis: "explicit" });
+      // Codex Desktop also invokes hooks for ephemeral internal work such as title
+      // generation. Record only an opaque internal marker so earlier or later OTLP
+      // evidence for the same identity cannot be promoted after a restart.
+      if (!codexHookHasTranscriptLocator(raw)) {
+        const active = this.rememberCodexInternalQuery(session, query, observedAt);
+        return internalCodexHookObservation({
+          observedAt,
+          query: active.query,
+          session: active.session,
+          startedAt: active.startedAt
+        });
+      }
+      const active = this.rememberCodexHookQuery(session, query, observedAt);
       return promptHookObservation({
         provider: "codex",
         sourceId: "hook_codex_lifecycle",
         profileVersion: "codex-hooks-v1",
         observedAt,
-        query,
-        session,
-        evidence: "submission_hook"
+        query: active.query,
+        session: active.session,
+        parentSession: reportedSession && reportedSession !== active.session ? reportedSession : undefined,
+        startedAt: active.startedAt,
+        evidence: "submission_hook",
+        lifecycleVisibility: "customer"
       });
     }
-    if (eventName !== "posttooluse") {
+    const query = firstText(raw.turn_id);
+    const reportedSession = firstText(raw.session_id);
+    const session = codexHookSession(raw) ?? query;
+    if (this.isInternalCodexIdentity({ query, session: session ?? reportedSession })) {
       return undefined;
     }
-    const query = firstText(raw.turn_id);
-    const session = firstText(raw.session_id) ?? query;
-    if (!query || !session) {
+    const isSubagentLifecycle = eventName === "subagentstart" || eventName === "subagentstop";
+    const current = isSubagentLifecycle && reportedSession
+      ? this.codexQueriesBySession.get(reportedSession)
+      : query
+        ? this.codexRememberedQueryForIdentity({ query, session: session ?? query }, query)
+        : session ? this.codexQueriesBySession.get(session) : undefined;
+    if (current && this.isInternalCodexIdentity(current)) {
+      return undefined;
+    }
+    if (eventName === "stop") {
+      if (!current) {
+        return undefined;
+      }
+      return completionHookObservation({
+        provider: "codex",
+        sourceId: "hook_codex_lifecycle",
+        profileVersion: "codex-hooks-v1",
+        observedAt,
+        query: current.query,
+        session: current.session,
+        startedAt: current.startedAt,
+        completionEvidence: "stop_hook"
+      });
+    }
+    if (eventName === "subagentstart" || eventName === "subagentstop") {
+      if (!current) {
+        return undefined;
+      }
+      const childSession = firstText(raw.agent_id, raw.subagent_id);
+      const request = childSession ?? `${eventName}|${observedAt}`;
+      if (eventName === "subagentstart") {
+        this.codexSubagentStarts.set(request, observedAt);
+      }
+      const startedAt = this.codexSubagentStarts.get(request)
+        ?? subtractDurationMs(observedAt, nonnegativeInteger(firstText(raw.duration_ms)))
+        ?? observedAt;
+      if (eventName === "subagentstop") {
+        this.codexSubagentStarts.delete(request);
+      }
+      const name = safeActivityName(firstText(raw.agent_type, raw.subagent_type, raw.agent_name, raw.name)) ?? "subagent";
+      return hookObservation({
+        provider: "codex",
+        sourceId: "hook_codex_lifecycle",
+        profileVersion: "codex-hooks-v1",
+        observedAt,
+        query: current.query,
+        session: current.session,
+        request,
+        activity: {
+          kind: "subagent",
+          name,
+          outcome: eventName === "subagentstart" ? "unknown" : raw.error ? "failure" : "success",
+          childSession
+        },
+        node: {
+          nodeKind: "subagent",
+          name,
+          outcome: eventName === "subagentstart" ? "unknown" : raw.error ? "failure" : "success",
+          startedAt,
+          endedAt: eventName === "subagentstop" ? observedAt : undefined,
+          durationMs: nonnegativeInteger(firstText(raw.duration_ms))
+        }
+      });
+    }
+    if (eventName !== "posttooluse" && eventName !== "posttoolusefailure") {
+      return undefined;
+    }
+    if (!current) {
       return undefined;
     }
     const toolName = safeActivityName(firstText(raw.tool_name)) ?? "unknown";
@@ -768,20 +1016,27 @@ export class DefaultAgentPrivacyGuard {
     const startedAt = subtractDurationMs(observedAt, durationMs) ?? observedAt;
     const toolUseId = firstText(raw.tool_use_id);
     const attributes = hookSensitiveAttributes(raw.tool_input, raw.tool_response, firstText(raw.cwd));
-    const outcome = hookOutcomeFromResponse(raw.tool_response);
+    const outcome = eventName === "posttoolusefailure"
+      ? raw.is_interrupt === true ? "rejected" : "failure"
+      : codexHookOutcome(toolName, raw.tool_response);
+    const toolResponse = isRecord(raw.tool_response) ? raw.tool_response : undefined;
+    const childSession = descriptor.kind === "subagent"
+      ? firstText(raw.agent_id, raw.subagent_id, toolResponse?.agent_id, toolResponse?.subagent_id)
+      : undefined;
     return hookObservation({
       provider: "codex",
       sourceId: "hook_codex_tools",
       profileVersion: "codex-hooks-v1",
       observedAt,
-      query,
-      session,
+      query: current.query,
+      session: current.session,
       request: toolUseId ?? `${toolName}|${startedAt}`,
       activity: {
         kind: descriptor.kind,
         name: descriptor.name,
         outcome,
-        durationMs
+        durationMs,
+        childSession
       },
       node: {
         nodeKind: executionNodeKindForActivity(descriptor.kind),
@@ -867,7 +1122,9 @@ export class DefaultAgentPrivacyGuard {
         turn,
         endedAt: observedAt,
         model,
-        usage: observedUsage ?? {}
+        usage: observedUsage ?? {},
+        completedAt: observedAt,
+        completionEvidence: eventName === "sessionend" ? "session_hook" : "stop_hook"
       });
     }
 
@@ -1258,7 +1515,7 @@ function owningToolActivityIds(
     const spanId = firstText(record.spanId);
     const attributes = { ...resourceAttributes, ...otlpAttributes(record.attributes) };
     const name = firstText(record.name, attributes["event.name"]) ?? "";
-    return spanId && activityDescriptor(provider, name, attributes) ? [spanId] : [];
+    return spanId && provider !== "codex" && activityDescriptor(provider, name, attributes) ? [spanId] : [];
   }));
   const result = new Map<string, string>();
   for (const record of records) {
@@ -1293,10 +1550,13 @@ function activityDescriptor(
   const name = normalizedName(rawName);
   const isTool = provider === "github-copilot"
     ? name.startsWith("execute_tool") || name === "copilot_chat.tool.call"
-    : provider === "claude-code"
+      : provider === "claude-code"
       ? name.includes("tool_result") || name.includes("tool_use")
       : provider === "codex"
-        ? name === "codex.tool_result" || name.includes("dispatch_tool_call")
+        // Current Codex exposes the authoritative tool boundary through PostToolUse.
+        // dispatch_tool_call spans are internal wrappers and can appear more than once
+        // for one invocation, so treating them as tools double-counts customer work.
+        ? name === "codex.tool_result"
         : name.includes("tool") || name.includes("shell") || name.includes("mcp");
   if (!isTool) {
     return undefined;
@@ -1313,11 +1573,13 @@ function activityDescriptor(
   const mcpName = safeActivityName(firstText(attributes["mcp_server"], attributes["mcp_server.name"], toolParameters?.mcp_server_name));
   const subagentName = safeActivityName(firstText(attributes["subagent_type"], toolParameters?.subagent_type));
   const normalizedTool = normalizedName(toolName);
+  const isProviderSubagentOperation = provider === "github-copilot"
+    && (normalizedTool === "runsubagent" || normalizedTool === "invokeagent");
   const kind: SafeActivityAtomV1["kind"] = mcpName
     ? "mcp"
     : skillName
       ? "skill"
-      : subagentName || normalizedTool.includes("agent") || normalizedTool.includes("subagent")
+      : subagentName || isProviderSubagentOperation
         ? "subagent"
         : "tool";
   return { kind, name: skillName ?? mcpName ?? subagentName ?? toolName };
@@ -1341,9 +1603,14 @@ function parseJsonRecord(value?: string): Record<string, unknown> | undefined {
 }
 
 function activityOutcome(record: Record<string, unknown>, attributes: Record<string, unknown>): SafeActivityAtomV1["outcome"] {
+  if (attributes.success === true) return "success";
+  if (attributes.success === false) return "failure";
   const success = firstText(attributes.success)?.toLowerCase();
   if (success === "true") return "success";
   if (success === "false") return "failure";
+  const otlpStatusCode = isRecord(record.status) ? Number(record.status.code) : Number.NaN;
+  if (otlpStatusCode === 1) return "success";
+  if (otlpStatusCode === 2) return "failure";
   const status = normalizedName(firstText(
     isRecord(record.status) ? record.status.code : undefined,
     attributes["status"],
@@ -1353,6 +1620,28 @@ function activityOutcome(record: Record<string, unknown>, attributes: Record<str
   if (status.includes("error") || status.includes("fail")) return "failure";
   if (status.includes("ok") || status.includes("success")) return "success";
   return "unknown";
+}
+
+function providerActivityOutcome(
+  provider: SafeObservationV1["provider"],
+  eventName: string,
+  toolName: string,
+  record: Record<string, unknown>,
+  attributes: Record<string, unknown>
+): SafeActivityAtomV1["outcome"] {
+  const outcome = activityOutcome(record, attributes);
+  if (
+    provider === "codex"
+    && normalizedName(eventName) === "codex.tool_result"
+    && isCodexShellTool(toolName)
+    && outcome === "success"
+  ) {
+    // Codex reports whether unified exec returned a protocol result here, not
+    // whether the child process exited successfully. Preserve explicit dispatch
+    // failures, but do not turn a protocol success into a shell outcome.
+    return "unknown";
+  }
+  return outcome;
 }
 
 function codexMetricOutcome(value: unknown): SafeActivityAtomV1["outcome"] {
@@ -1560,10 +1849,14 @@ function promptHookObservation(input: {
   sourceId: string;
   profileVersion: string;
   observedAt: string;
+  startedAt?: string;
   query: string;
   session: string;
+  parentSession?: string;
   evidence: QueryOccurrenceV1["evidence"];
+  lifecycleVisibility?: QueryOccurrenceV1["lifecycleVisibility"];
 }): SafeObservationV1 {
+  const startedAt = input.startedAt ?? input.observedAt;
   const queryId = opaqueHash("qry", `${input.provider}|${input.query}`);
   const sessionId = opaqueHash("ses", `${input.provider}|${input.session}`);
   const requestId = opaqueHash("req", `${input.provider}|${input.query}`);
@@ -1582,9 +1875,11 @@ function promptHookObservation(input: {
       schemaVersion: 1,
       queryId,
       sessionId,
+      ...(input.parentSession ? { parentSessionId: opaqueHash("ses", `${input.provider}|${input.parentSession}`) } : {}),
+      ...(input.lifecycleVisibility ? { lifecycleVisibility: input.lifecycleVisibility } : {}),
       provider: input.provider,
       runtime: input.provider,
-      startedAt: input.observedAt,
+      startedAt,
       promptState: "disabled",
       evidence: input.evidence
     }],
@@ -1600,7 +1895,78 @@ function promptHookObservation(input: {
       nodeKind: "prompt",
       name: "Prompt",
       outcome: "success",
-      startedAt: input.observedAt
+      startedAt
+    }],
+    usageAtoms: []
+  };
+}
+
+function internalCodexHookObservation(input: {
+  observedAt: string;
+  query: string;
+  session: string;
+  startedAt: string;
+}): SafeObservationV1 {
+  return {
+    schemaVersion: 1,
+    observationId: opaqueHash("obs", `hook_codex_internal|${input.query}|${input.observedAt}`),
+    sourceId: "hook_codex_internal",
+    provider: "codex",
+    runtime: "codex",
+    signal: "logs",
+    profileVersion: "codex-hooks-v1",
+    resourceCount: 1,
+    recordCount: 1,
+    observedAt: input.observedAt,
+    queryOccurrences: [{
+      schemaVersion: 1,
+      queryId: opaqueHash("qry", `codex|${input.query}`),
+      sessionId: opaqueHash("ses", `codex|${input.session}`),
+      lifecycleVisibility: "internal",
+      provider: "codex",
+      runtime: "codex",
+      startedAt: input.startedAt,
+      promptState: "disabled",
+      evidence: "provider_prompt_id"
+    }],
+    usageAtoms: []
+  };
+}
+
+function completionHookObservation(input: {
+  provider: ProviderHookSource;
+  sourceId: string;
+  profileVersion: string;
+  observedAt: string;
+  query: string;
+  session: string;
+  startedAt: string;
+  completionEvidence: NonNullable<QueryOccurrenceV1["completionEvidence"]>;
+}): SafeObservationV1 {
+  const queryId = opaqueHash("qry", `${input.provider}|${input.query}`);
+  const sessionId = opaqueHash("ses", `${input.provider}|${input.session}`);
+  return {
+    schemaVersion: 1,
+    observationId: opaqueHash("obs", `${input.sourceId}|${input.query}|completed|${input.observedAt}`),
+    sourceId: input.sourceId,
+    provider: input.provider,
+    runtime: input.provider,
+    signal: "logs",
+    profileVersion: input.profileVersion,
+    resourceCount: 1,
+    recordCount: 1,
+    observedAt: input.observedAt,
+    queryOccurrences: [{
+      schemaVersion: 1,
+      queryId,
+      sessionId,
+      provider: input.provider,
+      runtime: input.provider,
+      startedAt: input.startedAt,
+      completedAt: input.observedAt,
+      completionEvidence: input.completionEvidence,
+      promptState: "disabled",
+      evidence: "submission_hook"
     }],
     usageAtoms: []
   };
@@ -1620,6 +1986,7 @@ function hookObservation(input: {
     outcome: SafeActivityAtomV1["outcome"];
     durationMs?: number;
     sensitiveAuditEvidence?: SensitiveAuditEvidenceV1[];
+    childSession?: string;
   };
   node: {
     nodeKind: ExecutionNodeAtomV1["nodeKind"];
@@ -1658,12 +2025,21 @@ function hookObservation(input: {
       activityId,
       queryId,
       sessionId,
+      requestId,
       provider: input.provider,
       runtime: input.provider,
       kind: input.activity.kind,
       name: input.activity.name,
       outcome: input.activity.outcome,
       durationMs: input.activity.durationMs,
+      evidenceBasis: input.activity.kind === "subagent" ? "subagent_hook" : "tool_hook",
+      evidenceSourceId: input.sourceId,
+      evidenceProfileVersion: input.profileVersion,
+      identityConfidence: "high",
+      timingConfidence: "high",
+      ...(input.activity.childSession
+        ? { childSessionId: opaqueHash("ses", `${input.provider}|${input.activity.childSession}`) }
+        : {}),
       ...(input.activity.sensitiveAuditEvidence ? { sensitiveAuditEvidence: input.activity.sensitiveAuditEvidence } : {}),
       startedAt: input.node.startedAt,
       endedAt: input.node.endedAt
@@ -1697,6 +2073,8 @@ function cursorUsageHookObservation(input: {
   endedAt?: string;
   model?: string;
   usage: ReturnType<typeof tokenUsage>;
+  completedAt?: string;
+  completionEvidence?: NonNullable<QueryOccurrenceV1["completionEvidence"]>;
 }): SafeObservationV1 {
   const classification = {
     provider: "cursor" as const,
@@ -1725,6 +2103,20 @@ function cursorUsageHookObservation(input: {
     resourceCount: 1,
     recordCount: 1,
     observedAt: input.observedAt,
+    ...(input.completedAt ? {
+      queryOccurrences: [{
+        schemaVersion: 1 as const,
+        queryId,
+        sessionId,
+        provider: "cursor" as const,
+        runtime: "cursor",
+        startedAt: input.turn.startedAt,
+        completedAt: input.completedAt,
+        completionEvidence: input.completionEvidence ?? "stop_hook",
+        promptState: "disabled" as const,
+        evidence: "submission_hook" as const
+      }]
+    } : {}),
     executionNodes: [{
       schemaVersion: 1,
       nodeId: executionNodeId("cursor", queryId, input.turn.query, requestId, input.turn.startedAt, "cursor_turn"),
@@ -1770,6 +2162,7 @@ function cursorActivityHookObservation(input: {
     endedAt?: string;
     durationMs?: number;
     evidenceBasis: WebhookEvidenceBasisV1;
+    childSession?: string;
   };
 }): SafeObservationV1 {
   const queryId = opaqueHash("qry", `cursor|${input.turn.query}`);
@@ -1799,12 +2192,16 @@ function cursorActivityHookObservation(input: {
       activityId,
       queryId,
       sessionId,
+      requestId,
       provider: "cursor",
       runtime: "cursor",
       kind: input.activity.kind,
       name: input.activity.name,
       outcome: input.activity.outcome,
       durationMs: input.activity.durationMs,
+      ...(input.activity.childSession
+        ? { childSessionId: opaqueHash("ses", `cursor|${input.activity.childSession}`) }
+        : {}),
       startedAt: input.activity.startedAt,
       endedAt: input.activity.endedAt,
       evidenceBasis: input.activity.evidenceBasis,
@@ -1846,6 +2243,7 @@ function cursorActivityFromHook(
   endedAt?: string;
   durationMs?: number;
   evidenceBasis: WebhookEvidenceBasisV1;
+  childSession?: string;
 } | undefined {
   const durationMs = nonnegativeInteger(firstText(raw.duration_ms));
   const startedAt = subtractDurationMs(observedAt, durationMs) ?? observedAt;
@@ -1900,7 +2298,8 @@ function cursorActivityFromHook(
       startedAt,
       endedAt: eventName === "subagentstart" ? undefined : observedAt,
       durationMs,
-      evidenceBasis: "subagent_hook"
+      evidenceBasis: "subagent_hook",
+      childSession: firstText(raw.subagent_id, raw.agent_id)
     };
   }
   if (eventName === "afterfileedit") {
@@ -1967,6 +2366,12 @@ function hookOutcomeFromResponse(value: unknown): SafeActivityAtomV1["outcome"] 
   if (typeof value.interrupted === "boolean") {
     return value.interrupted ? "rejected" : "success";
   }
+  if (typeof value.is_error === "boolean") {
+    return value.is_error ? "failure" : "success";
+  }
+  if (typeof value.isError === "boolean") {
+    return value.isError ? "failure" : "success";
+  }
   if (typeof value.exit_code === "number") {
     return value.exit_code === 0 ? "success" : "failure";
   }
@@ -1983,6 +2388,18 @@ function hookOutcomeFromResponse(value: unknown): SafeActivityAtomV1["outcome"] 
     }
   }
   return "success";
+}
+
+function codexHookOutcome(toolName: string, value: unknown): SafeActivityAtomV1["outcome"] {
+  if (!isRecord(value) && isCodexShellTool(toolName)) {
+    return "unknown";
+  }
+  return hookOutcomeFromResponse(value);
+}
+
+function isCodexShellTool(toolName: string): boolean {
+  const normalized = normalizedName(toolName).replace(/[.:/\-]/g, "_");
+  return ["bash", "exec_command", "write_stdin", "shell", "shell_command", "unified_exec"].includes(normalized);
 }
 
 function otlpAttributes(value: unknown): Record<string, unknown> {
@@ -2031,6 +2448,19 @@ function codexSessionId(attributes: Record<string, unknown>, traceId?: string): 
     attributes["session.id"],
     traceId
   );
+}
+
+function codexHookSession(raw: Record<string, unknown>): string | undefined {
+  const transcriptPath = firstText(raw.transcript_path, raw.transcriptPath);
+  const transcriptFile = transcriptPath?.split(/[\\/]/).at(-1);
+  const transcriptSession = transcriptFile?.match(
+    /(?:^|[-_])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
+  )?.[1];
+  return transcriptSession ?? firstText(raw.session_id);
+}
+
+function codexHookHasTranscriptLocator(raw: Record<string, unknown>): boolean {
+  return firstText(raw.transcript_path, raw.transcriptPath) != null;
 }
 
 function sessionOnlyCodexIdentity(
@@ -2414,4 +2844,14 @@ function safePromptText(value?: string): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function pruneInsertionOrderedSet(values: Set<string>, maxSize: number): void {
+  while (values.size > maxSize) {
+    const oldest = values.values().next().value;
+    if (oldest == null) {
+      return;
+    }
+    values.delete(oldest);
+  }
 }

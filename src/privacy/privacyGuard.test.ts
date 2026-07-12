@@ -349,7 +349,7 @@ show the actual user prompt
       },
       coverage: {
         usageCoverage: "final",
-        activityCoverage: "none",
+        activityCoverage: "complete_for_reported_surface",
         costCoverage: "unavailable"
       },
       endedAt: "2026-06-08T00:00:01.000Z",
@@ -365,10 +365,78 @@ show the actual user prompt
       usageValueNanoUsd: 100_000,
       costEstimateBasis: "unavailable",
       costCoverage: "unavailable",
+      activity: [{
+        activityId: "activity_tool_value",
+        kind: "tool",
+        name: "Read",
+        outcome: "unknown",
+        count: 3,
+        failureCount: 1,
+        unknownCount: 1,
+        startedAt: "2026-06-08T00:00:00.000Z",
+        endedAt: "2026-06-08T00:00:01.000Z",
+        durationMs: 100,
+        resultSizeBytes: 256,
+        providerReportedResultTokens: 12,
+        usageAttributionBasis: "activity_only",
+        usageCoverage: "unavailable",
+        evidence: {
+          basis: "trace_span",
+          sourceId: "source_tool_value",
+          profileVersion: "codex-otel-logs-v1",
+          observedAt: "2026-06-08T00:00:01.000Z",
+          delayed: false,
+          identityConfidence: "high",
+          timingConfidence: "high"
+        }
+      }, {
+        activityId: "activity_unallocated_value",
+        kind: "unknown",
+        name: "Unallocated run usage",
+        outcome: "unknown",
+        count: 1,
+        failureCount: 0,
+        startedAt: "2026-06-08T00:00:00.000Z",
+        endedAt: "2026-06-08T00:00:01.000Z",
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 15,
+        usageAttributionBasis: "unavailable",
+        usageCoverage: "unavailable",
+        evidence: {
+          basis: "stop_hook",
+          sourceId: "source_test",
+          profileVersion: "codex-otel-logs-v1",
+          observedAt: "2026-06-08T00:00:01.000Z",
+          delayed: false,
+          identityConfidence: "high",
+          timingConfidence: "high"
+        }
+      }],
       state: "completed"
     };
 
     expect(guard.validatePublication(event).ok).toBe(true);
+    const provisionalTerminal = {
+      ...event,
+      coverage: {
+        usageCoverage: "complete_so_far",
+        activityCoverage: "partial",
+        costCoverage: "unavailable"
+      }
+    };
+    expect(guard.validatePublication(provisionalTerminal).ok).toBe(true);
+    expect(guard.validatePublication({
+      ...provisionalTerminal,
+      evidence: { ...provisionalTerminal.evidence, delayed: true }
+    }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...provisionalTerminal,
+      evidence: { ...provisionalTerminal.evidence, basis: "usage_projection" }
+    }).ok).toBe(false);
     expect(guard.validatePublication({
       ...event,
       codingHarness: "cursor",
@@ -381,5 +449,22 @@ show the actual user prompt
     }).ok).toBe(true);
     expect(guard.validatePublication({ ...event, usageValueNanoUsd: -1 }).ok).toBe(false);
     expect(guard.validatePublication({ ...event, usageValueUsd: 0.0001 }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...event,
+      activity: [{ ...event.activity[0], failureCount: 4 }, event.activity[1]]
+    }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...event,
+      activity: [{ ...event.activity[0], unknownCount: 3 }, event.activity[1]]
+    }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...event,
+      activity: [{ ...event.activity[0], promptText: "private prompt" }, event.activity[1]]
+    }).ok).toBe(false);
+    expect(guard.validatePublication({ ...event, totalTokens: 16 }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...event,
+      activity: [event.activity[0], { ...event.activity[1], outputTokens: 6, totalTokens: 16 }]
+    }).ok).toBe(false);
   });
 });

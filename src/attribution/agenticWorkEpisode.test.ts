@@ -276,6 +276,9 @@ class MemoryWorkEpisodeLedger implements WorkEpisodeLedger {
       .filter((episode) => !query.repoKey || (episode.repoKeys ?? []).includes(query.repoKey))
       .filter((episode) => !query.commitHash || episode.claimedByCommitHash === query.commitHash)
       .filter((episode) => !query.status || episode.status === query.status)
+      .filter((episode) => !query.queryId || episode.queryIds.includes(query.queryId))
+      .filter((episode) => !query.runId || episode.runIds.includes(query.runId))
+      .filter((episode) => !query.chatSessionId || episode.chatSessionId === query.chatSessionId)
       .map((episode) => structuredClone(episode));
   }
 

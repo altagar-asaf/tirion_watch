@@ -47,6 +47,10 @@ describe("source configuration", () => {
       OTEL_LOG_RAW_API_BODIES: "0"
     });
     expect(settings.hooks).toMatchObject({
+      UserPromptSubmit: [expect.any(Object)],
+      Stop: [expect.any(Object)],
+      SubagentStart: [expect.any(Object)],
+      SubagentStop: [expect.any(Object)],
       PostToolUse: [expect.objectContaining({
         matcher: "*",
         hooks: [expect.objectContaining({
@@ -128,6 +132,10 @@ describe("source configuration", () => {
         OTEL_LOG_RAW_API_BODIES: "1"
       },
       hooks: {
+        UserPromptSubmit: [expect.any(Object)],
+        Stop: [expect.any(Object)],
+        SubagentStart: [expect.any(Object)],
+        SubagentStop: [expect.any(Object)],
         PostToolUse: [expect.any(Object)],
         PostToolUseFailure: [expect.any(Object)]
       }
@@ -159,6 +167,9 @@ describe("source configuration", () => {
       responseContentSupported: false,
     });
     expect(parse(readFileSync(paths.codexConfigPath, "utf8"))).toMatchObject({
+      features: {
+        hooks: true
+      },
       otel: {
         log_user_prompt: false,
         exporter: {
@@ -184,6 +195,10 @@ describe("source configuration", () => {
         }
       },
       hooks: {
+        UserPromptSubmit: [expect.any(Object)],
+        Stop: [expect.any(Object)],
+        SubagentStart: [expect.any(Object)],
+        SubagentStop: [expect.any(Object)],
         PostToolUse: [expect.objectContaining({
           matcher: ".*",
           hooks: [expect.objectContaining({
@@ -193,13 +208,58 @@ describe("source configuration", () => {
         })]
       }
     });
-    expect(readFileSync(paths.codexHookRelayPath, "utf8")).toContain("content-type");
+    expect(readFileSync(paths.codexHookRelayPath, "utf8")).toContain("configuredEventName");
+    expect(readFileSync(paths.codexConfigPath, "utf8")).toContain("'UserPromptSubmit'");
     const before = readFileSync(paths.codexConfigPath, "utf8");
     expect(service.configure("codex", "http://127.0.0.1:9999")).toMatchObject({
       status: "conflict",
       reasonCodes: ["existing_exporter_conflict"]
     });
     expect(readFileSync(paths.codexConfigPath, "utf8")).toBe(before);
+  });
+
+  it("preserves unchanged Codex hook ordering and persisted trust state byte for byte", () => {
+    const paths = testPaths();
+    const service = new SourceConfigurationService(paths);
+    expect(service.configure("codex", "http://127.0.0.1:4318", "local-token")).toMatchObject({
+      status: "configured"
+    });
+    const config = parse(readFileSync(paths.codexConfigPath, "utf8")) as TomlTable;
+    const hooks = config.hooks as TomlTable;
+    const postToolUse = hooks.PostToolUse as unknown[];
+    postToolUse.unshift({
+      matcher: "^Bash$",
+      hooks: [{ type: "command", command: "/usr/local/bin/foreign-hook", timeout: 5 }]
+    });
+    hooks.state = {
+      [`${paths.codexConfigPath}:post_tool_use:1:0`]: {
+        trusted_hash: "sha256:trusted-tirion-hook"
+      }
+    };
+    writeFileSync(paths.codexConfigPath, stringify(config));
+    const before = readFileSync(paths.codexConfigPath, "utf8");
+
+    expect(service.configure("codex", "http://127.0.0.1:4318", "local-token")).toMatchObject({
+      status: "already_configured"
+    });
+    expect(readFileSync(paths.codexConfigPath, "utf8")).toBe(before);
+    expect(parse(before)).not.toHaveProperty("hooks.PostToolUseFailure");
+  });
+
+  it("refreshes an outdated private relay without rewriting an otherwise current Codex config", () => {
+    const paths = testPaths();
+    const service = new SourceConfigurationService(paths);
+    expect(service.configure("codex", "http://127.0.0.1:4318", "local-token")).toMatchObject({
+      status: "configured"
+    });
+    const configBefore = readFileSync(paths.codexConfigPath, "utf8");
+    writeFileSync(paths.codexHookRelayPath, "\"use strict\";\n// stale\n");
+
+    expect(service.configure("codex", "http://127.0.0.1:4318", "local-token")).toMatchObject({
+      status: "configured"
+    });
+    expect(readFileSync(paths.codexConfigPath, "utf8")).toBe(configBefore);
+    expect(readFileSync(paths.codexHookRelayPath, "utf8")).toContain("withHookContext");
   });
 
   it("configures Cursor hooks through a private relay while preserving foreign hook entries", () => {
@@ -469,6 +529,30 @@ describe("source configuration", () => {
     });
     expect(parse(readFileSync(paths.codexConfigPath, "utf8"))).toMatchObject({
       otel: { exporter: { "otlp-http": { endpoint: "https://changed.example" } } }
+    });
+  });
+
+  it("enables Codex hooks and restores the previous feature flag without disturbing other features", () => {
+    const paths = testPaths();
+    writeFileSync(paths.codexConfigPath, stringify({
+      features: { hooks: false, multi_agent: true },
+      model: "gpt-5.5"
+    }));
+    const service = new SourceConfigurationService(paths);
+
+    expect(service.configure("codex", "http://127.0.0.1:4318", "local-token")).toMatchObject({
+      status: "configured"
+    });
+    expect(parse(readFileSync(paths.codexConfigPath, "utf8"))).toMatchObject({
+      features: { hooks: true, multi_agent: true }
+    });
+
+    expect(service.restore("codex", "http://127.0.0.1:4318", "local-token")).toMatchObject({
+      status: "restored"
+    });
+    expect(parse(readFileSync(paths.codexConfigPath, "utf8"))).toEqual({
+      features: { hooks: false, multi_agent: true },
+      model: "gpt-5.5"
     });
   });
 

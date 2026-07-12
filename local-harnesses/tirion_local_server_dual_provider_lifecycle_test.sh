@@ -40,8 +40,12 @@ set -euo pipefail
 #   TIRION_TEST_CODEX_READ_ONLY_PROMPT="look online, ..." ./tirion_local_server_dual_provider_lifecycle_test.sh
 #   TIRION_TEST_PROVIDERS=github-copilot ./tirion_local_server_dual_provider_lifecycle_test.sh
 #   TIRION_TEST_TIRIONCTL="$PWD/packages/tirionctl/dist/main.js" ./tirion_local_server_dual_provider_lifecycle_test.sh
+#   TIRION_TEST_DIRECT_AGENT=1 TIRION_TEST_AGENT_ENTRY="$PWD/packages/agent/dist/main.js" ./tirion_local_server_dual_provider_lifecycle_test.sh
+#   CLAUDE_CONFIG_DIR=/tmp/tirion-claude TIRION_TEST_CLAUDE_DEFAULT_AUTH=1 ./tirion_local_server_dual_provider_lifecycle_test.sh
 ###############################################################################
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT="${TIRION_TEST_ROOT:-/tmp/tirion-local-server-test}"
 EVENT_DIR="$ROOT/events"
 CC_REPO="$ROOT/claude-code-repo"
@@ -55,10 +59,16 @@ WEBHOOK_TOKEN="${TIRION_TEST_WEBHOOK_TOKEN:-tirion-local-server-token}"
 WEBHOOK_SECRET="${TIRION_TEST_WEBHOOK_SECRET:-tirion-local-server-secret}"
 PROVIDERS="${TIRION_TEST_PROVIDERS:-claude-code,codex,github-copilot}"
 TIRIONCTL_BIN="${TIRION_TEST_TIRIONCTL:-tirionctl}"
+DIRECT_AGENT="${TIRION_TEST_DIRECT_AGENT:-0}"
+AGENT_ENTRY="${TIRION_TEST_AGENT_ENTRY:-$PROJECT_ROOT/packages/agent/dist/main.js}"
+AGENT_STATE_DIR="$ROOT/agent-state"
+AGENT_RUNTIME_DIR="$ROOT/agent-runtime"
+AGENT_SOCKET="$AGENT_RUNTIME_DIR/agent.sock"
 CLAUDE_PERMISSION_MODE="${TIRION_TEST_CLAUDE_PERMISSION_MODE:-acceptEdits}"
 CLAUDE_TOOLS="${TIRION_TEST_CLAUDE_TOOLS:-Read,Edit,Write,Glob,Grep}"
 CLAUDE_MAX_TURNS="${TIRION_TEST_CLAUDE_MAX_TURNS:-12}"
 CLAUDE_MODEL="${TIRION_TEST_CLAUDE_MODEL:-}"
+CLAUDE_DEFAULT_AUTH="${TIRION_TEST_CLAUDE_DEFAULT_AUTH:-0}"
 CODEX_READ_ONLY_PROMPT="${TIRION_TEST_CODEX_READ_ONLY_PROMPT:-Inspect this repository and summarize what it does. Do not modify any files. Do not repeat this exact sentinel: DO_NOT_LEAK_CODEX_SECRET.}"
 COPILOT_MODEL="${TIRION_TEST_COPILOT_MODEL:-gpt-5.4-mini}"
 COPILOT_BASELINE_SLEEP_SECONDS="${TIRION_TEST_COPILOT_BASELINE_SLEEP_SECONDS:-2}"
@@ -116,6 +126,43 @@ tirionctl() {
   fi
 }
 
+run_agent_entry() {
+  if [[ "$AGENT_ENTRY" == *.js ]]; then
+    node "$AGENT_ENTRY"
+  else
+    command "$AGENT_ENTRY"
+  fi
+}
+
+start_tirion_agent() {
+  if [[ "$DIRECT_AGENT" != "1" ]]; then
+    tirionctl stop >/dev/null 2>&1 || true
+    tirionctl start
+    return
+  fi
+
+  export TIRION_AGENT_STATE_DIR="$AGENT_STATE_DIR"
+  export TIRION_AGENT_RUNTIME_DIR="$AGENT_RUNTIME_DIR"
+  export TIRION_AGENT_SOCKET="$AGENT_SOCKET"
+  export TIRION_AGENT_OTLP_PORT="0"
+  mkdir -p "$AGENT_STATE_DIR" "$AGENT_RUNTIME_DIR"
+  run_agent_entry > "$ROOT/agent.stdout.log" 2> "$ROOT/agent.stderr.log" &
+  AGENT_PID="$!"
+
+  local attempt status_file="$ROOT/status.json"
+  for attempt in $(seq 1 100); do
+    if tirionctl status > "$status_file" 2>/dev/null && jq -e '.health == "healthy"' "$status_file" >/dev/null; then
+      pass "isolated Tirion agent started"
+      return
+    fi
+    sleep 0.1
+  done
+
+  cat "$ROOT/agent.stdout.log" >&2 || true
+  cat "$ROOT/agent.stderr.log" >&2 || true
+  fail "isolated Tirion agent did not become healthy"
+}
+
 provider_enabled() {
   local provider="$1"
   [[ ",$PROVIDERS," == *",$provider,"* ]]
@@ -153,6 +200,11 @@ cleanup() {
   tirionctl configure restore claude-code >/dev/null 2>&1 || true
   tirionctl configure restore codex >/dev/null 2>&1 || true
   tirionctl configure restore github-copilot >/dev/null 2>&1 || true
+  if [[ -n "${AGENT_PID:-}" ]]; then
+    tirionctl stop >/dev/null 2>&1 || true
+    kill "$AGENT_PID" >/dev/null 2>&1 || true
+    wait "$AGENT_PID" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -501,6 +553,56 @@ assert_no_orphan_run_lifecycle_subjects() {
   fi
 }
 
+assert_run_stream_integrity() {
+  local ended_file="$1" label="$2" run_id
+  run_id="$(jq -r '.runId' "$ended_file")"
+  sync_external_events
+  if ! jq -s -e --arg run_id "$run_id" '
+    def token_sum($items; $key): [$items[]? | (.activity // [])[]? | (.[$key] // 0)] | add // 0;
+    def canonical: walk(if type == "object" then to_entries | sort_by(.key) | from_entries else . end);
+    [.[] | select(.runId == $run_id)] as $events
+    | [$events[] | select(.eventType == "run.start")] as $starts
+    | [$events[] | select(.eventType == "run.update")] as $updates
+    | [$events[] | select(.eventType == "run.ended")] as $terminals
+    | ($terminals | sort_by(.version // 1) | last) as $final
+    | ([range(0; $events | length) | select($events[.].eventType == "run.ended")] | min) as $first_terminal
+    | ($starts | length) == 1
+      and ($updates | length) >= 1
+      and ($terminals | length) >= 1
+      and ([range($first_terminal + 1; $events | length) | $events[.] | select(.eventType == "run.update")] | length) == 0
+      and ([$updates[].eventId] | unique | length) == ($updates | length)
+      and ([$terminals[] | del(.eventId, .version) | canonical | tojson] | unique | length) == ($terminals | length)
+      and ([$terminals[] | (.version // 1)] | sort) == [range(1; ($terminals | length) + 1)]
+      and all($events[]; .repository.repoKey == $final.repository.repoKey and .startedAt == $starts[0].startedAt)
+      and all($updates[]; .totalTokens <= $final.totalTokens)
+      and all($updates[]; (.activity | length) <= 100)
+      and all(($updates + $terminals)[];
+        . as $event
+        | all(($event.activity // [])[];
+            .startedAt >= $event.startedAt
+            and ((.endedAt // .startedAt) <= ($event.updatedAt // $event.endedAt))))
+      and all(($updates + $terminals)[];
+        .totalTokens == (.inputTokens + .outputTokens)
+        and token_sum([.]; "inputTokens") == .inputTokens
+        and token_sum([.]; "outputTokens") == .outputTokens
+        and token_sum([.]; "cacheReadInputTokens") == .cacheReadInputTokens
+        and token_sum([.]; "cacheCreationInputTokens") == .cacheCreationInputTokens
+        and token_sum([.]; "reasoningOutputTokens") == .reasoningOutputTokens)
+      and all(($updates + $terminals)[];
+        all((.activity // [])[];
+          (.name | test("append_items|persist_rollout_items|handle_responses|receiving|dispatch_tool_call"; "i") | not)))
+  ' "$EVENT_DIR"/*.body.json >/dev/null; then
+    echo "$label integrity stream:" >&2
+    jq -r --arg run_id "$run_id" '
+      select(.runId == $run_id)
+      | [.eventType, (.sequence // .version // ""), .eventId, .state, .totalTokens,
+         ((.activity // []) | length), (.startedAt // ""), (.updatedAt // .endedAt // "")] | @tsv
+    ' "$EVENT_DIR"/*.body.json | sort >&2
+    fail "$label lifecycle stream failed monotonicity, conservation, deduplication, or semantic-activity checks"
+  fi
+  pass "$label lifecycle stream integrity validated"
+}
+
 query_trace_id_for_run_id() {
   local run_id="$1"
   echo "qry_${run_id#run_}"
@@ -551,7 +653,13 @@ activate_repo_for_provider() {
   activation="$(tirionctl repo activate "$repo" --provider "$provider")"
   printf '%s\n' "$activation" > "$out_file"
   assert_json "$out_file" '.schemaVersion == 1'
-  assert_json "$out_file" '.activationState == "ready"'
+  if [[ "$provider" == "codex" ]] && jq -e '(.reasonCodes | index("hook_trust_required")) != null' "$out_file" >/dev/null; then
+    assert_json "$out_file" '.activationState == "attention_required"'
+    assert_json "$out_file" '.sourceStatus.configurationState == "partial"'
+    assert_json "$out_file" '.sourceStatus.measurementState == "unavailable"'
+  else
+    assert_json "$out_file" '.activationState == "ready"'
+  fi
   assert_json "$out_file" --arg p "$provider" '.provider == $p'
   assert_json "$out_file" '.repositoryScope.kind == "repository"'
   assert_json "$out_file" '.repositoryScope.state == "active"'
@@ -646,17 +754,24 @@ run_claude_code() {
   if [[ -n "$CLAUDE_MODEL" ]]; then
     args+=(--model "$CLAUDE_MODEL")
   fi
-  claude "${args[@]}"
+  if [[ "$CLAUDE_DEFAULT_AUTH" == "1" ]]; then
+    [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] || fail "TIRION_TEST_CLAUDE_DEFAULT_AUTH requires an isolated CLAUDE_CONFIG_DIR"
+    env -u CLAUDE_CONFIG_DIR claude "${args[@]}" \
+      --setting-sources project,local \
+      --settings "$CLAUDE_CONFIG_DIR/settings.json"
+  else
+    claude "${args[@]}"
+  fi
 }
 
 run_codex_read_only() {
   local task="$1"
-  codex exec -s read-only "$task"
+  codex exec --dangerously-bypass-hook-trust -s read-only "$task"
 }
 
 run_codex_write() {
   local task="$1"
-  codex exec -s workspace-write "$task"
+  codex exec --dangerously-bypass-hook-trust -s workspace-write "$task"
 }
 
 now_ms() {
@@ -782,10 +897,24 @@ NODE
 
 insert_copilot_tool_span() {
   local trace_id="$1" turn_index="$2" start_ms="$3" end_ms="$4" tool_name="$5"
-  node - "$CP_SPAN_DB" "$trace_id" "$turn_index" "$start_ms" "$end_ms" "$tool_name" <<'NODE'
+  local workspace_path="${6:-}" file_path="${7:-}" target_path="${8:-}" destination_path="${9:-}"
+  node - "$CP_SPAN_DB" "$trace_id" "$turn_index" "$start_ms" "$end_ms" "$tool_name" \
+    "$workspace_path" "$file_path" "$target_path" "$destination_path" <<'NODE'
 const { DatabaseSync } = require("node:sqlite");
-const [dbPath, traceId, turnIndexRaw, startMsRaw, endMsRaw, toolName] = process.argv.slice(2);
+const [
+  dbPath,
+  traceId,
+  turnIndexRaw,
+  startMsRaw,
+  endMsRaw,
+  toolName,
+  workspacePath,
+  filePath,
+  targetPath,
+  destinationPath
+] = process.argv.slice(2);
 const db = new DatabaseSync(dbPath);
+const spanId = `${traceId}-tool-${toolName}`;
 db.prepare(`
   INSERT OR REPLACE INTO spans (
     span_id, trace_id, parent_span_id, name, start_time_ms, end_time_ms,
@@ -795,7 +924,7 @@ db.prepare(`
     turn_index, ttft_ms, status_code, status_message
   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `).run(
-  `${traceId}-tool-${toolName}`,
+  spanId,
   traceId,
   `${traceId}-root`,
   `execute_tool ${toolName}`,
@@ -820,6 +949,16 @@ db.prepare(`
   "ok",
   null
 );
+db.prepare("DELETE FROM span_attributes WHERE span_id = ?").run(spanId);
+const insertAttribute = db.prepare("INSERT INTO span_attributes (span_id, key, value) VALUES (?, ?, ?)");
+for (const [key, value] of [
+  ["workspace.path", workspacePath],
+  ["file.path", filePath],
+  ["target.path", targetPath],
+  ["destination.path", destinationPath]
+]) {
+  if (value) insertAttribute.run(spanId, key, value);
+}
 db.close();
 NODE
 }
@@ -885,6 +1024,10 @@ if provider_enabled "github-copilot"; then
   require_command node
   require_node_sqlite
 fi
+if [[ "$DIRECT_AGENT" == "1" ]]; then
+  require_command node
+  [[ -f "$AGENT_ENTRY" ]] || fail "TIRION_TEST_AGENT_ENTRY points to a missing file: $AGENT_ENTRY"
+fi
 if [[ "$START_RECEIVER" != "1" ]]; then
   require_command curl
 fi
@@ -909,8 +1052,7 @@ if provider_enabled "github-copilot"; then
 fi
 pass "test repositories created under $ROOT"
 
-tirionctl stop >/dev/null 2>&1 || true
-tirionctl start
+start_tirion_agent
 tirionctl clear-agent-data --confirm
 tirionctl webhook set-token "$WEBHOOK_TOKEN" >/dev/null
 tirionctl webhook set-secret "$WEBHOOK_SECRET" >/dev/null
@@ -1146,7 +1288,7 @@ upsert_copilot_root_span "$CP_READ_TRACE" 1 "$CP_READ_START_MS" "" "" "" "" ""
 CP_READ_START="$(wait_for_event --arg started "$CP_READ_STARTED_AT" '.eventType == "run.start" and .codingHarness == "github-copilot" and .repository.name == "github-copilot-repo" and .startedAt == $started')"
 assert_run_start_event "$CP_READ_START"
 CP_RUN_RO_ID="$(jq -r '.runId' "$CP_READ_START")"
-insert_copilot_tool_span "$CP_READ_TRACE" 1 "$((CP_READ_START_MS + 100))" "$((CP_READ_START_MS + 180))" "read_file"
+insert_copilot_tool_span "$CP_READ_TRACE" 1 "$((CP_READ_START_MS + 100))" "$((CP_READ_START_MS + 180))" "read_file" "$CP_REPO"
 CP_READ_UPDATE="$(wait_for_event --arg run_id "$CP_RUN_RO_ID" '.eventType == "run.update" and .runId == $run_id and .codingHarness == "github-copilot" and (.activity | length) >= 1')"
 assert_run_update_event "$CP_READ_UPDATE"
 CP_READ_END_MS="$((CP_READ_START_MS + 900))"
@@ -1177,7 +1319,8 @@ perl -0pi -e 's/"mode": "initial"/"mode": "github-copilot"/' config/settings.jso
 grep -q 'return 42;' src/answer.ts || fail "GitHub Copilot replay did not update src/answer.ts"
 grep -q 'github-copilot' config/settings.json || fail "GitHub Copilot replay did not update config/settings.json"
 test -f docs/copilot-notes.md || fail "GitHub Copilot replay did not create docs/copilot-notes.md"
-insert_copilot_tool_span "$CP_WRITE_TRACE" 2 "$((CP_WRITE_START_MS + 100))" "$((CP_WRITE_START_MS + 240))" "apply_patch"
+insert_copilot_tool_span "$CP_WRITE_TRACE" 2 "$((CP_WRITE_START_MS + 100))" "$((CP_WRITE_START_MS + 240))" "apply_patch" \
+  "$CP_REPO" "src/answer.ts" "docs/copilot-notes.md" "config/settings.json"
 CP_WRITE_UPDATE="$(wait_for_event --arg run_id "$CP_RUN_WR_ID" '.eventType == "run.update" and .runId == $run_id and .codingHarness == "github-copilot" and (.activity | length) >= 1')"
 assert_run_update_event "$CP_WRITE_UPDATE"
 CP_WRITE_END_MS="$((CP_WRITE_START_MS + 1200))"
@@ -1218,7 +1361,8 @@ CP_RUN_FEATURE_ID="$(jq -r '.runId' "$CP_FEATURE_START")"
 cat > src/copilot-feature.ts <<'EOF'
 export const copilotFeatureMarker = "feature";
 EOF
-insert_copilot_tool_span "$CP_FEATURE_TRACE" 3 "$((CP_FEATURE_START_MS + 100))" "$((CP_FEATURE_START_MS + 220))" "write_file"
+insert_copilot_tool_span "$CP_FEATURE_TRACE" 3 "$((CP_FEATURE_START_MS + 100))" "$((CP_FEATURE_START_MS + 220))" "write_file" \
+  "$CP_REPO" "src/copilot-feature.ts"
 CP_FEATURE_UPDATE="$(wait_for_event --arg run_id "$CP_RUN_FEATURE_ID" '.eventType == "run.update" and .runId == $run_id and .codingHarness == "github-copilot" and (.activity | length) >= 1')"
 assert_run_update_event "$CP_FEATURE_UPDATE"
 CP_FEATURE_END_MS="$((CP_FEATURE_START_MS + 1100))"
@@ -1263,6 +1407,9 @@ if provider_enabled "claude-code"; then
   assert_json "$CC_RUN_STORY" --arg key "$CC_REPO_KEY" '.repository.repoKey == $key'
   assert_json "$CC_BUG_COMMIT_EV" --arg key "$CC_REPO_KEY" '.repository.repoKey == $key'
   assert_json "$CC_STORY_COMMIT_EV" --arg key "$CC_REPO_KEY" '.repository.repoKey == $key'
+  assert_run_stream_integrity "$CC_RUN_RO" "Claude Code read-only"
+  assert_run_stream_integrity "$CC_RUN_WR" "Claude Code write"
+  assert_run_stream_integrity "$CC_RUN_STORY" "Claude Code Story"
 fi
 if provider_enabled "codex"; then
   assert_json "$CX_RUN_RO" --arg key "$CX_REPO_KEY" '.repository.repoKey == $key'
@@ -1270,6 +1417,9 @@ if provider_enabled "codex"; then
   assert_json "$CX_RUN_FEATURE" --arg key "$CX_REPO_KEY" '.repository.repoKey == $key'
   assert_json "$CX_ISSUE_COMMIT_EV" --arg key "$CX_REPO_KEY" '.repository.repoKey == $key'
   assert_json "$CX_FEATURE_COMMIT_EV" --arg key "$CX_REPO_KEY" '.repository.repoKey == $key'
+  assert_run_stream_integrity "$CX_RUN_RO" "Codex read-only"
+  assert_run_stream_integrity "$CX_RUN_WR" "Codex write"
+  assert_run_stream_integrity "$CX_RUN_FEATURE" "Codex Feature"
 fi
 if provider_enabled "github-copilot"; then
   assert_json "$CP_RUN_RO" --arg key "$CP_REPO_KEY" '.repository.repoKey == $key'
@@ -1277,6 +1427,9 @@ if provider_enabled "github-copilot"; then
   assert_json "$CP_RUN_FEATURE" --arg key "$CP_REPO_KEY" '.repository.repoKey == $key'
   assert_json "$CP_BUG_COMMIT_EV" --arg key "$CP_REPO_KEY" '.repository.repoKey == $key'
   assert_json "$CP_FEATURE_COMMIT_EV" --arg key "$CP_REPO_KEY" '.repository.repoKey == $key'
+  assert_run_stream_integrity "$CP_RUN_RO" "GitHub Copilot read-only"
+  assert_run_stream_integrity "$CP_RUN_WR" "GitHub Copilot write"
+  assert_run_stream_integrity "$CP_RUN_FEATURE" "GitHub Copilot Feature"
 fi
 
 assert_no_orphan_run_lifecycle_subjects

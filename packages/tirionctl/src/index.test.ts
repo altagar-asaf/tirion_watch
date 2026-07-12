@@ -467,7 +467,7 @@ describe("tirionctl", () => {
     });
   });
 
-  it("activates a repository end to end with a single command", async () => {
+  it("activates a Codex repository and reports the pending hook-trust precondition", async () => {
     const { env } = await startAgent();
     const repository = mkdtempSync(join(tmpdir(), "tirionctl-activate-repo-"));
     roots.push(repository);
@@ -480,12 +480,14 @@ describe("tirionctl", () => {
     })).toBe(0);
     const activation = JSON.parse(activated.text());
     expect(activation).toMatchObject({
-      activationState: "ready",
+      activationState: "attention_required",
       provider: "codex",
+      reasonCodes: expect.arrayContaining(["hook_trust_required"]),
       repositoryScope: { kind: "repository", state: "active" },
       sourceStatus: {
         provider: "codex",
-        configurationState: "configured",
+        configurationState: "partial",
+        measurementState: "unavailable",
         ownershipState: "managed_current",
         logsEnabled: true,
         tracesEnabled: true
@@ -837,7 +839,7 @@ describe("tirionctl", () => {
       inspectPackage() {
         return {
           agentVersion: "0.1.7",
-          databaseSchemaVersion: 9,
+          databaseSchemaVersion: 10,
           artifact: {
             packageIdentifier: "dev.tirion.agent",
             signingIdentity: "Developer ID Installer: Tirion",
@@ -845,7 +847,7 @@ describe("tirionctl", () => {
           },
           migrationSupportWindow: {
             minimumDatabaseSchemaVersion: 1,
-            maximumDatabaseSchemaVersion: 9,
+            maximumDatabaseSchemaVersion: 10,
             legacyExtensionHistoryMigration: "unsupported"
           }
         };

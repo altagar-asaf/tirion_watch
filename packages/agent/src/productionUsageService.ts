@@ -1,4 +1,11 @@
-import type { OwnershipState, ProductionRunV1, ProductionTotalsV1, ProductionUsageEpochV1 } from "@tirion/agent-contract";
+import type {
+  OwnershipState,
+  ProductionRunV1,
+  ProductionTotalsV1,
+  ProductionUsageEpochV1,
+  QueryOccurrenceV1,
+  SafeActivityAtomV1
+} from "@tirion/agent-contract";
 import { AgentStorageClient } from "@tirion/agent-storage";
 import { DefaultProductionUsagePipeline } from "@tirion/engine";
 
@@ -38,15 +45,96 @@ export class ProductionUsageService {
       await this.storage.listSafeActivityAtomsSince(projectionStartedAt)
     )
       .filter(isCompletedRun);
-    const byId = new Map(existingRuns
-      .filter(isCompletedRun)
-      .map((run) => [run.runId, run]));
-    for (const run of projected) {
-      byId.set(run.runId, run);
+    await this.storage.upsertProductionRuns(projected);
+    return await this.storage.listProductionRuns();
+  }
+
+  async projectCompletedQuery(owner: OwnershipState, queryId: string): Promise<ProductionRunV1[]> {
+    await this.requireReady(owner);
+    const epoch = await this.storage.productionUsageEpoch();
+    const allOccurrences = await this.storage.listQueryOccurrences();
+    const family = queryOccurrenceFamily(allOccurrences, queryId);
+    if (!family || family.root.startedAt < epoch!.startedAt) {
+      return [];
     }
-    const runs = [...byId.values()].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
-    await this.storage.replaceProductionRuns(runs);
-    return runs;
+    const expanded = await this.expandQueryFamily(family, allOccurrences);
+    const queryIds = expanded.occurrences.map((occurrence) => occurrence.queryId);
+    const projected = this.pipeline.project(
+      await this.storage.listSafeUsageAtomsForQueryIds(queryIds),
+      this.now(),
+      expanded.occurrences,
+      expanded.activities
+    )
+      .filter(isCompletedRun)
+      .filter((run) => (run.queryId ?? run.correlationId) === family.root.queryId);
+    await this.storage.upsertProductionRuns(projected);
+    return projected;
+  }
+
+  private async expandQueryFamily(family: {
+    root: QueryOccurrenceV1;
+    occurrences: QueryOccurrenceV1[];
+  }, allOccurrences: QueryOccurrenceV1[]): Promise<{
+    occurrences: QueryOccurrenceV1[];
+    activities: SafeActivityAtomV1[];
+  }> {
+    const occurrences = new Map(family.occurrences.map((occurrence) => [occurrence.queryId, occurrence]));
+    const sessions = new Set(family.occurrences.map((occurrence) => occurrence.sessionId));
+    const activities = new Map<string, SafeActivityAtomV1>();
+    const queried = new Set<string>();
+    const completedAt = family.root.completedAt;
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const occurrence of allOccurrences) {
+        if (
+          occurrences.has(occurrence.queryId)
+          || occurrence.lifecycleVisibility === "internal"
+          || occurrence.provider !== family.root.provider
+          || !occurrence.parentSessionId
+          || !sessions.has(occurrence.parentSessionId)
+          || occurrence.startedAt < family.root.startedAt
+          || (completedAt != null && occurrence.startedAt > completedAt)
+        ) {
+          continue;
+        }
+        occurrences.set(occurrence.queryId, occurrence);
+        sessions.add(occurrence.sessionId);
+        changed = true;
+      }
+
+      const pendingQueryIds = [...occurrences.keys()].filter((candidate) => !queried.has(candidate));
+      if (pendingQueryIds.length === 0) {
+        continue;
+      }
+      pendingQueryIds.forEach((candidate) => queried.add(candidate));
+      for (const activity of await this.storage.listSafeActivityAtomsForQueryIds(pendingQueryIds)) {
+        activities.set(activity.activityId, activity);
+        if (!activity.childSessionId) {
+          continue;
+        }
+        for (const occurrence of allOccurrences) {
+          if (
+            occurrences.has(occurrence.queryId)
+            || occurrence.lifecycleVisibility === "internal"
+            || occurrence.provider !== family.root.provider
+            || occurrence.sessionId !== activity.childSessionId
+            || occurrence.startedAt < family.root.startedAt
+            || (completedAt != null && occurrence.startedAt > completedAt)
+          ) {
+            continue;
+          }
+          occurrences.set(occurrence.queryId, occurrence);
+          sessions.add(occurrence.sessionId);
+          changed = true;
+        }
+      }
+    }
+    return {
+      occurrences: [...occurrences.values()].sort((left, right) =>
+        left.startedAt.localeCompare(right.startedAt) || left.queryId.localeCompare(right.queryId)),
+      activities: [...activities.values()]
+    };
   }
 
   async runs(owner: OwnershipState, limit?: number): Promise<ProductionRunV1[]> {
@@ -119,6 +207,64 @@ export class ProductionUsageService {
 
 function isCompletedRun(run: ProductionRunV1): boolean {
   return Boolean(run.endedAt && run.endedAt >= run.startedAt);
+}
+
+function queryOccurrenceFamily(
+  occurrences: QueryOccurrenceV1[],
+  queryId: string
+): { root: QueryOccurrenceV1; occurrences: QueryOccurrenceV1[] } | undefined {
+  const target = occurrences.find((occurrence) => occurrence.queryId === queryId);
+  if (!target || target.lifecycleVisibility === "internal") {
+    return undefined;
+  }
+  let root = target;
+  const visited = new Set([root.queryId]);
+  while (root.parentSessionId) {
+    const parent = occurrences
+      .filter((occurrence) =>
+        occurrence.provider === root.provider
+        && occurrence.sessionId === root.parentSessionId
+        && occurrence.startedAt <= root.startedAt
+      )
+      .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+    if (!parent || visited.has(parent.queryId) || parent.lifecycleVisibility === "internal") {
+      if (parent?.lifecycleVisibility === "internal") {
+        return undefined;
+      }
+      break;
+    }
+    root = parent;
+    visited.add(root.queryId);
+  }
+
+  const family = new Map<string, QueryOccurrenceV1>([[root.queryId, root]]);
+  const sessions = new Set([root.sessionId]);
+  const completedAt = root.completedAt ?? target.completedAt;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const occurrence of occurrences) {
+      if (
+        family.has(occurrence.queryId)
+        || occurrence.lifecycleVisibility === "internal"
+        || occurrence.provider !== root.provider
+        || !occurrence.parentSessionId
+        || !sessions.has(occurrence.parentSessionId)
+        || occurrence.startedAt < root.startedAt
+        || (completedAt != null && occurrence.startedAt > completedAt)
+      ) {
+        continue;
+      }
+      family.set(occurrence.queryId, occurrence);
+      sessions.add(occurrence.sessionId);
+      changed = true;
+    }
+  }
+  return {
+    root,
+    occurrences: [...family.values()].sort((left, right) =>
+      left.startedAt.localeCompare(right.startedAt) || left.queryId.localeCompare(right.queryId))
+  };
 }
 
 function productionCsv(runs: ProductionRunV1[]): string {

@@ -20,9 +20,20 @@ import type {
 import type {
   AgentDocument,
   AgentDocumentCollection,
+  AttributionDocumentSanitizationResult,
+  AttributionDocumentSummary,
   EncryptedRepositoryScope,
-  SafeObservationRetentionResult
+  ExecutionNodeRetentionResult,
+  SafeObservationRetentionResult,
+  StorageCompactionResult,
+  WebhookLifecycleDocumentIdentity,
+  WebhookOutboxStatusSnapshot,
+  WorkEpisodeDocumentQuery,
+  WorkspaceEvidenceDocumentQuery
 } from "./index";
+
+const STORAGE_COMPACTION_MIN_FREE_PAGES = 1_024;
+const STORAGE_COMPACTION_MIN_FREE_RATIO = 0.25;
 
 type SqliteDatabase = {
   exec(sql: string): void;
@@ -94,14 +105,20 @@ function handle(command: WorkerCommandName, payload: unknown): unknown {
       );
     case "listSafeUsageAtoms":
       return listSafeUsageAtoms();
+    case "listSafeUsageAtomsForQueryIds":
+      return listSafeUsageAtomsForQueryIds(stringArray(asRecord(payload).queryIds));
     case "listSafeUsageAtomsSince":
       return listSafeUsageAtomsSince(String(asRecord(payload).startedAt));
     case "listSafeActivityAtoms":
       return listSafeActivityAtoms();
+    case "listSafeActivityAtomsForQueryIds":
+      return listSafeActivityAtomsForQueryIds(stringArray(asRecord(payload).queryIds));
     case "listSafeActivityAtomsSince":
       return listSafeActivityAtomsSince(String(asRecord(payload).startedAt));
     case "listQueryOccurrences":
       return listQueryOccurrences();
+    case "readQueryOccurrence":
+      return readQueryOccurrence(String(asRecord(payload).queryId));
     case "listQueryOccurrencesSince":
       return listQueryOccurrencesSince(String(asRecord(payload).startedAt));
     case "applyQueryOccurrenceRetention":
@@ -120,6 +137,8 @@ function handle(command: WorkerCommandName, payload: unknown): unknown {
       return productionUsageEpoch();
     case "replaceProductionRuns":
       return replaceProductionRuns(asProductionRunsInput(payload));
+    case "upsertProductionRuns":
+      return upsertProductionRuns(asProductionRunsInput(payload));
     case "listProductionRuns":
       return listProductionRuns();
     case "clearProductionRuns":
@@ -150,8 +169,42 @@ function handle(command: WorkerCommandName, payload: unknown): unknown {
       return replaceAgentDocuments(asAgentDocumentsInput(payload));
     case "listAgentDocuments":
       return listAgentDocuments(asAgentDocumentCollection(payload));
+    case "listWorkspaceEvidenceDocuments":
+      return listWorkspaceEvidenceDocuments(asWorkspaceEvidenceDocumentQuery(asRecord(payload).query));
+    case "listWorkEpisodeDocuments":
+      return listWorkEpisodeDocuments(asWorkEpisodeDocumentQuery(asRecord(payload).query));
+    case "attributionDocumentSummary":
+      return attributionDocumentSummary();
+    case "sanitizeOversizedAttributionDocuments":
+      return sanitizeOversizedAttributionDocuments(Number(asRecord(payload).maxArtifactStates));
     case "trimAgentDocuments":
       return trimAgentDocuments(asAgentDocumentCollection(payload), Number(asRecord(payload).maxDocuments));
+    case "readAgentDocument":
+      return readAgentDocument(asAgentDocumentCollection(payload), requiredText(asRecord(payload).key));
+    case "listWebhookOutboxDueDocuments":
+      return listWebhookOutboxDueDocuments(
+        String(asRecord(payload).now),
+        asRecord(payload).force === true
+      );
+    case "webhookOutboxStatus":
+      return webhookOutboxStatus();
+    case "listWebhookLifecycleDocuments":
+      return listWebhookLifecycleDocuments(asWebhookLifecycleDocumentIdentity(asRecord(payload).identity));
+    case "listDeliveredWritingLifecycleRunIds":
+      return listDeliveredWritingLifecycleRunIds();
+    case "nextWebhookOutboxAttemptAt":
+      return nextWebhookOutboxAttemptAt();
+    case "listExecutionNodeDocumentsForQuery":
+      return listExecutionNodeDocumentsForQuery(requiredText(asRecord(payload).queryId));
+    case "applyExecutionNodeRetention":
+      return applyExecutionNodeRetention(
+        String(asRecord(payload).retainAfter),
+        Number(asRecord(payload).maxNodes)
+      );
+    case "compactIfFragmented":
+      return compactIfFragmented();
+    case "pruneRepositorySnapshotDocuments":
+      return pruneRepositorySnapshotDocuments(Number(asRecord(payload).maxArtifactStates));
     case "removeAgentDocument":
       return removeAgentDocument(asAgentDocumentCollection(payload), requiredText(asRecord(payload).key));
     case "clearAgentDocuments":
@@ -187,7 +240,7 @@ function initialize(input: InitializeInput): AgentMetadataRow {
   const record: AgentMetadataRow = {
     installationId,
     environmentId,
-    schemaVersion: 9,
+    schemaVersion: 10,
     ownershipState: (existing.ownershipState as OwnershipState | undefined) ?? input.ownershipState,
     protocolVersion: input.protocolVersion,
     createdAt,
@@ -223,7 +276,7 @@ function metadata(): AgentMetadataRow {
   return {
     installationId: record.installationId,
     environmentId: record.environmentId,
-    schemaVersion: Number(record.schemaVersion ?? 9),
+    schemaVersion: Number(record.schemaVersion ?? 10),
     ownershipState: record.ownershipState as OwnershipState,
     protocolVersion: record.protocolVersion ?? "1.0",
     createdAt: record.createdAt ?? record.updatedAt ?? new Date(0).toISOString(),
@@ -290,7 +343,7 @@ function backupTo(path: string): void {
 function migrate(): void {
   const row = database().prepare("PRAGMA user_version").get() as Record<string, unknown> | undefined;
   const current = Number(row ? Object.values(row)[0] : 0);
-  if (current > 9) {
+  if (current > 10) {
     throw new Error("storage_unavailable");
   }
   if (current === 0) {
@@ -458,6 +511,20 @@ function migrate(): void {
       COMMIT;
     `);
   }
+  const afterActivity = afterOccurrences === 8 ? 9 : afterOccurrences;
+  if (afterActivity === 9) {
+    backupBeforeMigration(9);
+    database().exec(`
+      BEGIN IMMEDIATE;
+      CREATE INDEX IF NOT EXISTS safe_usage_atoms_query_id
+        ON safe_usage_atoms (COALESCE(json_extract(atom_json, '$.queryId'), json_extract(atom_json, '$.correlationId')));
+      CREATE INDEX IF NOT EXISTS agent_documents_webhook_outbox_run_id
+        ON agent_documents (json_extract(document_json, '$.event.runId'))
+        WHERE collection = 'webhook_outbox';
+      PRAGMA user_version = 10;
+      COMMIT;
+    `);
+  }
 }
 
 function backupBeforeMigration(fromVersion: number): void {
@@ -567,16 +634,49 @@ function appendSafeObservation(input: ObservationInput): boolean {
 }
 
 function preferredQueryOccurrence(existing: QueryOccurrenceV1 | undefined, incoming: QueryOccurrenceV1): QueryOccurrenceV1 {
-  if (!existing || incoming.promptState === "captured") {
+  if (!existing) {
     return incoming;
   }
-  if (existing.promptState === "captured") {
-    return existing;
-  }
-  if (incoming.promptState === "disabled") {
-    return incoming;
-  }
-  return existing;
+  const preferred = incoming.promptState === "captured"
+    ? incoming
+    : existing.promptState === "captured"
+      ? existing
+      : incoming.promptState === "disabled"
+        ? incoming
+        : existing;
+  const completedAt = [existing.completedAt, incoming.completedAt]
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1);
+  const completionSource = completedAt === incoming.completedAt ? incoming : existing;
+  const evidence = queryOccurrenceEvidencePriority(incoming.evidence) >= queryOccurrenceEvidencePriority(existing.evidence)
+    ? incoming.evidence
+    : existing.evidence;
+  const lifecycleVisibility = existing.lifecycleVisibility === "internal" || incoming.lifecycleVisibility === "internal"
+    ? "internal"
+    : incoming.lifecycleVisibility ?? existing.lifecycleVisibility;
+  return {
+    ...preferred,
+    evidence,
+    ...(lifecycleVisibility ? { lifecycleVisibility } : {}),
+    startedAt: existing.startedAt < incoming.startedAt ? existing.startedAt : incoming.startedAt,
+    ...(incoming.parentSessionId ?? existing.parentSessionId
+      ? { parentSessionId: incoming.parentSessionId ?? existing.parentSessionId }
+      : {}),
+    ...(completedAt ? { completedAt } : {}),
+    ...(completionSource.completionEvidence ? { completionEvidence: completionSource.completionEvidence } : {}),
+    ...(incoming.repositoryKey ?? existing.repositoryKey
+      ? { repositoryKey: incoming.repositoryKey ?? existing.repositoryKey }
+      : {})
+  };
+}
+
+function queryOccurrenceEvidencePriority(evidence: QueryOccurrenceV1["evidence"]): number {
+  if (evidence === "submission_hook") return 5;
+  if (evidence === "provider_root_span") return 4;
+  if (evidence === "provider_prompt_id") return 3;
+  if (evidence === "provider_user_prompt_event" || evidence === "provider_user_message_event") return 2;
+  return 1;
 }
 
 function safeObservationCount(): number {
@@ -623,6 +723,23 @@ function listSafeUsageAtoms(): SafeUsageAtomV1[] {
     .map((row) => JSON.parse(row.atom_json) as SafeUsageAtomV1);
 }
 
+function listSafeUsageAtomsForQueryIds(queryIds: string[]): SafeUsageAtomV1[] {
+  const ids = uniqueNonEmptyStrings(queryIds);
+  if (ids.length === 0) {
+    return [];
+  }
+  const placeholders = ids.map(() => "?").join(", ");
+  return (database().prepare(`
+    SELECT atom_json
+    FROM safe_usage_atoms
+    WHERE COALESCE(
+      json_extract(atom_json, '$.queryId'),
+      json_extract(atom_json, '$.correlationId')
+    ) IN (${placeholders})
+    ORDER BY atom_id
+  `).all(...ids) as { atom_json: string }[]).map((row) => JSON.parse(row.atom_json) as SafeUsageAtomV1);
+}
+
 function listSafeUsageAtomsSince(startedAt: string): SafeUsageAtomV1[] {
   return (database().prepare(`
     SELECT a.atom_json
@@ -638,6 +755,20 @@ function listSafeActivityAtoms(): SafeActivityAtomV1[] {
     .map((row) => JSON.parse(row.atom_json) as SafeActivityAtomV1);
 }
 
+function listSafeActivityAtomsForQueryIds(queryIds: string[]): SafeActivityAtomV1[] {
+  const ids = uniqueNonEmptyStrings(queryIds);
+  if (ids.length === 0) {
+    return [];
+  }
+  const placeholders = ids.map(() => "?").join(", ");
+  return (database().prepare(`
+    SELECT atom_json
+    FROM safe_activity_atoms
+    WHERE json_extract(atom_json, '$.queryId') IN (${placeholders})
+    ORDER BY activity_id
+  `).all(...ids) as { atom_json: string }[]).map((row) => JSON.parse(row.atom_json) as SafeActivityAtomV1);
+}
+
 function listSafeActivityAtomsSince(startedAt: string): SafeActivityAtomV1[] {
   return (database().prepare(`
     SELECT a.atom_json
@@ -651,6 +782,13 @@ function listSafeActivityAtomsSince(startedAt: string): SafeActivityAtomV1[] {
 function listQueryOccurrences(): QueryOccurrenceV1[] {
   return (database().prepare("SELECT occurrence_json FROM query_occurrences ORDER BY started_at, query_id").all() as { occurrence_json: string }[])
     .map((row) => JSON.parse(row.occurrence_json) as QueryOccurrenceV1);
+}
+
+function readQueryOccurrence(queryId: string): QueryOccurrenceV1 | undefined {
+  const row = database().prepare(
+    "SELECT occurrence_json FROM query_occurrences WHERE query_id = ?"
+  ).get(queryId) as { occurrence_json: string } | undefined;
+  return row ? JSON.parse(row.occurrence_json) as QueryOccurrenceV1 : undefined;
 }
 
 function listQueryOccurrencesSince(startedAt: string): QueryOccurrenceV1[] {
@@ -737,6 +875,24 @@ function replaceProductionRuns(input: ProductionRunsInput): void {
   try {
     database().exec("DELETE FROM production_runs");
     const statement = database().prepare("INSERT INTO production_runs (run_id, run_json) VALUES (?, ?)");
+    for (const run of input.runs) {
+      statement.run(run.runId, JSON.stringify(run));
+    }
+    database().exec("COMMIT");
+  } catch (error) {
+    database().exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function upsertProductionRuns(input: ProductionRunsInput): void {
+  database().exec("BEGIN IMMEDIATE");
+  try {
+    const statement = database().prepare(`
+      INSERT INTO production_runs (run_id, run_json)
+      VALUES (?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET run_json = excluded.run_json
+    `);
     for (const run of input.runs) {
       statement.run(run.runId, JSON.stringify(run));
     }
@@ -904,6 +1060,503 @@ function listAgentDocuments(collection: AgentDocumentCollection): AgentDocument[
   }));
 }
 
+function listWorkspaceEvidenceDocuments(query: WorkspaceEvidenceDocumentQuery): AgentDocument[] {
+  const conditions = ["collection = 'workspace_evidence'"];
+  const params: unknown[] = [];
+  if (query.queryId) {
+    conditions.push("json_extract(document_json, '$.queryId') = ?");
+    params.push(query.queryId);
+  }
+  if (query.repoKey) {
+    conditions.push("json_extract(document_json, '$.repoKey') = ?");
+    params.push(query.repoKey);
+  }
+  if (query.status) {
+    conditions.push("json_extract(document_json, '$.status') = ?");
+    params.push(query.status);
+  }
+  return (database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE ${conditions.join(" AND ")}
+    ORDER BY sort_at DESC, document_key
+  `).all(...params) as AgentDocumentRow[]).map(agentDocumentFromRow);
+}
+
+function listWorkEpisodeDocuments(query: WorkEpisodeDocumentQuery): AgentDocument[] {
+  const conditions = ["collection = 'work_episode'"];
+  const params: unknown[] = [];
+  if (query.episodeId) {
+    conditions.push("document_key = ?");
+    params.push(query.episodeId);
+  }
+  if (query.repoKey) {
+    conditions.push(`(
+      json_extract(document_json, '$.repoKey') = ?
+      OR EXISTS (
+        SELECT 1 FROM json_each(document_json, '$.repoKeys')
+        WHERE value = ?
+      )
+    )`);
+    params.push(query.repoKey, query.repoKey);
+  }
+  if (query.commitHash) {
+    conditions.push("json_extract(document_json, '$.claimedByCommitHash') = ?");
+    params.push(query.commitHash);
+  }
+  if (query.status) {
+    conditions.push("json_extract(document_json, '$.status') = ?");
+    params.push(query.status);
+  }
+  if (query.queryId) {
+    conditions.push(`EXISTS (
+      SELECT 1 FROM json_each(document_json, '$.queryIds')
+      WHERE value = ?
+    )`);
+    params.push(query.queryId);
+  }
+  if (query.runId) {
+    conditions.push(`EXISTS (
+      SELECT 1 FROM json_each(document_json, '$.runIds')
+      WHERE value = ?
+    )`);
+    params.push(query.runId);
+  }
+  if (query.chatSessionId) {
+    conditions.push("json_extract(document_json, '$.chatSessionId') = ?");
+    params.push(query.chatSessionId);
+  }
+  if (query.range) {
+    conditions.push("sort_at >= ? AND sort_at <= ?");
+    params.push(query.range.from, query.range.to);
+  }
+  const limit = query.limit == null ? "" : " LIMIT ?";
+  if (query.limit != null) {
+    params.push(query.limit);
+  }
+  return (database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE ${conditions.join(" AND ")}
+    ORDER BY sort_at DESC, document_key${limit}
+  `).all(...params) as AgentDocumentRow[]).map(agentDocumentFromRow);
+}
+
+function attributionDocumentSummary(): AttributionDocumentSummary {
+  const workspaceRows = database().prepare(`
+    SELECT COALESCE(json_extract(document_json, '$.status'), 'unknown') AS status, COUNT(*) AS count
+    FROM agent_documents
+    WHERE collection = 'workspace_evidence'
+    GROUP BY status
+  `).all() as { status: string; count: number }[];
+  const episodeRows = database().prepare(`
+    SELECT COALESCE(json_extract(document_json, '$.status'), 'unknown') AS status, COUNT(*) AS count
+    FROM agent_documents
+    WHERE collection = 'work_episode'
+    GROUP BY status
+  `).all() as { status: string; count: number }[];
+  const unbound = database().prepare(`
+    SELECT COUNT(*) AS count
+    FROM agent_documents
+    WHERE collection = 'work_episode'
+      AND json_extract(document_json, '$.repoKey') IS NULL
+      AND COALESCE(json_array_length(document_json, '$.repoKeys'), 0) = 0
+  `).get() as { count: number };
+  const toCounts = (rows: { status: string; count: number }[]): Record<string, number> =>
+    Object.fromEntries(rows.map((row) => [row.status, Number(row.count)]));
+  const workspaceEvidence = toCounts(workspaceRows);
+  const workEpisodes = toCounts(episodeRows);
+  return {
+    workspaceEvidence: {
+      totalCount: Object.values(workspaceEvidence).reduce((total, count) => total + count, 0),
+      statusCounts: workspaceEvidence
+    },
+    workEpisodes: {
+      totalCount: Object.values(workEpisodes).reduce((total, count) => total + count, 0),
+      statusCounts: workEpisodes,
+      unboundCount: Number(unbound.count)
+    }
+  };
+}
+
+function sanitizeOversizedAttributionDocuments(maxArtifactStates: number): AttributionDocumentSanitizationResult {
+  if (!Number.isSafeInteger(maxArtifactStates) || maxArtifactStates < 0) {
+    throw new Error("invalid_request");
+  }
+  const workspaceRows = database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE collection = 'workspace_evidence'
+  `).all() as AgentDocumentRow[];
+  const episodeRows = database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE collection = 'work_episode'
+  `).all() as AgentDocumentRow[];
+  let workspaceEvidenceSanitized = 0;
+  let workEpisodesSanitized = 0;
+  database().exec("BEGIN IMMEDIATE");
+  try {
+    const update = database().prepare(`
+      UPDATE agent_documents
+      SET document_json = ?
+      WHERE collection = ? AND document_key = ?
+    `);
+    for (const row of workspaceRows) {
+      const value = JSON.parse(row.document_json);
+      const sanitized = sanitizeOversizedEvidence(value, maxArtifactStates);
+      if (!sanitized.changed) {
+        continue;
+      }
+      update.run(JSON.stringify(sanitized.value), "workspace_evidence", row.document_key);
+      workspaceEvidenceSanitized += 1;
+    }
+    for (const row of episodeRows) {
+      const episode = JSON.parse(row.document_json);
+      if (!isRecord(episode) || !Array.isArray(episode.evidence)) {
+        continue;
+      }
+      let changed = false;
+      const evidence = episode.evidence.map((item: unknown) => {
+        const sanitized = sanitizeOversizedEvidence(item, maxArtifactStates);
+        changed ||= sanitized.changed;
+        return sanitized.value;
+      });
+      if (!changed) {
+        continue;
+      }
+      update.run(JSON.stringify({ ...episode, evidence }), "work_episode", row.document_key);
+      workEpisodesSanitized += 1;
+    }
+    database().exec("COMMIT");
+  } catch (error) {
+    database().exec("ROLLBACK");
+    throw error;
+  }
+  return { workspaceEvidenceSanitized, workEpisodesSanitized };
+}
+
+function sanitizeOversizedEvidence(value: unknown, maxArtifactStates: number): { changed: boolean; value: unknown } {
+  if (!isRecord(value)) {
+    return { changed: false, value };
+  }
+  const artifactStates = Array.isArray(value.artifactStates) ? value.artifactStates : [];
+  const baselineArtifactStates = Array.isArray(value.baselineArtifactStates) ? value.baselineArtifactStates : [];
+  if (artifactStates.length <= maxArtifactStates && baselineArtifactStates.length <= maxArtifactStates) {
+    return { changed: false, value };
+  }
+  const baselineReasons = uniqueNonEmptyStrings([
+    ...(Array.isArray(value.baselineReasons) ? value.baselineReasons.filter((item): item is string => typeof item === "string") : []),
+    "artifact_state_coverage_partial"
+  ]);
+  return {
+    changed: true,
+    value: {
+      ...value,
+      baselineTrusted: false,
+      baselineReasons,
+      baselineArtifactStates: [],
+      artifactStates: [],
+      artifactKeys: [],
+      causalArtifactKeys: [],
+      observedChangeCount: 0,
+      addedLines: 0,
+      deletedLines: 0
+    }
+  };
+}
+
+function readAgentDocument(collection: AgentDocumentCollection, key: string): AgentDocument | undefined {
+  const row = database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE collection = ? AND document_key = ?
+  `).get(collection, key) as AgentDocumentRow | undefined;
+  return row ? agentDocumentFromRow(row) : undefined;
+}
+
+function listWebhookOutboxDueDocuments(now: string, force: boolean): AgentDocument[] {
+  const rows = force
+    ? database().prepare(`
+      SELECT document_key, sort_at, document_json
+      FROM agent_documents
+      WHERE collection = 'webhook_outbox'
+        AND (
+          (
+            json_extract(document_json, '$.deliveryState') = 'pending'
+            AND (
+              json_extract(document_json, '$.nextAttemptAt') IS NULL
+              OR json_extract(document_json, '$.nextAttemptAt') <= ?
+            )
+          )
+          OR json_extract(document_json, '$.deliveryState') IN ('retry', 'blocked')
+        )
+      ORDER BY sort_at ASC, document_key ASC
+    `).all(now) as AgentDocumentRow[]
+    : database().prepare(`
+      SELECT document_key, sort_at, document_json
+      FROM agent_documents
+      WHERE collection = 'webhook_outbox'
+        AND json_extract(document_json, '$.deliveryState') IN ('pending', 'retry')
+        AND (
+          json_extract(document_json, '$.nextAttemptAt') IS NULL
+          OR json_extract(document_json, '$.nextAttemptAt') <= ?
+        )
+      ORDER BY sort_at ASC, document_key ASC
+    `).all(now) as AgentDocumentRow[];
+  return rows.map(agentDocumentFromRow);
+}
+
+function webhookOutboxStatus(): WebhookOutboxStatusSnapshot {
+  const totals = database().prepare(`
+    SELECT
+      SUM(CASE WHEN json_extract(document_json, '$.deliveryState') = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+      SUM(CASE WHEN json_extract(document_json, '$.deliveryState') = 'retry' THEN 1 ELSE 0 END) AS retry_count,
+      SUM(CASE WHEN json_extract(document_json, '$.deliveryState') = 'blocked' THEN 1 ELSE 0 END) AS blocked_count,
+      SUM(CASE WHEN json_extract(document_json, '$.deliveryState') = 'delivered' THEN 1 ELSE 0 END) AS delivered_count,
+      MIN(CASE
+        WHEN json_extract(document_json, '$.deliveryState') IN ('pending', 'retry')
+        THEN json_extract(document_json, '$.queuedAt')
+      END) AS oldest_queued_at,
+      MAX(CASE
+        WHEN json_extract(document_json, '$.deliveryState') = 'delivered'
+        THEN COALESCE(json_extract(document_json, '$.deliveredAt'), json_extract(document_json, '$.updatedAt'))
+      END) AS last_delivered_at
+    FROM agent_documents
+    WHERE collection = 'webhook_outbox'
+  `).get() as {
+    pending_count?: unknown;
+    retry_count?: unknown;
+    blocked_count?: unknown;
+    delivered_count?: unknown;
+    oldest_queued_at?: unknown;
+    last_delivered_at?: unknown;
+  };
+  const latestError = database().prepare(`
+    SELECT json_extract(document_json, '$.lastErrorCode') AS last_error_code
+    FROM agent_documents
+    WHERE collection = 'webhook_outbox'
+      AND json_extract(document_json, '$.lastErrorCode') IS NOT NULL
+    ORDER BY sort_at DESC, document_key DESC
+    LIMIT 1
+  `).get() as { last_error_code?: unknown } | undefined;
+  const activeEntries = (database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE collection = 'webhook_outbox'
+      AND json_extract(document_json, '$.deliveryState') IN ('pending', 'retry', 'blocked')
+    ORDER BY sort_at ASC, document_key ASC
+  `).all() as AgentDocumentRow[]).map(agentDocumentFromRow);
+  return {
+    pendingCount: Number(totals.pending_count ?? 0),
+    retryCount: Number(totals.retry_count ?? 0),
+    blockedCount: Number(totals.blocked_count ?? 0),
+    deliveredCount: Number(totals.delivered_count ?? 0),
+    ...(typeof totals.oldest_queued_at === "string" ? { oldestQueuedAt: totals.oldest_queued_at } : {}),
+    ...(typeof totals.last_delivered_at === "string" ? { lastDeliveredAt: totals.last_delivered_at } : {}),
+    ...(typeof latestError?.last_error_code === "string" ? { lastErrorCode: latestError.last_error_code } : {}),
+    activeEntries
+  };
+}
+
+function listWebhookLifecycleDocuments(identity: WebhookLifecycleDocumentIdentity): AgentDocument[] {
+  const matches: string[] = [];
+  const params: unknown[] = [];
+  if (identity.runId) {
+    matches.push("json_extract(document_json, '$.event.runId') = ?");
+    params.push(identity.runId);
+  }
+  if (identity.traceId) {
+    matches.push(`EXISTS (
+      SELECT 1 FROM json_each(document_json, '$.event.traceIds')
+      WHERE value = ?
+    )`);
+    params.push(identity.traceId);
+  }
+  if (identity.sessionId) {
+    matches.push("json_extract(document_json, '$.event.sessionId') = ?");
+    params.push(identity.sessionId);
+  }
+  if (matches.length === 0) {
+    return [];
+  }
+  return (database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE collection = 'webhook_outbox'
+      AND json_extract(document_json, '$.event.eventType') IN ('run.start', 'run.update', 'run.ended')
+      AND (${matches.join(" OR ")})
+    ORDER BY sort_at ASC, document_key ASC
+  `).all(...params) as AgentDocumentRow[]).map(agentDocumentFromRow);
+}
+
+function listDeliveredWritingLifecycleRunIds(): string[] {
+  const rows = database().prepare(`
+    SELECT DISTINCT run_id
+    FROM (
+      SELECT substr(document_key, length('run.ended:') + 1) AS run_id
+      FROM agent_documents
+      WHERE collection = 'webhook_delivery_state'
+        AND json_extract(document_json, '$.eventType') = 'run.ended'
+        AND json_extract(document_json, '$.deliveredAt') IS NOT NULL
+        AND COALESCE(json_extract(document_json, '$.filesChangedCount'), 0) > 0
+      UNION
+      SELECT json_extract(outbox.document_json, '$.event.runId') AS run_id
+      FROM agent_documents outbox
+      WHERE outbox.collection = 'webhook_outbox'
+        AND json_extract(outbox.document_json, '$.event.eventType') = 'run.ended'
+        AND (
+          json_extract(outbox.document_json, '$.deliveryState') = 'delivered'
+          OR json_extract(outbox.document_json, '$.deliveredAt') IS NOT NULL
+        )
+        AND COALESCE(json_array_length(outbox.document_json, '$.event.filesChanged'), 0) > 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM agent_documents state
+          WHERE state.collection = 'webhook_delivery_state'
+            AND state.document_key = 'run.ended:' || json_extract(outbox.document_json, '$.event.runId')
+            AND json_extract(state.document_json, '$.eventType') = 'run.ended'
+            AND json_extract(state.document_json, '$.deliveredAt') IS NOT NULL
+            AND COALESCE(json_extract(state.document_json, '$.filesChangedCount'), 0) = 0
+        )
+    )
+    WHERE run_id IS NOT NULL AND run_id <> ''
+  `).all() as { run_id?: unknown }[];
+  return rows
+    .map((row) => row.run_id)
+    .filter((runId): runId is string => typeof runId === "string" && runId.length > 0)
+    .sort();
+}
+
+function nextWebhookOutboxAttemptAt(): string | undefined {
+  const row = database().prepare(`
+    SELECT MIN(json_extract(document_json, '$.nextAttemptAt')) AS next_attempt_at
+    FROM agent_documents
+    WHERE collection = 'webhook_outbox'
+      AND json_extract(document_json, '$.deliveryState') IN ('pending', 'retry')
+      AND json_extract(document_json, '$.nextAttemptAt') IS NOT NULL
+  `).get() as { next_attempt_at?: unknown } | undefined;
+  return typeof row?.next_attempt_at === "string" ? row.next_attempt_at : undefined;
+}
+
+function listExecutionNodeDocumentsForQuery(queryId: string): AgentDocument[] {
+  return (database().prepare(`
+    SELECT document_key, sort_at, document_json
+    FROM agent_documents
+    WHERE collection = 'execution_node_atom'
+      AND json_extract(document_json, '$.queryId') = ?
+    ORDER BY sort_at ASC, document_key ASC
+  `).all(queryId) as AgentDocumentRow[]).map(agentDocumentFromRow);
+}
+
+function applyExecutionNodeRetention(retainAfter: string, maxNodes: number): ExecutionNodeRetentionResult {
+  if (!Number.isSafeInteger(maxNodes) || maxNodes <= 0) {
+    throw new Error("invalid_request");
+  }
+  database().exec("BEGIN IMMEDIATE");
+  try {
+    const byAge = database().prepare(`
+      DELETE FROM agent_documents
+      WHERE collection = 'execution_node_atom' AND sort_at < ?
+    `).run(retainAfter) as { changes?: number };
+    const retainedBeforeOverflow = executionNodeDocumentCount();
+    const overflow = Math.max(0, retainedBeforeOverflow - maxNodes);
+    if (overflow > 0) {
+      database().prepare(`
+        DELETE FROM agent_documents
+        WHERE rowid IN (
+          SELECT rowid
+          FROM agent_documents
+          WHERE collection = 'execution_node_atom'
+          ORDER BY sort_at DESC, document_key DESC
+          LIMIT -1 OFFSET ?
+        )
+      `).run(maxNodes);
+    }
+    database().exec("COMMIT");
+    return {
+      removedByAge: Number(byAge.changes ?? 0),
+      removedByOverflow: overflow,
+      retainedCount: executionNodeDocumentCount()
+    };
+  } catch (error) {
+    database().exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function compactIfFragmented(): StorageCompactionResult {
+  const before = databasePageCounts();
+  const materiallyFragmented = before.freePageCount >= STORAGE_COMPACTION_MIN_FREE_PAGES
+    && before.freePageCount / Math.max(1, before.pageCount) >= STORAGE_COMPACTION_MIN_FREE_RATIO;
+  if (!materiallyFragmented) {
+    return {
+      compacted: false,
+      pageCountBefore: before.pageCount,
+      freePageCountBefore: before.freePageCount,
+      pageCountAfter: before.pageCount,
+      freePageCountAfter: before.freePageCount
+    };
+  }
+  try {
+    database().exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+  } catch {
+    return {
+      compacted: false,
+      pageCountBefore: before.pageCount,
+      freePageCountBefore: before.freePageCount,
+      pageCountAfter: before.pageCount,
+      freePageCountAfter: before.freePageCount
+    };
+  }
+  const after = databasePageCounts();
+  return {
+    compacted: true,
+    pageCountBefore: before.pageCount,
+    freePageCountBefore: before.freePageCount,
+    pageCountAfter: after.pageCount,
+    freePageCountAfter: after.freePageCount
+  };
+}
+
+function pruneRepositorySnapshotDocuments(maxArtifactStates: number): number {
+  if (!Number.isSafeInteger(maxArtifactStates) || maxArtifactStates < 0) {
+    throw new Error("invalid_request");
+  }
+  const result = database().prepare(`
+    DELETE FROM agent_documents
+    WHERE collection = 'repository_snapshot'
+      AND COALESCE(json_array_length(document_json, '$.artifactStates'), 0) > ?
+  `).run(maxArtifactStates) as { changes?: number };
+  return Number(result.changes ?? 0);
+}
+
+function executionNodeDocumentCount(): number {
+  const row = database().prepare(`
+    SELECT COUNT(*) AS count
+    FROM agent_documents
+    WHERE collection = 'execution_node_atom'
+  `).get() as { count: number };
+  return Number(row.count);
+}
+
+function databasePageCounts(): { pageCount: number; freePageCount: number } {
+  const pageCount = database().prepare("PRAGMA page_count").get() as { page_count?: unknown };
+  const freePageCount = database().prepare("PRAGMA freelist_count").get() as { freelist_count?: unknown };
+  return {
+    pageCount: Number(pageCount.page_count ?? 0),
+    freePageCount: Number(freePageCount.freelist_count ?? 0)
+  };
+}
+
+function agentDocumentFromRow(row: AgentDocumentRow): AgentDocument {
+  return {
+    key: row.document_key,
+    sortAt: row.sort_at,
+    value: JSON.parse(row.document_json)
+  };
+}
+
 function trimAgentDocuments(collection: AgentDocumentCollection, maxDocuments: number): number {
   if (!Number.isSafeInteger(maxDocuments) || maxDocuments <= 0) {
     throw new Error("invalid_request");
@@ -1021,6 +1674,67 @@ function requiredText(value: unknown): string {
     throw new Error("invalid_request");
   }
   return value;
+}
+
+function optionalText(value: unknown): string | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  return requiredText(value);
+}
+
+function stringArray(value: unknown): string[] {
+  return uniqueNonEmptyStrings(asArray(value).map(requiredText));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function uniqueNonEmptyStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim() !== ""))].sort();
+}
+
+function asWorkspaceEvidenceDocumentQuery(value: unknown): WorkspaceEvidenceDocumentQuery {
+  const record = asRecord(value);
+  return {
+    ...(optionalText(record.queryId) ? { queryId: optionalText(record.queryId) } : {}),
+    ...(optionalText(record.repoKey) ? { repoKey: optionalText(record.repoKey) } : {}),
+    ...(optionalText(record.status) ? { status: optionalText(record.status) } : {})
+  };
+}
+
+function asWorkEpisodeDocumentQuery(value: unknown): WorkEpisodeDocumentQuery {
+  const record = asRecord(value);
+  const range = record.range == null ? undefined : asRecord(record.range);
+  const limit = record.limit == null ? undefined : Number(record.limit);
+  if (limit != null && (!Number.isSafeInteger(limit) || limit < 0 || limit > 10_000)) {
+    throw new Error("invalid_request");
+  }
+  return {
+    ...(optionalText(record.episodeId) ? { episodeId: optionalText(record.episodeId) } : {}),
+    ...(optionalText(record.repoKey) ? { repoKey: optionalText(record.repoKey) } : {}),
+    ...(optionalText(record.commitHash) ? { commitHash: optionalText(record.commitHash) } : {}),
+    ...(optionalText(record.status) ? { status: optionalText(record.status) } : {}),
+    ...(optionalText(record.queryId) ? { queryId: optionalText(record.queryId) } : {}),
+    ...(optionalText(record.runId) ? { runId: optionalText(record.runId) } : {}),
+    ...(optionalText(record.chatSessionId) ? { chatSessionId: optionalText(record.chatSessionId) } : {}),
+    ...(range ? { range: { from: requiredText(range.from), to: requiredText(range.to) } } : {}),
+    ...(limit != null ? { limit } : {})
+  };
+}
+
+function asWebhookLifecycleDocumentIdentity(value: unknown): WebhookLifecycleDocumentIdentity {
+  const record = asRecord(value);
+  const identity = {
+    ...(optionalText(record.runId) ? { runId: optionalText(record.runId) } : {}),
+    ...(optionalText(record.traceId) ? { traceId: optionalText(record.traceId) } : {}),
+    ...(optionalText(record.sessionId) ? { sessionId: optionalText(record.sessionId) } : {})
+  };
+  if (Object.keys(identity).length === 0) {
+    throw new Error("invalid_request");
+  }
+  return identity;
 }
 
 function asInitializeInput(value: unknown): InitializeInput {
@@ -1155,10 +1869,13 @@ type WorkerCommandName =
   | "safeObservationCount"
   | "applySafeObservationRetention"
   | "listSafeUsageAtoms"
+  | "listSafeUsageAtomsForQueryIds"
   | "listSafeUsageAtomsSince"
   | "listSafeActivityAtoms"
+  | "listSafeActivityAtomsForQueryIds"
   | "listSafeActivityAtomsSince"
   | "listQueryOccurrences"
+  | "readQueryOccurrence"
   | "listQueryOccurrencesSince"
   | "applyQueryOccurrenceRetention"
   | "clearQueryOccurrences"
@@ -1168,6 +1885,7 @@ type WorkerCommandName =
   | "beginProductionUsageEpoch"
   | "productionUsageEpoch"
   | "replaceProductionRuns"
+  | "upsertProductionRuns"
   | "listProductionRuns"
   | "clearProductionRuns"
   | "upsertRepositoryScope"
@@ -1183,7 +1901,21 @@ type WorkerCommandName =
   | "upsertAgentDocument"
   | "replaceAgentDocuments"
   | "listAgentDocuments"
+  | "listWorkspaceEvidenceDocuments"
+  | "listWorkEpisodeDocuments"
+  | "attributionDocumentSummary"
+  | "sanitizeOversizedAttributionDocuments"
   | "trimAgentDocuments"
+  | "readAgentDocument"
+  | "listWebhookOutboxDueDocuments"
+  | "webhookOutboxStatus"
+  | "listWebhookLifecycleDocuments"
+  | "listDeliveredWritingLifecycleRunIds"
+  | "nextWebhookOutboxAttemptAt"
+  | "listExecutionNodeDocumentsForQuery"
+  | "applyExecutionNodeRetention"
+  | "compactIfFragmented"
+  | "pruneRepositorySnapshotDocuments"
   | "removeAgentDocument"
   | "clearAgentDocuments"
   | "clearAllAgentData"

@@ -144,6 +144,70 @@ describe("CopilotSpanDbIngress", () => {
     ));
   });
 
+  it("preserves successful Copilot tool status and attaches only opaque causal artifact evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-copilot-span-db-write-"));
+    roots.push(root);
+    const dbPath = join(root, "agent-traces.db");
+    createSpanDb(dbPath);
+
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.sqlite3") });
+    storages.push(storage);
+    await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+
+    const accepted: SafeObservationV1[] = [];
+    const resolverCalls: Array<{ workspacePath: string; artifactPaths: string[] }> = [];
+    const ingress = new CopilotSpanDbIngress(
+      storage,
+      "env_test",
+      () => new Date("2026-06-08T00:00:03.000Z"),
+      async (observation) => {
+        accepted.push(observation);
+      },
+      undefined,
+      async (workspacePath, artifactPaths) => {
+        resolverCalls.push({ workspacePath, artifactPaths });
+        return {
+          repositoryKey: "repo_opaque",
+          artifactKeys: ["artifact_a", "artifact_b", "artifact_c"]
+        };
+      }
+    );
+    ingresses.push(ingress);
+    await ingress.configure({
+      schemaVersion: 1,
+      enabled: true,
+      spanDbPath: dbPath,
+      captureContent: false,
+      dbSpanExporter: true
+    });
+
+    await sleep(1_100);
+    appendCopilotWriteToolSpan(dbPath);
+
+    await waitUntil(async () => accepted.length > 0);
+    expect(resolverCalls).toEqual([{
+      workspacePath: "/workspace/copilot-repo",
+      artifactPaths: ["src/answer.ts", "docs/copilot-notes.md", "config/settings.json"]
+    }]);
+    const writeObservation = accepted.find((observation) => observation.repositoryKey === "repo_opaque");
+    expect(writeObservation).toMatchObject({
+      repositoryKey: "repo_opaque",
+      executionNodes: [expect.objectContaining({
+        nodeKind: "tool",
+        outcome: "success",
+        repositoryKey: "repo_opaque",
+        artifactKeys: ["artifact_a", "artifact_b", "artifact_c"],
+        artifactEvidence: "provider_tool_event"
+      })]
+    });
+    expect(JSON.stringify(writeObservation)).not.toContain("/workspace/copilot-repo");
+    expect(JSON.stringify(writeObservation)).not.toContain("src/answer.ts");
+  });
+
   it("reports missing span DBs without leaking absolute paths", async () => {
     const root = mkdtempSync(join(tmpdir(), "tirion-copilot-span-db-missing-"));
     roots.push(root);
@@ -307,6 +371,54 @@ function appendCopilotInFlightRootSpan(dbPath: string): void {
     null,
     null
   );
+  db.close();
+}
+
+function appendCopilotWriteToolSpan(dbPath: string): void {
+  const db = newDatabase(dbPath);
+  db.prepare(`
+    INSERT INTO spans (
+      span_id, trace_id, parent_span_id, name, start_time_ms, end_time_ms,
+      operation_name, provider_name, agent_name, conversation_id,
+      request_model, response_model, input_tokens, output_tokens, cached_tokens,
+      reasoning_tokens, tool_name, tool_call_id, tool_type, chat_session_id,
+      turn_index, ttft_ms, status_code, status_message
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "span_write_tool",
+    "trace_copilot_write",
+    "span_write_root",
+    "execute_tool apply_patch",
+    1_780_099_201_100,
+    1_780_099_201_240,
+    "execute_tool",
+    "github-copilot",
+    "GitHub Copilot Chat",
+    "conversation-write",
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    "apply_patch",
+    "tool-call-write",
+    "tool",
+    "chat-session-write",
+    2,
+    null,
+    "ok",
+    null
+  );
+  const insertAttribute = db.prepare("INSERT INTO span_attributes (span_id, key, value) VALUES (?, ?, ?)");
+  for (const [key, value] of [
+    ["workspace.path", "/workspace/copilot-repo"],
+    ["file.path", "src/answer.ts"],
+    ["target.path", "docs/copilot-notes.md"],
+    ["destination.path", "config/settings.json"]
+  ]) {
+    insertAttribute.run("span_write_tool", key, value);
+  }
   db.close();
 }
 
