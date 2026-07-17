@@ -80,10 +80,12 @@ export async function runTirionCtl(argv: string[], io: CliIo = defaultIo()): Pro
         io.stdout.write(`${JSON.stringify(await agentRequest(io, "GET", "/v1/diagnostics", undefined, bootstrap(io)))}\n`);
         return 0;
       case "logs":
-        io.stdout.write(`${JSON.stringify(await agentRequest(io, "GET", `/v1/logs${limitQuery(rest)}`, undefined, bootstrap(io)))}\n`);
+        io.stdout.write(`${JSON.stringify(await agentRequest(io, "GET", `/v1/logs${diagnosticLogQuery(rest)}`, undefined, bootstrap(io)))}\n`);
         return 0;
       case "budget":
         return await budget(rest, io);
+      case "runtime":
+        return await runtime(rest, io);
       case "service":
         return service(rest, io);
       case "start":
@@ -208,6 +210,30 @@ async function budget(args: string[], io: CliIo): Promise<number> {
     return 0;
   }
   io.stderr.write("Use 'tirionctl budget status' or 'tirionctl budget set' with all threshold options.\n");
+  return 2;
+}
+
+async function runtime(args: string[], io: CliIo): Promise<number> {
+  const [subcommand] = args;
+  if (subcommand === "quiesce") {
+    const suppliedTimeout = args.includes("--timeout-ms");
+    const timeoutMs = suppliedTimeout ? optionInteger(args, "--timeout-ms") : 60_000;
+    if (
+      !((args.length === 1) || (args.length === 3 && args[1] === "--timeout-ms"))
+      || timeoutMs == null
+      || timeoutMs < 100
+      || timeoutMs > 120_000
+    ) {
+      io.stderr.write("Use 'tirionctl runtime quiesce [--timeout-ms 100..120000]'.\n");
+      return 2;
+    }
+    io.stdout.write(`${JSON.stringify(await agentRequest(io, "POST", "/v1/runtime/quiesce", {
+      schemaVersion: 1,
+      timeoutMs
+    }, bootstrap(io)))}\n`);
+    return 0;
+  }
+  io.stderr.write("Use 'tirionctl runtime quiesce [--timeout-ms 100..120000]'.\n");
   return 2;
 }
 
@@ -1766,6 +1792,59 @@ function limitQuery(args: string[]): string {
   return raw ? `?limit=${encodeURIComponent(raw)}` : "";
 }
 
+function diagnosticLogQuery(args: string[]): string {
+  const supported = new Set(["--limit", "--since", "--until"]);
+  const options = new Map<string, string>();
+  for (let index = 0; index < args.length; index += 2) {
+    const name = args[index];
+    const value = args[index + 1];
+    if (!supported.has(name) || options.has(name) || !value || value.startsWith("--")) {
+      throw new Error("invalid_request");
+    }
+    options.set(name, value);
+  }
+  const rawLimit = options.get("--limit");
+  if (rawLimit != null) {
+    const limit = Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1000) {
+      throw new Error("invalid_request");
+    }
+  }
+  const since = diagnosticUtcBound(options.get("--since"));
+  const until = diagnosticUtcBound(options.get("--until"));
+  if (since && until && since > until) {
+    throw new Error("invalid_request");
+  }
+  const parameters = new URLSearchParams();
+  if (rawLimit) {
+    parameters.set("limit", rawLimit);
+  }
+  if (since) {
+    parameters.set("since", since);
+  }
+  if (until) {
+    parameters.set("until", until);
+  }
+  const query = parameters.toString();
+  return query ? `?${query}` : "";
+}
+
+function diagnosticUtcBound(raw: string | undefined): string | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/.exec(raw);
+  if (!match) {
+    throw new Error("invalid_request");
+  }
+  const normalized = `${match[1]}.${(match[2] ?? "").padEnd(3, "0")}Z`;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== normalized) {
+    throw new Error("invalid_request");
+  }
+  return normalized;
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1807,7 +1886,7 @@ function helpText(): string {
     "  health",
     "  doctor",
     "  diagnostics",
-    "  logs [--limit N]",
+    "  logs [--limit N] [--since ISO-UTC] [--until ISO-UTC]",
     "  support-bundle",
     "  app",
     "  version",
@@ -1828,6 +1907,7 @@ function helpText(): string {
     "  report [--output <path>]",
     "  budget status",
     "  budget set --run-tokens N --run-estimated-nano-usd N --daily-estimated-nano-usd N --monthly-estimated-nano-usd N",
+    "  runtime quiesce [--timeout-ms 100..120000]",
     "  runs [--current] [--limit N] | totals | export [--csv]",
     "  clear-history",
     "  clear-agent-data --confirm",

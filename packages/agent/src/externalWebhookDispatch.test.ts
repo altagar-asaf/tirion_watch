@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -6,8 +7,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   CommitAttributedWebhookEventV1,
+  ExecutionNodeAtomV1,
   ProductionRunV1,
+  QueryOccurrenceV1,
   RunEndedWebhookEventV1,
+  RunStartedWebhookEventV1,
+  RunUpdatedWebhookEventV1,
   SafeObservationV1
 } from "@tirion/agent-contract";
 import { AgentStorageClient } from "@tirion/agent-storage";
@@ -185,25 +190,47 @@ describe("external webhook dispatch", () => {
     servers.push(server);
     const address = server.address() as AddressInfo;
 
-    const run = productionRun({
-      runId: "run_changed",
-      queryId: "qry_changed",
-      correlationId: "trace_changed",
-      provider: "codex",
-      runtime: "codex",
-      inputTokens: 25,
-      outputTokens: 4,
-      totalTokens: 29,
-      estimatedNanoUsd: 122_500,
-      usageValueNanoUsd: 122_500,
-      costEstimateBasis: "catalog_estimate",
-      startedAt: "2026-06-08T00:00:01.000Z",
-      endedAt: "2026-06-08T00:00:02.000Z",
-      models: ["gpt-5.4"]
-    });
+    const run: ProductionRunV1 = {
+      ...productionRun({
+        runId: "run_changed",
+        queryId: "qry_changed",
+        correlationId: "trace_changed",
+        provider: "codex",
+        runtime: "codex",
+        inputTokens: 25,
+        outputTokens: 4,
+        totalTokens: 29,
+        estimatedNanoUsd: 122_500,
+        usageValueNanoUsd: 122_500,
+        costEstimateBasis: "catalog_estimate",
+        completionEvidence: "stop_hook",
+        completionOutcome: "failure",
+        startedAt: "2026-06-08T00:00:01.000Z",
+        endedAt: "2026-06-08T00:00:02.000Z",
+        models: ["gpt-5.4"]
+      }),
+      breakdown: [{
+        schemaVersion: 1,
+        breakdownId: "brk_changed_write",
+        kind: "tool",
+        name: "Write",
+        count: 1,
+        failureCount: 0,
+        totalDurationMs: 1,
+        attributionBasis: "activity_only",
+        coverage: "unavailable"
+      }]
+    };
     const { service } = await testService({
       attribution: {
-        listWorkEpisodes: async () => [workEpisode("run_changed", "qry_changed", ["artifact_src"], "repo_tirion")]
+        listWorkEpisodes: async () => [workEpisode(
+          "run_changed",
+          "qry_changed",
+          ["artifact_src"],
+          "repo_tirion",
+          undefined,
+          successfulWriteArtifactProofs("qry_changed", "repo_tirion", ["artifact_src"])
+        )]
       },
       repositories: {
         relativePaths: () => ["src/index.ts"],
@@ -289,6 +316,7 @@ describe("external webhook dispatch", () => {
       estimatedNanoUsd: 122_500,
       usageValueNanoUsd: 122_500,
       costEstimateBasis: "catalog_estimate",
+      outcome: "failure",
       state: "completed"
     });
     const payload = JSON.stringify(received.map((item) => item.body));
@@ -348,6 +376,872 @@ describe("external webhook dispatch", () => {
 
     expect(received.find((event) => (event as { eventType?: string }).eventType === "run.ended"))
       .toMatchObject({ filesChanged: [] });
+  });
+
+  it("does not publish initial terminal files from a causal artifact without a successful semantic write", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const run: ProductionRunV1 = {
+      ...productionRun({
+        runId: "run_causal_read_only",
+        queryId: "qry_causal_read_only",
+        correlationId: "trace_causal_read_only",
+        provider: "claude-code",
+        runtime: "claude-code",
+        inputTokens: 4,
+        outputTokens: 1,
+        totalTokens: 5,
+        startedAt: "2026-07-14T08:30:00.000Z",
+        endedAt: "2026-07-14T08:30:01.000Z"
+      }),
+      breakdown: [{
+        schemaVersion: 1,
+        breakdownId: "brk_causal_read_only",
+        kind: "tool",
+        name: "Read",
+        count: 1,
+        failureCount: 0,
+        totalDurationMs: 1,
+        attributionBasis: "activity_only",
+        coverage: "unavailable"
+      }]
+    };
+    const { service } = await testService({
+      attribution: {
+        listWorkEpisodes: async () => [workEpisode(
+          run.runId,
+          run.queryId!,
+          ["artifact_causal_read"],
+          "repo_tirion"
+        )]
+      },
+      repositories: {
+        relativePaths: () => ["src/should-not-publish.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      timing: { runEndedGraceMs: 1 }
+    });
+
+    await service.start();
+    startedServices.push(service);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeCompletedRuns([run]);
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
+
+    expect(received.find((event) => (event as { eventType?: string }).eventType === "run.ended"))
+      .toMatchObject({
+        runId: run.runId,
+        filesChanged: []
+      });
+  });
+
+  it("does not let an unrelated completed write publish a rejected artifact", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const run: ProductionRunV1 = {
+      ...productionRun({
+        runId: "run_mixed_completed_write_evidence",
+        queryId: "qry_mixed_completed_write_evidence",
+        correlationId: "trace_mixed_completed_write_evidence",
+        provider: "claude-code",
+        runtime: "claude-code",
+        inputTokens: 4,
+        outputTokens: 1,
+        totalTokens: 5,
+        startedAt: "2026-07-14T09:00:00.000Z",
+        endedAt: "2026-07-14T09:00:01.000Z"
+      }),
+      breakdown: [{
+        schemaVersion: 1,
+        breakdownId: "brk_mixed_completed_successful_write",
+        kind: "tool",
+        name: "Write",
+        count: 1,
+        failureCount: 0,
+        totalDurationMs: 1,
+        attributionBasis: "activity_only",
+        coverage: "unavailable"
+      }, {
+        schemaVersion: 1,
+        breakdownId: "brk_mixed_completed_rejected_edit",
+        kind: "tool",
+        name: "Edit",
+        count: 1,
+        failureCount: 1,
+        rejectedCount: 1,
+        totalDurationMs: 1,
+        attributionBasis: "activity_only",
+        coverage: "unavailable"
+      }]
+    };
+    const { service } = await testService({
+      attribution: {
+        listWorkEpisodes: async () => [workEpisode(
+          run.runId,
+          run.queryId!,
+          ["artifact_rejected_edit"],
+          "repo_tirion",
+          []
+        )]
+      },
+      repositories: {
+        relativePaths: () => ["src/rejected-edit.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      timing: { runEndedGraceMs: 1 }
+    });
+
+    await service.start();
+    startedServices.push(service);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeCompletedRuns([run]);
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
+
+    expect(received.find((event) => (event as { eventType?: string }).eventType === "run.ended"))
+      .toMatchObject({
+        runId: run.runId,
+        filesChanged: []
+      });
+  });
+
+  it("retains a successful live Write artifact when same-name live activity is unknown without publishing the rejected artifact", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_mixed_live_write_evidence";
+    const sessionId = "ses_mixed_live_write_evidence";
+    const startedAt = "2026-07-14T09:30:00.000Z";
+    const completedAt = "2026-07-14T09:30:02.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_mixed_live", root: "/tmp/mixed-live" }],
+        relativePaths: (_repoKey, artifactKeys) => artifactKeys.map((artifactKey) => ({
+          artifact_successful_live_write: "src/successful-live-write.ts",
+          artifact_rejected_live_write: "src/rejected-live-write.ts"
+        }[artifactKey] ?? artifactKey))
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    now += 1;
+    const successfulWrite = liveToolObservation(queryId, sessionId, new Date(now).toISOString());
+    await service.observeSafeObservation({
+      ...successfulWrite,
+      observationId: "obs_mixed_live_write_evidence",
+      activityAtoms: [{
+        ...successfulWrite.activityAtoms![0],
+        activityId: "act_mixed_live_successful_write",
+        name: "Write",
+        outcome: "unknown"
+      }, {
+        ...successfulWrite.activityAtoms![0],
+        activityId: "act_mixed_live_rejected_write",
+        name: "Write",
+        outcome: "rejected"
+      }],
+      executionNodes: [{
+        ...successfulWrite.executionNodes![0],
+        nodeId: "node_mixed_live_successful_write",
+        name: "Write",
+        toolName: "Write",
+        outcome: "success",
+        artifactKeys: ["artifact_successful_live_write"]
+      }, {
+        ...successfulWrite.executionNodes![0],
+        nodeId: "node_mixed_live_rejected_write",
+        requestId: "req_mixed_live_rejected_write",
+        name: "Write",
+        toolName: "Write",
+        outcome: "rejected",
+        artifactKeys: ["artifact_rejected_live_write"]
+      }]
+    });
+
+    now = Date.parse(completedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
+
+    expect(received.find((event) => (event as { eventType?: string }).eventType === "run.ended"))
+      .toMatchObject({
+        runId: expect.stringMatching(/^run_/),
+        filesChanged: ["src/successful-live-write.ts"],
+        activity: expect.arrayContaining([
+          expect.objectContaining({ name: "Write", outcome: "unknown", count: 1 })
+        ])
+      });
+  });
+
+  it("fails closed for an exact native Claude decision received before a live terminal", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_preterminal";
+    const sessionId = "ses_native_preterminal";
+    const startedAt = "2026-07-14T13:00:00.000Z";
+    const completedAt = "2026-07-14T13:00:02.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_native_preterminal", root: "/tmp/native-preterminal" }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:00:01.000Z",
+      invocationId: "invocation_native_preterminal",
+      activityRequestId: "req_activity_native_preterminal",
+      nodeRequestId: "req_hook_native_preterminal",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:00:01.100Z",
+      invocationId: "invocation_native_preterminal",
+      activityRequestId: "req_activity_native_preterminal",
+      nodeRequestId: "req_otlp_native_preterminal"
+    }));
+    now = Date.parse(completedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    const terminal = received.find((event) => event.eventType === "run.ended") as {
+      filesChanged: string[];
+      activity: Array<{ activityId: string; kind: string; name: string; outcome: string }>;
+    };
+    expect(terminal.filesChanged).toEqual([]);
+    expect(terminal.activity.filter((activity) => activity.kind === "tool")).toEqual([
+      expect.objectContaining({ name: "Write", outcome: "rejected" })
+    ]);
+  });
+
+  it("replaces a queued live terminal's exact conflicted file and activity before its first delivery", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_queued_correction";
+    const sessionId = "ses_native_queued_correction";
+    const startedAt = "2026-07-14T13:10:00.000Z";
+    const completedAt = "2026-07-14T13:10:02.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_native_queued", root: "/tmp/native-queued" }],
+        relativePaths: (_repoKey, artifactKeys) => artifactKeys.map((artifactKey) => ({
+          artifact_rejected: "src/rejected.ts",
+          artifact_independent: "src/independent.ts"
+        }[artifactKey] ?? artifactKey))
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 10_000 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:10:01.000Z",
+      invocationId: "invocation_native_queued_rejected",
+      activityRequestId: "req_activity_native_queued_rejected",
+      nodeRequestId: "req_hook_native_queued_rejected",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:10:01.200Z",
+      invocationId: "invocation_native_queued_independent",
+      activityRequestId: "req_activity_native_queued_independent",
+      nodeRequestId: "req_hook_native_queued_independent",
+      artifactKeys: ["artifact_independent"]
+    }));
+    now = Date.parse(completedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    expect(received.some((event) => event.eventType === "run.ended")).toBe(false);
+
+    now += 1;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: completedAt,
+      invocationId: "invocation_native_queued_rejected",
+      activityRequestId: "req_activity_native_queued_rejected",
+      nodeRequestId: "req_otlp_native_queued_rejected"
+    }));
+    now += 10_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    const terminal = received.find((event) => event.eventType === "run.ended") as {
+      version: number;
+      filesChanged: string[];
+      activity: Array<{ kind: string; name: string; outcome: string }>;
+    };
+    expect(terminal.version).toBe(1);
+    expect(terminal.filesChanged).toEqual(["src/independent.ts"]);
+    expect(terminal.activity.filter((activity) => activity.kind === "tool")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "Write", outcome: "rejected" }),
+      expect.objectContaining({ name: "Write", outcome: "success" })
+    ]));
+    expect(terminal.activity.filter((activity) => activity.kind === "tool" && activity.outcome === "success")).toHaveLength(1);
+  });
+
+  it("keeps a queued live terminal unchanged when an exact native Claude decision begins after its completion boundary", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_queued_post_boundary";
+    const sessionId = "ses_native_queued_post_boundary";
+    const startedAt = "2026-07-14T13:15:00.000Z";
+    const completedAt = "2026-07-14T13:15:02.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_native_queued_post_boundary", root: "/tmp/native-queued-post-boundary" }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 10_000 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:15:01.000Z",
+      invocationId: "invocation_native_queued_post_boundary",
+      activityRequestId: "req_activity_native_queued_post_boundary",
+      nodeRequestId: "req_hook_native_queued_post_boundary",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    now = Date.parse(completedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    expect(received.some((event) => event.eventType === "run.ended")).toBe(false);
+
+    // The decision reaches the agent before V1's delivery deadline, but its
+    // provider-side event began after the completed run's source boundary.
+    now += 1_000;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: new Date(Date.parse(completedAt) + 1).toISOString(),
+      invocationId: "invocation_native_queued_post_boundary",
+      activityRequestId: "req_activity_native_queued_post_boundary",
+      nodeRequestId: "req_otlp_native_queued_post_boundary"
+    }));
+    now += 10_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    const terminals = received.filter((event) => event.eventType === "run.ended") as Array<{
+      version: number;
+      filesChanged: string[];
+      activity: Array<{ kind: string; name: string; outcome: string }>;
+    }>;
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      version: 1,
+      filesChanged: ["src/rejected.ts"]
+    });
+    expect(terminals[0]!.activity.filter((activity) => activity.kind === "tool")).toEqual([
+      expect.objectContaining({ name: "Write", outcome: "success" })
+    ]);
+  });
+
+  it("does not widen a queued live terminal's native correction boundary with a later duplicate completion", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_queued_duplicate_boundary";
+    const sessionId = "ses_native_queued_duplicate_boundary";
+    const startedAt = "2026-07-14T13:16:00.000Z";
+    const earlyCompletedAt = "2026-07-14T13:16:02.000Z";
+    const replayedCompletedAt = "2026-07-14T13:16:04.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_native_queued_duplicate_boundary",
+          root: "/tmp/native-queued-duplicate-boundary"
+        }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 10_000 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:16:01.000Z",
+      invocationId: "invocation_native_queued_duplicate_boundary",
+      activityRequestId: "req_activity_native_queued_duplicate_boundary",
+      nodeRequestId: "req_hook_native_queued_duplicate_boundary",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    now = Date.parse(earlyCompletedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, earlyCompletedAt, "stop_hook"));
+    expect(received.some((event) => event.eventType === "run.ended")).toBe(false);
+
+    // The replay has a later terminal timestamp and stronger outcome meaning,
+    // but the same opaque query. It may refine public lifecycle meaning, never
+    // the source-time correction window.
+    now = Date.parse(replayedCompletedAt);
+    await service.observeSafeObservation({
+      ...liveCompletionObservation(prompt, replayedCompletedAt, "stop_hook", "failure"),
+      observationId: "obs_live_duplicate_completion_boundary"
+    });
+    now += 1_000;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: "2026-07-14T13:16:03.000Z",
+      invocationId: "invocation_native_queued_duplicate_boundary",
+      activityRequestId: "req_activity_native_queued_duplicate_boundary",
+      nodeRequestId: "req_otlp_native_queued_duplicate_boundary"
+    }));
+    now += 10_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    const terminals = received.filter((event) => event.eventType === "run.ended") as Array<{
+      version: number;
+      filesChanged: string[];
+      activity: Array<{ kind: string; name: string; outcome: string }>;
+      outcome?: string;
+      endedAt: string;
+    }>;
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      version: 1,
+      endedAt: replayedCompletedAt,
+      outcome: "failure",
+      filesChanged: ["src/rejected.ts"]
+    });
+    expect(terminals[0]!.activity.filter((activity) => activity.kind === "tool")).toEqual([
+      expect.objectContaining({ name: "Write", outcome: "success" })
+    ]);
+  });
+
+  it("keeps a queued live terminal unchanged when an exact native Claude decision has a malformed source start", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_queued_malformed_start";
+    const sessionId = "ses_native_queued_malformed_start";
+    const startedAt = "2026-07-14T13:17:00.000Z";
+    const completedAt = "2026-07-14T13:17:02.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_native_queued_malformed_start", root: "/tmp/native-queued-malformed-start" }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 10_000 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:17:01.000Z",
+      invocationId: "invocation_native_queued_malformed_start",
+      activityRequestId: "req_activity_native_queued_malformed_start",
+      nodeRequestId: "req_hook_native_queued_malformed_start",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    now = Date.parse(completedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    expect(received.some((event) => event.eventType === "run.ended")).toBe(false);
+
+    // A valid post-terminal arrival/end must not rehabilitate a malformed
+    // source start by canonicalizing it to the run's initial timestamp.
+    now += 1_000;
+    const observedAt = new Date(now).toISOString();
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt,
+      startedAt: "not-a-timestamp",
+      endedAt: observedAt,
+      invocationId: "invocation_native_queued_malformed_start",
+      activityRequestId: "req_activity_native_queued_malformed_start",
+      nodeRequestId: "req_otlp_native_queued_malformed_start"
+    }));
+    now += 10_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    const terminals = received.filter((event) => event.eventType === "run.ended") as Array<{
+      version: number;
+      filesChanged: string[];
+      activity: Array<{ kind: string; name: string; outcome: string }>;
+    }>;
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      version: 1,
+      filesChanged: ["src/rejected.ts"]
+    });
+    expect(terminals[0]!.activity.filter((activity) => activity.kind === "tool")).toEqual([
+      expect.objectContaining({ name: "Write", outcome: "success" })
+    ]);
+  });
+
+  it("issues a higher live terminal correction after delivery without dropping an unrelated Write", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_delivered_correction";
+    const sessionId = "ses_native_delivered_correction";
+    const startedAt = "2026-07-14T13:20:00.000Z";
+    const completedAt = "2026-07-14T13:20:02.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_native_delivered", root: "/tmp/native-delivered" }],
+        relativePaths: (_repoKey, artifactKeys) => artifactKeys.map((artifactKey) => ({
+          artifact_rejected: "src/rejected.ts",
+          artifact_independent: "src/independent.ts"
+        }[artifactKey] ?? artifactKey))
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:20:01.000Z",
+      invocationId: "invocation_native_delivered_rejected",
+      activityRequestId: "req_activity_native_delivered_rejected",
+      nodeRequestId: "req_hook_native_delivered_rejected",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:20:01.200Z",
+      invocationId: "invocation_native_delivered_independent",
+      activityRequestId: "req_activity_native_delivered_independent",
+      nodeRequestId: "req_hook_native_delivered_independent",
+      artifactKeys: ["artifact_independent"]
+    }));
+    now = Date.parse(completedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    // A provider may reuse a request ID for another tool use. Its native
+    // decision must not retract this completed Write or create a V2 terminal
+    // when the opaque invocation identity differs.
+    now += 1;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: completedAt,
+      invocationId: "invocation_native_delivered_different_tool_use",
+      activityRequestId: "req_activity_native_delivered_rejected",
+      nodeRequestId: "req_otlp_native_delivered_different_tool_use"
+    }));
+    await service.retryNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(received.filter((event) => event.eventType === "run.ended")).toHaveLength(1);
+
+    now += 1;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: completedAt,
+      invocationId: "invocation_native_delivered_rejected",
+      activityRequestId: "req_activity_native_delivered_rejected",
+      nodeRequestId: "req_otlp_native_delivered_rejected"
+    }));
+    await waitUntil(() => received.filter((event) => event.eventType === "run.ended").length === 2);
+
+    const terminals = received
+      .filter((event) => event.eventType === "run.ended")
+      .map((event) => event as {
+        version: number;
+        filesChanged: string[];
+        activity: Array<{ kind: string; name: string; outcome: string }>;
+      });
+    expect(terminals[0]).toMatchObject({
+      version: 1,
+      filesChanged: ["src/independent.ts", "src/rejected.ts"]
+    });
+    expect(terminals[1]).toMatchObject({
+      version: 2,
+      filesChanged: ["src/independent.ts"]
+    });
+    const correctedTools = terminals[1]!.activity.filter((activity) => activity.kind === "tool");
+    expect(correctedTools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "Write", outcome: "rejected" }),
+      expect.objectContaining({ name: "Write", outcome: "success" })
+    ]));
+    expect(correctedTools.filter((activity) => activity.outcome === "success")).toHaveLength(1);
+  });
+
+  it("does not issue a correction for a delivered terminal when an exact native Claude decision begins after its completion boundary", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_delivered_post_boundary";
+    const sessionId = "ses_native_delivered_post_boundary";
+    const startedAt = "2026-07-14T13:25:00.000Z";
+    const completedAt = "2026-07-14T13:25:02.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_native_delivered_post_boundary", root: "/tmp/native-delivered-post-boundary" }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:25:01.000Z",
+      invocationId: "invocation_native_delivered_post_boundary",
+      activityRequestId: "req_activity_native_delivered_post_boundary",
+      nodeRequestId: "req_hook_native_delivered_post_boundary",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    now = Date.parse(completedAt);
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    // Arrival is later than V1, and the matching opaque invocation makes this
+    // a boundary test rather than an identity-mismatch test.
+    now += 1;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: new Date(Date.parse(completedAt) + 1).toISOString(),
+      invocationId: "invocation_native_delivered_post_boundary",
+      activityRequestId: "req_activity_native_delivered_post_boundary",
+      nodeRequestId: "req_otlp_native_delivered_post_boundary"
+    }));
+    await service.retryNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const terminals = received.filter((event) => event.eventType === "run.ended") as Array<{
+      version: number;
+      filesChanged: string[];
+      activity: Array<{ kind: string; name: string; outcome: string }>;
+    }>;
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      version: 1,
+      filesChanged: ["src/rejected.ts"]
+    });
+    expect(terminals[0]!.activity.filter((activity) => activity.kind === "tool")).toEqual([
+      expect.objectContaining({ name: "Write", outcome: "success" })
+    ]);
+  });
+
+  it("narrows a delivered terminal's native correction boundary when an earlier completion arrives late", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_native_delivered_earlier_boundary";
+    const sessionId = "ses_native_delivered_earlier_boundary";
+    const startedAt = "2026-07-14T13:27:00.000Z";
+    const earlierCompletedAt = "2026-07-14T13:27:02.000Z";
+    const initiallyRetainedCompletedAt = "2026-07-14T13:27:04.000Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_native_delivered_earlier_boundary",
+          root: "/tmp/native-delivered-earlier-boundary"
+        }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-14T13:27:01.000Z",
+      invocationId: "invocation_native_delivered_earlier_boundary",
+      activityRequestId: "req_activity_native_delivered_earlier_boundary",
+      nodeRequestId: "req_hook_native_delivered_earlier_boundary",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    now = Date.parse(initiallyRetainedCompletedAt);
+    await service.observeSafeObservation(
+      liveCompletionObservation(prompt, initiallyRetainedCompletedAt, "stop_hook")
+    );
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    // This delayed provider receipt is older than V1's original terminal
+    // anchor. It cannot rewrite V1, but it must narrow future correction
+    // authority before a later decision is evaluated.
+    now += 1;
+    await service.observeSafeObservation({
+      ...liveCompletionObservation(prompt, earlierCompletedAt, "stop_hook"),
+      observationId: "obs_live_delivered_earlier_completion",
+      observedAt: new Date(now).toISOString()
+    });
+    now += 1;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId,
+      sessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: "2026-07-14T13:27:03.000Z",
+      invocationId: "invocation_native_delivered_earlier_boundary",
+      activityRequestId: "req_activity_native_delivered_earlier_boundary",
+      nodeRequestId: "req_otlp_native_delivered_earlier_boundary"
+    }));
+    await service.retryNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const terminals = received.filter((event) => event.eventType === "run.ended") as Array<{
+      version: number;
+      filesChanged: string[];
+      activity: Array<{ kind: string; name: string; outcome: string }>;
+    }>;
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      version: 1,
+      filesChanged: ["src/rejected.ts"]
+    });
+    expect(terminals[0]!.activity.filter((activity) => activity.kind === "tool")).toEqual([
+      expect.objectContaining({ name: "Write", outcome: "success" })
+    ]);
   });
 
   it("publishes terminal activity counts and conserves unattributed token usage", async () => {
@@ -787,6 +1681,295 @@ describe("external webhook dispatch", () => {
       .toEqual(expect.arrayContaining(["run.update"]));
   });
 
+  it("requires a Claude submission hook before publishing a stable live run-start", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_claude_hook_authority";
+    const sessionId = "ses_claude_hook_authority";
+    const providerPromptAt = "2026-07-12T17:22:00.000Z";
+    const providerEventAt = "2026-07-12T17:22:01.000Z";
+    const submissionHookAt = "2026-07-12T17:22:02.000Z";
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_claude_hook_authority", root: "/tmp/claude-hook-authority" }]
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    for (const [index, [observedAt, evidence]] of ([
+      [providerPromptAt, "provider_prompt_id"],
+      [providerEventAt, "provider_user_prompt_event"]
+    ] as const).entries()) {
+      const providerObservation = livePromptObservation(queryId, sessionId, observedAt);
+      await service.observeSafeObservation({
+        ...providerObservation,
+        observationId: `obs_claude_provider_prompt_${index}`,
+        sourceId: "otlp_claude_code_logs",
+        profileVersion: "claude-code-otel-logs-v1",
+        queryOccurrences: providerObservation.queryOccurrences?.map((occurrence) => ({
+          ...occurrence,
+          evidence
+        }))
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(received).toEqual([]);
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0, deliveredCount: 0 });
+
+    await service.observeSafeObservation(livePromptObservation(queryId, sessionId, submissionHookAt));
+    await waitUntil(() => received.some((event) => event.eventType === "run.start"));
+
+    const delayedEarlierProviderEvidence = livePromptObservation(queryId, sessionId, providerPromptAt);
+    await service.observeSafeObservation({
+      ...delayedEarlierProviderEvidence,
+      observationId: "obs_claude_provider_prompt_delayed",
+      sourceId: "otlp_claude_code_logs",
+      profileVersion: "claude-code-otel-logs-v1",
+      queryOccurrences: delayedEarlierProviderEvidence.queryOccurrences?.map((occurrence) => ({
+        ...occurrence,
+        evidence: "provider_prompt_id"
+      }))
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(received).toEqual([
+      expect.objectContaining({
+        eventType: "run.start",
+        runId: "run_claude_hook_authority",
+        sessionId,
+        startedAt: submissionHookAt,
+        updatedAt: submissionHookAt,
+        evidence: expect.objectContaining({
+          basis: "prompt_hook",
+          observedAt: submissionHookAt
+        })
+      })
+    ]);
+  });
+
+  it("corrects a trace-before-log auxiliary title update and keeps the terminal customer-only", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_claude_auxiliary_title";
+    const sessionId = "ses_claude_auxiliary_title";
+    const startedAt = "2026-07-12T10:00:00.000Z";
+    const usageAt = "2026-07-12T10:00:01.000Z";
+    const completedAt = "2026-07-12T10:00:02.000Z";
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_claude_auxiliary_title", root: "/tmp/claude-auxiliary-title" }]
+      },
+      now: () => Date.parse("2026-07-12T10:00:03.000Z"),
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    const prompt = livePromptObservation(queryId, sessionId, startedAt);
+    await service.observeSafeObservation(prompt);
+    await waitUntil(() => received.some((event) => event.eventType === "run.start"));
+
+    const sources: Array<{
+      id: string;
+      requestId: string;
+      model: string;
+      inputTokens: number;
+      outputTokens: number;
+    }> = [{
+      id: "customer",
+      requestId: "req_customer",
+      model: "claude-sonnet-5",
+      inputTokens: 100,
+      outputTokens: 20
+    }, {
+      id: "unclassified",
+      requestId: "req_unclassified",
+      model: "claude-opus-4.1",
+      inputTokens: 30,
+      outputTokens: 4
+    }, {
+      id: "auxiliary_title",
+      requestId: "req_auxiliary_title",
+      model: "claude-haiku-4-5-20251001",
+      inputTokens: 1_000,
+      outputTokens: 100
+    }, {
+      id: "auxiliary_title_untagged_copy",
+      requestId: "req_auxiliary_title",
+      model: "claude-haiku-4-5-20251001",
+      inputTokens: 1_000,
+      outputTokens: 100
+    }];
+    const usageObservation = {
+      schemaVersion: 1,
+      observationId: "obs_claude_auxiliary_title_usage",
+      sourceId: "otlp_claude_code_traces",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "traces",
+      profileVersion: "claude-code-enhanced-traces-beta-v1",
+      resourceCount: 1,
+      recordCount: sources.length * 2,
+      observedAt: usageAt,
+      usageAtoms: sources.map((source) => ({
+        schemaVersion: 1,
+        atomId: `atom_${source.id}`,
+        correlationId: queryId,
+        queryId,
+        sessionId,
+        requestId: source.requestId,
+        signal: "traces",
+        sourceId: "otlp_claude_code_traces",
+        profileVersion: "claude-code-enhanced-traces-beta-v1",
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        billingContext: "anthropic-direct",
+        model: source.model,
+        modelProvider: "anthropic",
+        modelProviderBasis: "model_name_rule",
+        inputTokens: source.inputTokens,
+        outputTokens: source.outputTokens,
+        startedAt: usageAt,
+        endedAt: usageAt,
+      })),
+      executionNodes: sources.map((source) => ({
+        schemaVersion: 1,
+        nodeId: `node_${source.id}`,
+        queryId,
+        sessionId,
+        requestId: source.requestId,
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "traces",
+        nodeKind: "llm_request",
+        name: source.model,
+        outcome: "success",
+        startedAt: usageAt,
+        endedAt: usageAt,
+        model: source.model,
+        inputTokens: source.inputTokens,
+        outputTokens: source.outputTokens,
+      }))
+    } as SafeObservationV1;
+    await service.observeSafeObservation(usageObservation);
+    await waitUntil(() => received.some((event) => event.eventType === "run.update"));
+
+    const firstUpdate = received.find((event) => event.eventType === "run.update")!;
+    expect(firstUpdate.llmModels).toContain("claude-haiku-4-5-20251001");
+    expect(firstUpdate.traceIds).toContain("req_auxiliary_title");
+
+    const auxiliaryMarkerObservation: SafeObservationV1 = {
+      schemaVersion: 1,
+      observationId: "obs_claude_auxiliary_title_log_marker",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "claude-code-enhanced-logs-beta-v1",
+      resourceCount: 1,
+      recordCount: 2,
+      observedAt: "2026-07-12T10:00:01.100Z",
+      usageAtoms: [{
+        schemaVersion: 1,
+        atomId: "atom_auxiliary_title_log_marker",
+        correlationId: queryId,
+        queryId,
+        sessionId,
+        requestId: "req_auxiliary_title",
+        signal: "logs",
+        sourceId: "otlp_claude_code_logs",
+        profileVersion: "claude-code-enhanced-logs-beta-v1",
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        usagePurpose: "auxiliary_session_title",
+        model: "claude-haiku-4-5-20251001",
+        modelProvider: "anthropic",
+        modelProviderBasis: "model_name_rule",
+        inputTokens: 1_000,
+        outputTokens: 100,
+        startedAt: usageAt,
+        endedAt: usageAt
+      }],
+      executionNodes: [{
+        schemaVersion: 1,
+        nodeId: "node_auxiliary_title_log_marker",
+        queryId,
+        sessionId,
+        requestId: "req_auxiliary_title",
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "logs",
+        nodeKind: "llm_request",
+        name: "claude-haiku-4-5-20251001",
+        outcome: "success",
+        usagePurpose: "auxiliary_session_title",
+        startedAt: usageAt,
+        endedAt: usageAt,
+        model: "claude-haiku-4-5-20251001",
+        inputTokens: 1_000,
+        outputTokens: 100
+      }]
+    };
+    await service.observeSafeObservation(auxiliaryMarkerObservation);
+    await waitUntil(() => received.filter((event) => event.eventType === "run.update").length >= 2);
+
+    await service.observeSafeObservation(liveCompletionObservation(prompt, completedAt, "stop_hook"));
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    const start = received.find((event) => event.eventType === "run.start")!;
+    const update = received.filter((event) => event.eventType === "run.update").at(-1)!;
+    const ended = received.find((event) => event.eventType === "run.ended")!;
+    for (const event of [update, ended]) {
+      expect(event).toMatchObject({
+        inputTokens: 130,
+        outputTokens: 24,
+        totalTokens: 154,
+        estimatedNanoUsd: 1_150_000,
+        usageValueNanoUsd: 1_150_000,
+        costEstimateBasis: "catalog_estimate",
+        costCoverage: "complete",
+        activity: [expect.objectContaining({
+          kind: "llm_request",
+          count: 2,
+          inputTokens: 130,
+          outputTokens: 24,
+          totalTokens: 154
+        })]
+      });
+      expect(event.llmModels).toEqual(expect.arrayContaining(["claude-sonnet-5", "claude-opus-4.1"]));
+      expect(event.llmModels).toHaveLength(2);
+      expect(event.traceIds).not.toContain("req_auxiliary_title");
+      const activity = event.activity as Array<Record<string, number>>;
+      expect(activity.reduce((sum, item) => sum + (item.inputTokens ?? 0), 0)).toBe(event.inputTokens);
+      expect(activity.reduce((sum, item) => sum + (item.outputTokens ?? 0), 0)).toBe(event.outputTokens);
+    }
+    const lifecycle = JSON.stringify([start, update, ended]);
+    expect(lifecycle).not.toContain("auxiliary_session_title");
+    expect(lifecycle).not.toContain("claude-haiku-4-5-20251001");
+    expect(lifecycle).not.toContain("atom_auxiliary_title");
+    expect(lifecycle).not.toContain("node_auxiliary_title");
+    expect(lifecycle).not.toContain("req_auxiliary_title");
+  });
+
   it("wakes deferred run-ended delivery at the terminal deadline", async () => {
     const received: unknown[] = [];
     const diagnostics: DiagnosticEvent[] = [];
@@ -1059,6 +2242,797 @@ describe("external webhook dispatch", () => {
       .toMatchObject({ totalTokens: 51_097 });
   });
 
+  it("suppresses a stale running snapshot after a published settling high-water", async () => {
+    const diagnostics: DiagnosticEvent[] = [];
+    const received: RunUpdatedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunUpdatedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    let now = Date.parse("2026-07-12T18:19:10.000Z");
+    const { service } = await testService({
+      now: () => now,
+      recordEvent: (event) => diagnostics.push(event),
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_cc06_settling_high_water";
+    const settling = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_settling_997",
+      state: "settling",
+      updatedAt: "2026-07-12T18:19:09.000Z",
+      inputTokens: 900,
+      outputTokens: 97
+    });
+    await internals.queueEvent(settling, `run.update:${runId}`);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 1);
+
+    now += 1_000;
+    const stale = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_stale_running_54",
+      state: "running",
+      updatedAt: "2026-07-12T18:19:10.000Z",
+      inputTokens: 50,
+      outputTokens: 4
+    });
+    await expect(internals.queueEvent(stale, `run.update:${runId}`)).resolves.toBe(false);
+    await internals.processDueEntries();
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ state: "settling", totalTokens: 997 });
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        construct: "ExternalWebhookDispatch",
+        operation: "queue",
+        state: "suppressed",
+        reason: "run_update_dominated_by_published_high_water",
+        runId
+      })
+    ]));
+  });
+
+  it("reconstructs the published update high-water after dispatch restart", async () => {
+    const received: RunUpdatedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunUpdatedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    let now = Date.parse("2026-07-12T18:19:20.000Z");
+    const { service, storage, root } = await testService({
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const original = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_cc06_restarted_high_water";
+    await original.queueEvent(runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_restarted_settling_997",
+      state: "settling",
+      updatedAt: "2026-07-12T18:19:19.000Z",
+      inputTokens: 900,
+      outputTokens: 97
+    }), `run.update:${runId}`);
+    await original.processDueEntries();
+    await waitUntil(() => received.length === 1);
+
+    await storage.close();
+    const originalStorageIndex = storages.indexOf(storage);
+    if (originalStorageIndex >= 0) {
+      storages.splice(originalStorageIndex, 1);
+    }
+    const restartedStorage = serviceStorage(root);
+    storages.push(restartedStorage);
+    const metadata = await restartedStorage.metadata();
+    const restartedService = new ExternalWebhookDispatchService(
+      restartedStorage,
+      { configurationPath: join(root, "webhook-config.json") },
+      emptyAttribution() as unknown as AgentVerifiedAttributionService,
+      emptyRepositories() as unknown as AgentRepositoryObservationService,
+      () => now,
+      undefined,
+      metadata.installationId,
+      { runEndedGraceMs: 1 }
+    );
+    const restarted = restartedService as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    now += 1_000;
+    await expect(restarted.queueEvent(runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_restarted_stale_running_54",
+      state: "running",
+      updatedAt: "2026-07-12T18:19:20.000Z",
+      inputTokens: 50,
+      outputTokens: 4
+    }), `run.update:${runId}`)).resolves.toBe(false);
+    await restarted.processDueEntries();
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ state: "settling", totalTokens: 997 });
+    await expect(restartedService.status()).resolves.toMatchObject({ queuedCount: 0 });
+  });
+
+  it("orders distinct equal-source-time updates beyond the durable high-water after restart", async () => {
+    const received: RunUpdatedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunUpdatedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const sourceUpdatedAt = "2026-07-12T18:19:29.000Z";
+    const now = Date.parse("2026-07-12T18:19:30.000Z");
+    const { service, storage, root } = await testService({ now: () => now });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const original = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_cc06_equal_time_restart_order";
+    const explore = runUpdateActivity(
+      "activity_cc06_equal_time_restart_explore",
+      "subagent",
+      "Explore",
+      sourceUpdatedAt
+    );
+    await original.queueEvent(runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_equal_time_restart_explore",
+      state: "running",
+      updatedAt: sourceUpdatedAt,
+      activity: [explore]
+    }), `run.update:${runId}`);
+    await original.processDueEntries();
+    await waitUntil(() => received.length === 1);
+
+    await storage.close();
+    const originalStorageIndex = storages.indexOf(storage);
+    if (originalStorageIndex >= 0) {
+      storages.splice(originalStorageIndex, 1);
+    }
+    const restartedStorage = serviceStorage(root);
+    storages.push(restartedStorage);
+    const metadata = await restartedStorage.metadata();
+    const restartedService = new ExternalWebhookDispatchService(
+      restartedStorage,
+      { configurationPath: join(root, "webhook-config.json") },
+      emptyAttribution() as unknown as AgentVerifiedAttributionService,
+      emptyRepositories() as unknown as AgentRepositoryObservationService,
+      () => now,
+      undefined,
+      metadata.installationId
+    );
+    const restarted = restartedService as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    await expect(restarted.queueEvent(runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_equal_time_restart_bash",
+      state: "running",
+      updatedAt: sourceUpdatedAt,
+      activity: [
+        explore,
+        runUpdateActivity(
+          "activity_cc06_equal_time_restart_bash",
+          "tool",
+          "Bash",
+          sourceUpdatedAt
+        )
+      ]
+    }), `run.update:${runId}`)).resolves.toBe(true);
+    await restarted.processDueEntries();
+    await waitUntil(() => received.length === 2);
+
+    expect(received.map((event) => event.updatedAt)).toEqual([
+      sourceUpdatedAt,
+      "2026-07-12T18:19:29.001Z"
+    ]);
+    expect(received[1].evidence.observedAt).toBe(sourceUpdatedAt);
+    expect(received[1].activity.map((activity) => activity.name).sort()).toEqual(["Bash", "Explore"]);
+    expect(new Set(received.map((event) => event.eventId))).toHaveLength(2);
+  });
+
+  it("does not retain complete cost coverage when the delivered token high-water advances to a partial-cost snapshot", async () => {
+    const received: RunUpdatedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunUpdatedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService();
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_cc06_cost_coverage_high_water";
+    const first = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_cost_complete",
+      state: "running",
+      updatedAt: "2026-07-12T18:19:29.000Z",
+      inputTokens: 8,
+      outputTokens: 2
+    });
+    first.estimatedNanoUsd = 100_000;
+    first.costEstimateBasis = "catalog_estimate";
+    first.costCoverage = "complete";
+    first.coverage.costCoverage = "complete";
+    await internals.queueEvent(first, `run.update:${runId}`);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 1);
+
+    const expanded = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_cost_partial",
+      state: "running",
+      updatedAt: "2026-07-12T18:19:30.000Z",
+      inputTokens: 16,
+      outputTokens: 4
+    });
+    expanded.estimatedNanoUsd = 150_000;
+    expanded.costEstimateBasis = "catalog_estimate";
+    expanded.costCoverage = "partial";
+    expanded.coverage.costCoverage = "partial";
+    await internals.queueEvent(expanded, `run.update:${runId}`);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 2);
+
+    expect(received[1]).toMatchObject({
+      inputTokens: 16,
+      outputTokens: 4,
+      totalTokens: 20,
+      estimatedNanoUsd: 150_000,
+      costEstimateBasis: "catalog_estimate",
+      costCoverage: "partial",
+      coverage: { costCoverage: "partial" }
+    });
+  });
+
+  it("coalesces a transient fourth duplicate into the canonical three-activity snapshot", async () => {
+    const received: RunUpdatedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunUpdatedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService();
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_cc06_activity_canonicalization";
+    const transient = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_explore_transient_four",
+      state: "running",
+      updatedAt: "2026-07-12T18:20:00.000Z",
+      activity: Array.from({ length: 4 }, (_value, index) => runUpdateActivity(
+        `activity_cc06_explore_${index + 1}`,
+        "subagent",
+        "Explore",
+        "2026-07-12T18:19:59.000Z"
+      ))
+    });
+    const canonical = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_explore_canonical_three",
+      state: "running",
+      updatedAt: "2026-07-12T18:20:01.000Z",
+      activity: transient.activity.slice(0, 3)
+    });
+
+    const firstQueue = internals.queueEvent(transient, `run.update:${runId}`);
+    const canonicalQueue = internals.queueEvent(canonical, `run.update:${runId}`);
+    await expect(Promise.all([firstQueue, canonicalQueue])).resolves.toEqual([true, true]);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 1);
+
+    expect(received[0].activity.filter((activity) =>
+      activity.kind === "subagent" && activity.name === "Explore"
+    )).toHaveLength(3);
+    expect(received[0].activity.map((activity) => activity.activityId)).not.toContain("activity_cc06_explore_4");
+  });
+
+  it("prefers the serialized canonical activity correction when update time and tokens tie", async () => {
+    const received: RunUpdatedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunUpdatedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService();
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_cc06_equal_time_activity_correction";
+    const updatedAt = "2026-07-12T18:20:02.000Z";
+    const transient = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_equal_time_explore_four",
+      state: "running",
+      updatedAt,
+      activity: Array.from({ length: 4 }, (_value, index) => runUpdateActivity(
+        `activity_cc06_equal_time_explore_${index + 1}`,
+        "subagent",
+        "Explore",
+        updatedAt
+      ))
+    });
+    const canonical = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc06_equal_time_explore_three",
+      state: "running",
+      updatedAt,
+      activity: transient.activity.slice(0, 3)
+    });
+
+    const transientQueue = internals.queueEvent(transient, `run.update:${runId}`);
+    const canonicalQueue = internals.queueEvent(canonical, `run.update:${runId}`);
+    await expect(Promise.all([transientQueue, canonicalQueue])).resolves.toEqual([true, true]);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 1);
+
+    expect(received[0].activity.filter((activity) =>
+      activity.kind === "subagent" && activity.name === "Explore"
+    )).toHaveLength(3);
+    expect(received[0].activity.map((activity) => activity.activityId))
+      .not.toContain("activity_cc06_equal_time_explore_4");
+  });
+
+  it("delivers a due Claude closed-root terminal ahead of a same-run settling snapshot at the equal deadline", async () => {
+    const received: Array<{ eventType: string; totalTokens: number }> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as { eventType: string; totalTokens: number });
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    let now = Date.parse("2026-07-12T18:21:00.000Z");
+    const { service } = await testService({
+      now: () => now,
+      timing: { runEndedGraceMs: 40 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      queueRunEndedEvent: (event: RunEndedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_cc06_terminal_preemption";
+    const settling = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc07rr_settling_queued_first",
+      state: "settling",
+      updatedAt: "2026-07-12T18:21:00.000Z",
+      inputTokens: 50,
+      outputTokens: 4
+    });
+    const {
+      sequence: _sequence,
+      updatedAt: _updatedAt,
+      ...terminalBase
+    } = settling;
+    const terminal: RunEndedWebhookEventV1 = {
+      ...terminalBase,
+      eventType: "run.ended",
+      eventId: "evt_cc07rr_terminal_queued_second",
+      version: 1,
+      endedAt: "2026-07-12T18:21:00.000Z",
+      evidence: {
+        ...settling.evidence,
+        basis: "root_span",
+        sourceId: "trace_claude_code_closed_root"
+      },
+      coverage: {
+        ...settling.coverage,
+        usageCoverage: "final"
+      },
+      state: "completed",
+      filesChanged: []
+    };
+    await expect(internals.queueEvent(settling, `run.update:${runId}`)).resolves.toBe(true);
+    await expect(internals.queueRunEndedEvent(terminal, `run.ended:${runId}`)).resolves.toBe(true);
+
+    now += 41;
+    await internals.processDueEntries();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ eventType: "run.ended", totalTokens: 54 });
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0 });
+  });
+
+  it("uses a same-run settling snapshot as a fallback when a trusted Claude closed-root terminal retries", async () => {
+    const received: Array<{ eventType: string; runId: string; state: string }> = [];
+    const runId = "run_cc07rr_terminal_retry_fallback";
+    let terminalAttempts = 0;
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        const event = body as { eventType: string; runId: string; state: string };
+        received.push(event);
+        if (event.eventType === "run.ended" && event.runId === runId && terminalAttempts++ === 0) {
+          response.statusCode = 500;
+          response.end("retry");
+          return;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const now = Date.parse("2026-07-13T07:23:00.000Z");
+    const dueAt = new Date(now - 100).toISOString();
+    const { service } = await testService({
+      now: () => now,
+      timing: { runEndedGraceMs: 40 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      queueRunEndedEvent: (event: RunEndedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: (force?: boolean) => Promise<void>;
+    };
+    const settling = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc07rr_terminal_retry_settling",
+      state: "settling",
+      updatedAt: dueAt,
+      inputTokens: 50,
+      outputTokens: 4
+    });
+    const terminal = runEndedFromUpdate(settling, {
+      eventId: "evt_cc07rr_terminal_retry_root",
+      endedAt: dueAt,
+      evidence: {
+        basis: "root_span",
+        sourceId: "trace_cc07rr_terminal_retry_closed_root",
+        delayed: false
+      }
+    });
+
+    await expect(internals.queueEvent(settling, `run.update:${runId}`)).resolves.toBe(true);
+    await expect(internals.queueRunEndedEvent(terminal, `run.ended:${runId}`)).resolves.toBe(true);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 2);
+
+    expect(received.map((event) => [event.eventType, event.state])).toEqual([
+      ["run.ended", "completed"],
+      ["run.update", "settling"]
+    ]);
+    await expect(service.status()).resolves.toMatchObject({
+      queuedItems: expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "run.ended",
+          subjectId: `run.ended:${runId}`,
+          deliveryState: "retry"
+        })
+      ])
+    });
+
+    await internals.processDueEntries(true);
+    await waitUntil(() => received.filter((event) => event.eventType === "run.ended").length === 2);
+    expect(received.map((event) => [event.eventType, event.state])).toEqual([
+      ["run.ended", "completed"],
+      ["run.update", "settling"],
+      ["run.ended", "completed"]
+    ]);
+
+    const laterUpdate = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc07rr_terminal_retry_late_update",
+      state: "running",
+      updatedAt: new Date(now + 1).toISOString(),
+      inputTokens: 60,
+      outputTokens: 5
+    });
+    await expect(internals.queueEvent(laterUpdate, `run.update:${runId}`)).resolves.toBe(false);
+    await internals.processDueEntries();
+    expect(received).toHaveLength(3);
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0 });
+  });
+
+  it("keeps settling snapshots ahead of ordinary Claude terminal evidence at equal deadlines", async () => {
+    const received: Array<{ eventType: string; runId: string }> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as { eventType: string; runId: string });
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    let now = Date.parse("2026-07-13T07:24:00.000Z");
+    const at = new Date(now).toISOString();
+    const { service } = await testService({
+      now: () => now,
+      timing: { runEndedGraceMs: 40 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      queueRunEndedEvent: (event: RunEndedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const cases = [{
+      suffix: "stop_hook",
+      basis: "stop_hook" as const,
+      delayed: false
+    }, {
+      suffix: "delayed_root_span",
+      basis: "root_span" as const,
+      delayed: true
+    }];
+
+    for (const terminalCase of cases) {
+      const runId = `run_cc07rr_ordinary_terminal_${terminalCase.suffix}`;
+      const settling = runUpdatedEvent({
+        runId,
+        eventId: `evt_cc07rr_ordinary_settling_${terminalCase.suffix}`,
+        state: "settling",
+        updatedAt: at
+      });
+      const terminal = runEndedFromUpdate(settling, {
+        eventId: `evt_cc07rr_ordinary_terminal_${terminalCase.suffix}`,
+        endedAt: at,
+        evidence: {
+          basis: terminalCase.basis,
+          sourceId: `trace_cc07rr_ordinary_${terminalCase.suffix}`,
+          delayed: terminalCase.delayed
+        }
+      });
+      await expect(internals.queueEvent(settling, `run.update:${runId}`)).resolves.toBe(true);
+      await expect(internals.queueRunEndedEvent(terminal, `run.ended:${runId}`)).resolves.toBe(true);
+    }
+
+    now += 41;
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === cases.length * 2);
+    for (const terminalCase of cases) {
+      const runId = `run_cc07rr_ordinary_terminal_${terminalCase.suffix}`;
+      expect(received.filter((event) => event.runId === runId).map((event) => event.eventType)).toEqual([
+        "run.update",
+        "run.ended"
+      ]);
+    }
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0 });
+  });
+
+  it("durably queues a due trusted Claude closed-root terminal behind an in-flight same-run settling update", async () => {
+    const received: Array<{ eventType: string; runId: string }> = [];
+    const runId = "run_cc07rr_same_run_settling_in_flight";
+    let releaseSettling: (() => void) | undefined;
+    const settlingReleased = new Promise<void>((resolve) => {
+      releaseSettling = resolve;
+    });
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as { eventType: string; runId: string };
+        received.push(event);
+        if (event.eventType === "run.update" && event.runId === runId) {
+          await settlingReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const now = Date.parse("2026-07-13T07:25:00.000Z");
+    const dueAt = new Date(now - 100).toISOString();
+    const { service } = await testService({
+      now: () => now,
+      timing: { runEndedGraceMs: 40 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      queueRunEndedEvent: (event: RunEndedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+      inFlightLifecycleSubjects: Set<string>;
+    };
+    const settling = runUpdatedEvent({
+      runId,
+      eventId: "evt_cc07rr_same_run_settling_in_flight",
+      state: "settling",
+      updatedAt: dueAt
+    });
+    const terminal = runEndedFromUpdate(settling, {
+      eventId: "evt_cc07rr_same_run_settling_closed_root",
+      endedAt: dueAt,
+      evidence: {
+        basis: "root_span",
+        sourceId: "trace_cc07rr_same_run_settling_closed_root",
+        delayed: false
+      }
+    });
+
+    await expect(internals.queueEvent(settling, `run.update:${runId}`)).resolves.toBe(true);
+    const settlingDelivery = internals.processDueEntries();
+    await waitUntil(() => received.some((event) => event.eventType === "run.update" && event.runId === runId));
+    expect(internals.inFlightLifecycleSubjects.has(runId)).toBe(true);
+    try {
+      await expect(internals.queueRunEndedEvent(terminal, `run.ended:${runId}`)).resolves.toBe(true);
+      await internals.processDueEntries();
+      await expect(service.status()).resolves.toMatchObject({
+        queuedItems: expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "run.ended",
+            subjectId: `run.ended:${runId}`,
+            deliveryState: "pending"
+          })
+        ])
+      });
+      expect(received.map((event) => [event.eventType, event.runId])).toEqual([
+        ["run.update", runId]
+      ]);
+    } finally {
+      releaseSettling?.();
+      await settlingDelivery;
+    }
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended" && event.runId === runId));
+    expect(received.map((event) => [event.eventType, event.runId])).toEqual([
+      ["run.update", runId],
+      ["run.ended", runId]
+    ]);
+  });
+
+  it("bypasses an unrelated in-flight update with a due Claude closed-root terminal before another run settles", async () => {
+    const received: Array<{ eventType: string; runId: string }> = [];
+    let releaseBlockingUpdate: (() => void) | undefined;
+    const blockingUpdateReleased = new Promise<void>((resolve) => {
+      releaseBlockingUpdate = resolve;
+    });
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as { eventType: string; runId: string };
+        received.push(event);
+        if (event.runId === "run_cc07rr_cross_run_blocking") {
+          await blockingUpdateReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const now = Date.parse("2026-07-13T07:22:00.000Z");
+    const dueAt = new Date(now - 100).toISOString();
+    const { service } = await testService({
+      now: () => now,
+      timing: { runEndedGraceMs: 40 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      queueRunEndedEvent: (event: RunEndedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const blockingRunId = "run_cc07rr_cross_run_blocking";
+    const settlingRunId = "run_cc07rr_cross_run_settling";
+    const terminalRunId = "run_cc07rr_cross_run_terminal";
+    const blocking = runUpdatedEvent({
+      runId: blockingRunId,
+      eventId: "evt_cc07rr_cross_run_blocking",
+      state: "running",
+      updatedAt: new Date(now).toISOString()
+    });
+    const settling = runUpdatedEvent({
+      runId: settlingRunId,
+      eventId: "evt_cc07rr_cross_run_settling",
+      state: "settling",
+      updatedAt: dueAt
+    });
+    const terminalSource = runUpdatedEvent({
+      runId: terminalRunId,
+      eventId: "evt_cc07rr_cross_run_terminal_source",
+      state: "running",
+      updatedAt: dueAt
+    });
+    const {
+      sequence: _sequence,
+      updatedAt: _updatedAt,
+      ...terminalBase
+    } = terminalSource;
+    const terminal: RunEndedWebhookEventV1 = {
+      ...terminalBase,
+      eventType: "run.ended",
+      eventId: "evt_cc07rr_cross_run_terminal",
+      version: 1,
+      endedAt: dueAt,
+      evidence: {
+        ...terminalSource.evidence,
+        basis: "root_span",
+        sourceId: "trace_cc07rr_cross_run_closed_root"
+      },
+      coverage: {
+        ...terminalSource.coverage,
+        usageCoverage: "final"
+      },
+      state: "completed",
+      filesChanged: []
+    };
+
+    await expect(internals.queueEvent(blocking, `run.update:${blockingRunId}`)).resolves.toBe(true);
+    const blockedDelivery = internals.processDueEntries();
+    await waitUntil(() => received.some((event) => event.runId === blockingRunId));
+    await expect(internals.queueEvent(settling, `run.update:${settlingRunId}`)).resolves.toBe(true);
+    await expect(internals.queueRunEndedEvent(terminal, `run.ended:${terminalRunId}`)).resolves.toBe(true);
+
+    await internals.processDueEntries();
+    await waitUntil(() => received.some((event) => event.runId === terminalRunId));
+    expect(received.map((event) => [event.eventType, event.runId])).toEqual([
+      ["run.update", blockingRunId],
+      ["run.ended", terminalRunId]
+    ]);
+
+    releaseBlockingUpdate?.();
+    await blockedDelivery;
+    await waitUntil(() => received.some((event) => event.runId === settlingRunId));
+    expect(received.map((event) => [event.eventType, event.runId])).toEqual([
+      ["run.update", blockingRunId],
+      ["run.ended", terminalRunId],
+      ["run.update", settlingRunId]
+    ]);
+  });
+
   it("turns a hung webhook request into a bounded retryable timeout", async () => {
     let connectionCount = 0;
     const server = createServer((request) => {
@@ -1234,6 +3208,1174 @@ describe("external webhook dispatch", () => {
       ["run.start", "run_new_start"],
       ["run.update", "run_existing_update"]
     ]);
+  });
+
+  it("durably admits a later ordinary update while the prior receiver response is blocked", async () => {
+    const received: Array<{ eventType?: string; runId?: string }> = [];
+    let releaseStartResponse: (() => void) | undefined;
+    const startResponseReleased = new Promise<void>((resolve) => {
+      releaseStartResponse = resolve;
+    });
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as { eventType?: string; runId?: string };
+        received.push(event);
+        if (event.eventType === "run.start" && event.runId === "run_nonblocking_admission") {
+          await startResponseReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_nonblocking_admission",
+          root: "/tmp/nonblocking-admission"
+        }]
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    try {
+      await service.admitSafeObservation(liveCodexPromptObservation(
+        "qry_nonblocking_admission",
+        "ses_nonblocking_admission",
+        "2026-06-08T00:00:00.000Z"
+      ));
+      await waitUntil(() => received.some((event) =>
+        event.eventType === "run.start" && event.runId === "run_nonblocking_admission"
+      ));
+
+      await service.admitSafeObservation(liveUsageObservation({
+        queryId: "qry_nonblocking_admission",
+        sessionId: "ses_nonblocking_admission",
+        observedAt: "2026-06-08T00:00:01.000Z",
+        atomId: "nonblocking_admission_update",
+        inputTokens: 10,
+        outputTokens: 2
+      }));
+
+      await expect(service.status()).resolves.toMatchObject({
+        queuedItems: expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "run.update",
+            subjectId: "run.update:run_nonblocking_admission",
+            deliveryState: "pending"
+          })
+        ])
+      });
+    } finally {
+      releaseStartResponse?.();
+    }
+
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.update" && event.runId === "run_nonblocking_admission"
+    ));
+    expect(received.map((event) => event.eventType)).toEqual(["run.start", "run.update"]);
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0, blockedCount: 0 });
+  });
+
+  it("keeps only the latest durable same-run update successor while the prior update response is blocked", async () => {
+    const received: Array<RunStartedWebhookEventV1 | RunUpdatedWebhookEventV1> = [];
+    let releaseFirstUpdateResponse: (() => void) | undefined;
+    const firstUpdateResponseReleased = new Promise<void>((resolve) => {
+      releaseFirstUpdateResponse = resolve;
+    });
+    let acknowledgeFirstUpdateBody: (() => void) | undefined;
+    const firstUpdateBodyReceived = new Promise<void>((resolve) => {
+      acknowledgeFirstUpdateBody = resolve;
+    });
+    let inFlightUpdateEventId: string | undefined;
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as RunStartedWebhookEventV1 | RunUpdatedWebhookEventV1;
+        received.push(event);
+        if (event.eventType === "run.update" && !inFlightUpdateEventId) {
+          inFlightUpdateEventId = event.eventId;
+          acknowledgeFirstUpdateBody?.();
+          await firstUpdateResponseReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service, storage } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_same_run_update_successor",
+          root: "/tmp/same-run-update-successor"
+        }]
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const queryId = "qry_same_run_update_successor";
+    const sessionId = "ses_same_run_update_successor";
+    const runId = "run_same_run_update_successor";
+
+    await service.admitSafeObservation(liveCodexPromptObservation(
+      queryId,
+      sessionId,
+      "2026-06-08T00:00:00.000Z"
+    ));
+    await waitUntil(() => received.some((event) => event.eventType === "run.start"));
+
+    await service.admitSafeObservation(liveUsageObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-06-08T00:00:01.000Z",
+      atomId: "same_run_update_a",
+      inputTokens: 10,
+      outputTokens: 2
+    }));
+    await firstUpdateBodyReceived;
+    const updateAEventId = inFlightUpdateEventId;
+    if (!updateAEventId) {
+      throw new Error("first_update_event_id_missing");
+    }
+
+    let updateBAdmission: Promise<void> | undefined;
+    let updateCAdmission: Promise<void> | undefined;
+    try {
+      let updateBAdmitted = false;
+      updateBAdmission = service.admitSafeObservation(liveUsageObservation({
+        queryId,
+        sessionId,
+        observedAt: "2026-06-08T00:00:02.000Z",
+        atomId: "same_run_update_b",
+        inputTokens: 20,
+        outputTokens: 4
+      })).then(() => {
+        updateBAdmitted = true;
+      });
+      await waitUntil(() => updateBAdmitted);
+      await updateBAdmission;
+
+      const pendingAfterB = (await service.status()).queuedItems
+        ?.filter((item) => item.eventType === "run.update" && item.subjectId === `run.update:${runId}`)
+        ?? [];
+      expect(pendingAfterB).toHaveLength(2);
+      const updateBEventId = pendingAfterB.find((item) => item.eventId !== updateAEventId)?.eventId;
+      if (!updateBEventId) {
+        throw new Error("second_update_event_id_missing");
+      }
+
+      let updateCAdmitted = false;
+      updateCAdmission = service.admitSafeObservation(liveUsageObservation({
+        queryId,
+        sessionId,
+        observedAt: "2026-06-08T00:00:03.000Z",
+        atomId: "same_run_update_c",
+        inputTokens: 30,
+        outputTokens: 6
+      })).then(() => {
+        updateCAdmitted = true;
+      });
+      await waitUntil(() => updateCAdmitted);
+      await updateCAdmission;
+
+      const pendingAfterC = (await service.status()).queuedItems
+        ?.filter((item) => item.eventType === "run.update" && item.subjectId === `run.update:${runId}`)
+        ?? [];
+      expect(pendingAfterC).toHaveLength(2);
+      expect(pendingAfterC.map((item) => item.eventId)).toContain(updateAEventId);
+      expect(pendingAfterC.map((item) => item.eventId)).not.toContain(updateBEventId);
+      const updateCEventId = pendingAfterC.find((item) => item.eventId !== updateAEventId)?.eventId;
+      if (!updateCEventId) {
+        throw new Error("third_update_event_id_missing");
+      }
+
+      const outboxByEventId = new Map((await storage.listAgentDocuments<{
+        event: { eventId: string };
+        deliveryState: string;
+        lastErrorCode?: string;
+      }>("webhook_outbox")).map((document) => [document.value.event.eventId, document.value]));
+      expect(outboxByEventId.get(updateAEventId)).toMatchObject({ deliveryState: "pending" });
+      expect(outboxByEventId.get(updateAEventId)?.lastErrorCode)
+        .not.toBe("run_update_superseded_by_high_water");
+      expect(outboxByEventId.get(updateBEventId)).toMatchObject({
+        deliveryState: "delivered",
+        lastErrorCode: "run_update_superseded_by_high_water"
+      });
+      expect(outboxByEventId.get(updateCEventId)).toMatchObject({ deliveryState: "pending" });
+    } finally {
+      releaseFirstUpdateResponse?.();
+      await Promise.allSettled([updateBAdmission, updateCAdmission].filter((value): value is Promise<void> => Boolean(value)));
+    }
+
+    await waitUntil(() => received.length === 3);
+    expect(received.map((event) => event.eventType)).toEqual(["run.start", "run.update", "run.update"]);
+    expect(new Set(received.map((event) => event.eventId))).toHaveLength(3);
+    const deliveredUpdates = received.filter(
+      (event): event is RunUpdatedWebhookEventV1 => event.eventType === "run.update"
+    );
+    expect(deliveredUpdates.map((event) => event.totalTokens)).toEqual([12, 72]);
+    expect(deliveredUpdates[1].updatedAt > deliveredUpdates[0].updatedAt).toBe(true);
+    expect(deliveredUpdates.map((event) => event.activity[0]?.count)).toEqual([1, 3]);
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0, blockedCount: 0 });
+  });
+
+  it("serializes truly concurrent same-run successor writes while update A is on the wire", async () => {
+    const received: Array<RunStartedWebhookEventV1 | RunUpdatedWebhookEventV1> = [];
+    let releaseUpdateAResponse: (() => void) | undefined;
+    const updateAResponseReleased = new Promise<void>((resolve) => {
+      releaseUpdateAResponse = resolve;
+    });
+    let acknowledgeUpdateABody: (() => void) | undefined;
+    const updateABodyReceived = new Promise<void>((resolve) => {
+      acknowledgeUpdateABody = resolve;
+    });
+    let updateABlocked = false;
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as RunStartedWebhookEventV1 | RunUpdatedWebhookEventV1;
+        received.push(event);
+        if (event.eventType === "run.update" && !updateABlocked) {
+          updateABlocked = true;
+          acknowledgeUpdateABody?.();
+          await updateAResponseReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service, storage } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_cc06_webhook_test",
+          root: "/tmp/concurrent-update-successors"
+        }]
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const runId = "run_concurrent_update_successors";
+    await service.admitSafeObservation(liveCodexPromptObservation(
+      "qry_concurrent_update_successors",
+      "ses_concurrent_update_successors",
+      "2026-07-12T18:19:00.000Z"
+    ));
+    await waitUntil(() => received.some((event) => event.eventType === "run.start"));
+
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      queueEventUnlocked: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const subjectId = `run.update:${runId}`;
+    await internals.queueEvent(runUpdatedEvent({
+      runId,
+      eventId: "evt_concurrent_update_a",
+      state: "running",
+      updatedAt: "2026-07-12T18:19:01.000Z",
+      inputTokens: 10,
+      outputTokens: 2
+    }), subjectId);
+    const delivery = internals.processDueEntries();
+    await updateABodyReceived;
+
+    const originalQueueEventUnlocked = internals.queueEventUnlocked.bind(service);
+    let releaseFirstQueueWrite: (() => void) | undefined;
+    const firstQueueWriteReleased = new Promise<void>((resolve) => {
+      releaseFirstQueueWrite = resolve;
+    });
+    let acknowledgeFirstQueueWrite: (() => void) | undefined;
+    const firstQueueWriteEntered = new Promise<void>((resolve) => {
+      acknowledgeFirstQueueWrite = resolve;
+    });
+    let queueWriteCount = 0;
+    let activeQueueWrites = 0;
+    let maxActiveQueueWrites = 0;
+    internals.queueEventUnlocked = async (event, queuedSubjectId) => {
+      queueWriteCount += 1;
+      activeQueueWrites += 1;
+      maxActiveQueueWrites = Math.max(maxActiveQueueWrites, activeQueueWrites);
+      try {
+        if (queueWriteCount === 1) {
+          acknowledgeFirstQueueWrite?.();
+          await firstQueueWriteReleased;
+        }
+        return await originalQueueEventUnlocked(event, queuedSubjectId);
+      } finally {
+        activeQueueWrites -= 1;
+      }
+    };
+
+    let updateBQueue: Promise<boolean> | undefined;
+    let updateCQueue: Promise<boolean> | undefined;
+    try {
+      updateBQueue = internals.queueEvent(runUpdatedEvent({
+        runId,
+        eventId: "evt_concurrent_update_b",
+        state: "running",
+        updatedAt: "2026-07-12T18:19:02.000Z",
+        inputTokens: 30,
+        outputTokens: 6
+      }), subjectId);
+      await firstQueueWriteEntered;
+      updateCQueue = internals.queueEvent(runUpdatedEvent({
+        runId,
+        eventId: "evt_concurrent_update_c",
+        state: "running",
+        updatedAt: "2026-07-12T18:19:03.000Z",
+        inputTokens: 60,
+        outputTokens: 12
+      }), subjectId);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(maxActiveQueueWrites).toBe(1);
+      releaseFirstQueueWrite?.();
+      await expect(Promise.all([updateBQueue, updateCQueue])).resolves.toEqual([true, true]);
+
+      const updateRows = (await storage.listAgentDocuments<{
+        event: { eventType: string; eventId: string; totalTokens?: number };
+        deliveryState: string;
+        lastErrorCode?: string;
+      }>("webhook_outbox"))
+        .map((document) => document.value)
+        .filter((row) => row.event.eventType === "run.update");
+      expect(updateRows.find((row) => row.event.totalTokens === 12)).toMatchObject({ deliveryState: "pending" });
+      expect(updateRows.find((row) => row.event.totalTokens === 36)).toMatchObject({
+        deliveryState: "delivered",
+        lastErrorCode: "run_update_superseded_by_high_water"
+      });
+      expect(updateRows.find((row) => row.event.totalTokens === 72)).toMatchObject({ deliveryState: "pending" });
+      await internals.processDueEntries();
+    } finally {
+      releaseFirstQueueWrite?.();
+      internals.queueEventUnlocked = originalQueueEventUnlocked;
+      releaseUpdateAResponse?.();
+      await Promise.allSettled([delivery, updateBQueue, updateCQueue].filter(
+        (value): value is Promise<void> | Promise<boolean> => Boolean(value)
+      ));
+    }
+
+    await waitUntil(() => received.length === 3);
+    expect(received.map((event) => event.eventType)).toEqual(["run.start", "run.update", "run.update"]);
+    const deliveredUpdates = received.filter(
+      (event): event is RunUpdatedWebhookEventV1 => event.eventType === "run.update"
+    );
+    expect(deliveredUpdates.map((event) => event.totalTokens)).toEqual([12, 72]);
+    expect(new Set(received.map((event) => event.eventId))).toHaveLength(3);
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0, blockedCount: 0 });
+  });
+
+  it("suppresses failed update A before a durable successor delivers after restart", async () => {
+    const attempts: Array<RunStartedWebhookEventV1 | RunUpdatedWebhookEventV1> = [];
+    const accepted: Array<RunStartedWebhookEventV1 | RunUpdatedWebhookEventV1> = [];
+    let releaseUpdateAFailure: (() => void) | undefined;
+    const updateAFailureReleased = new Promise<void>((resolve) => {
+      releaseUpdateAFailure = resolve;
+    });
+    let acknowledgeUpdateABody: (() => void) | undefined;
+    const updateABodyReceived = new Promise<void>((resolve) => {
+      acknowledgeUpdateABody = resolve;
+    });
+    let updateAttemptCount = 0;
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as RunStartedWebhookEventV1 | RunUpdatedWebhookEventV1;
+        attempts.push(event);
+        if (event.eventType === "run.update") {
+          updateAttemptCount += 1;
+          if (updateAttemptCount === 1) {
+            acknowledgeUpdateABody?.();
+            await updateAFailureReleased;
+            response.statusCode = 500;
+            response.end("retry");
+            return;
+          }
+        }
+        accepted.push(event);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service, storage, root } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_cc06_webhook_test",
+          root: "/tmp/restarted-update-successor"
+        }]
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const runId = "run_restarted_update_successor";
+    await service.admitSafeObservation(liveCodexPromptObservation(
+      "qry_restarted_update_successor",
+      "ses_restarted_update_successor",
+      "2026-07-12T18:20:00.000Z"
+    ));
+    await waitUntil(() => accepted.some((event) => event.eventType === "run.start"));
+
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const subjectId = `run.update:${runId}`;
+    await internals.queueEvent(runUpdatedEvent({
+      runId,
+      eventId: "evt_restarted_update_a",
+      state: "running",
+      updatedAt: "2026-07-12T18:20:01.000Z",
+      inputTokens: 10,
+      outputTokens: 2
+    }), subjectId);
+    const updateADelivery = internals.processDueEntries();
+    await updateABodyReceived;
+
+    await internals.queueEvent(runUpdatedEvent({
+      runId,
+      eventId: "evt_restarted_update_c",
+      state: "running",
+      updatedAt: "2026-07-12T18:20:03.000Z",
+      inputTokens: 60,
+      outputTokens: 12
+    }), subjectId);
+    const durableBeforeFailure = (await storage.listAgentDocuments<{
+      event: { eventType: string; eventId: string; totalTokens?: number };
+      deliveryState: string;
+      lastErrorCode?: string;
+    }>("webhook_outbox"))
+      .map((document) => document.value)
+      .filter((row) => row.event.eventType === "run.update");
+    const updateAEventId = durableBeforeFailure.find((row) => row.event.totalTokens === 12)?.event.eventId;
+    const updateCEventId = durableBeforeFailure.find((row) => row.event.totalTokens === 72)?.event.eventId;
+    if (!updateAEventId || !updateCEventId) {
+      throw new Error("durable_update_successor_ids_missing");
+    }
+    expect(durableBeforeFailure).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: expect.objectContaining({ eventId: updateAEventId }), deliveryState: "pending" }),
+      expect.objectContaining({ event: expect.objectContaining({ eventId: updateCEventId }), deliveryState: "pending" })
+    ]));
+
+    releaseUpdateAFailure?.();
+    await updateADelivery;
+    await expect(service.status()).resolves.toMatchObject({
+      queuedCount: 2,
+      queuedItems: expect.arrayContaining([
+        expect.objectContaining({ eventId: updateAEventId, deliveryState: "retry" }),
+        expect.objectContaining({ eventId: updateCEventId, deliveryState: "pending" })
+      ])
+    });
+
+    await storage.close();
+    const originalStorageIndex = storages.indexOf(storage);
+    if (originalStorageIndex >= 0) {
+      storages.splice(originalStorageIndex, 1);
+    }
+    const restartedStorage = serviceStorage(root);
+    storages.push(restartedStorage);
+    const metadata = await restartedStorage.metadata();
+    const restarted = new ExternalWebhookDispatchService(
+      restartedStorage,
+      { configurationPath: join(root, "webhook-config.json") },
+      emptyAttribution() as unknown as AgentVerifiedAttributionService,
+      emptyRepositories() as unknown as AgentRepositoryObservationService,
+      Date.now,
+      undefined,
+      metadata.installationId
+    );
+
+    await restarted.retryNow();
+    await waitUntil(() => attempts.filter((event) => event.eventType === "run.update").length === 2);
+    expect(attempts.map((event) => event.eventType)).toEqual(["run.start", "run.update", "run.update"]);
+    expect(attempts.filter((event) => event.eventId === updateAEventId)).toHaveLength(1);
+    expect(new Set(attempts.map((event) => event.eventId))).toHaveLength(3);
+    expect(accepted.filter((event) => event.eventType === "run.update")).toEqual([
+      expect.objectContaining({ eventId: updateCEventId, totalTokens: 72 })
+    ]);
+    await expect(restarted.status()).resolves.toMatchObject({ queuedCount: 0, blockedCount: 0 });
+    const finalRows = new Map((await restartedStorage.listAgentDocuments<{
+      event: { eventId: string };
+      deliveryState: string;
+      lastErrorCode?: string;
+    }>("webhook_outbox")).map((document) => [document.value.event.eventId, document.value]));
+    expect(finalRows.get(updateAEventId)).toMatchObject({
+      deliveryState: "delivered",
+      lastErrorCode: "run_update_superseded_by_high_water"
+    });
+    expect(finalRows.get(updateCEventId)).toMatchObject({ deliveryState: "delivered" });
+    expect(finalRows.get(updateCEventId)?.lastErrorCode).toBeUndefined();
+  });
+
+  it("persists and delivers merged novel facts before superseding a stale retry claim", async () => {
+    const received: RunUpdatedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunUpdatedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service, storage } = await testService();
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueEvent: (event: RunUpdatedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+      outbox: {
+        upsert: (entry: {
+          event: RunUpdatedWebhookEventV1;
+          deliveryState: string;
+          lastErrorCode?: string;
+        }) => Promise<void>;
+      };
+    };
+    const runId = "run_retry_novel_fact_merge";
+    const subjectId = `run.update:${runId}`;
+    const deliveredHighWater = runUpdatedEvent({
+      runId,
+      eventId: "evt_retry_novel_high_water",
+      state: "running",
+      updatedAt: "2026-07-12T18:21:01.000Z",
+      inputTokens: 10,
+      outputTokens: 2
+    });
+    deliveredHighWater.activity.push(runUpdateActivity(
+      "activity_delivered_fact_b",
+      "tool",
+      "DeliveredFactToolB",
+      "2026-07-12T18:21:01.000Z"
+    ));
+    deliveredHighWater.activity.push(runUpdateActivity(
+      "activity_delivered_bash_1",
+      "tool",
+      "Bash",
+      "2026-07-12T18:21:01.100Z"
+    ));
+    deliveredHighWater.context = {
+      schemaVersion: 1,
+      accumulatedInputTokens: 10,
+      initialInputContextTokens: 6,
+      latestInputContextTokens: 10,
+      peakInputContextTokens: 10,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      observedLlmRequestCount: 3,
+      contextGrowthInputTokens: 4,
+      contextGrowthRatio: 10 / 6,
+      basis: "derived_from_usage_atoms",
+      coverage: "complete_so_far"
+    };
+    await internals.queueEvent(deliveredHighWater, subjectId);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 1);
+    const deliveredHighWaterEventId = received[0].eventId;
+
+    const staleRetry = runUpdatedEvent({
+      runId,
+      eventId: "evt_99999999999999999999999999999999",
+      state: "running",
+      updatedAt: "2026-07-12T18:21:02.000Z",
+      inputTokens: 10,
+      outputTokens: 2
+    });
+    staleRetry.activity.push(runUpdateActivity(
+      "activity_retry_novel_fact",
+      "tool",
+      "RetryFactToolA",
+      "2026-07-12T18:21:02.000Z"
+    ));
+    staleRetry.activity.push(runUpdateActivity(
+      "activity_retry_bash_2",
+      "tool",
+      "Bash",
+      // Parallel calls may share exact public timing; distinct stable IDs must
+      // still survive unless the next row proves correction authority.
+      "2026-07-12T18:21:01.100Z"
+    ));
+    staleRetry.context = {
+      schemaVersion: 1,
+      accumulatedInputTokens: 10,
+      initialInputContextTokens: 2,
+      latestInputContextTokens: 4,
+      peakInputContextTokens: 4,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      observedLlmRequestCount: 1,
+      contextGrowthInputTokens: 2,
+      contextGrowthRatio: 2,
+      basis: "derived_from_usage_atoms",
+      coverage: "partial"
+    };
+    const seededAt = new Date().toISOString();
+    await storage.upsertAgentDocument("webhook_outbox", {
+      key: staleRetry.eventId,
+      sortAt: seededAt,
+      value: {
+        schemaVersion: 1,
+        key: staleRetry.eventId,
+        event: staleRetry,
+        eventType: staleRetry.eventType,
+        subjectId,
+        payloadHash: "seeded_stale_retry_with_novel_fact",
+        deliveryState: "retry",
+        attempts: 1,
+        queuedAt: seededAt,
+        firstAttemptAt: seededAt,
+        lastAttemptAt: seededAt,
+        nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+        lastErrorCode: "http_500",
+        createdAt: seededAt,
+        updatedAt: seededAt
+      }
+    });
+
+    const originalOutboxUpsert = internals.outbox.upsert.bind(internals.outbox);
+    const durableMutationOrder: string[] = [];
+    internals.outbox.upsert = async (entry) => {
+      await originalOutboxUpsert(entry);
+      if (
+        entry.event.eventId !== deliveredHighWaterEventId
+        && entry.event.eventId !== staleRetry.eventId
+        && entry.deliveryState === "pending"
+      ) {
+        durableMutationOrder.push("merged_successor_durable");
+      }
+      if (
+        entry.event.eventId === staleRetry.eventId
+        && entry.lastErrorCode === "run_update_superseded_by_high_water"
+      ) {
+        durableMutationOrder.push("stale_retry_tombstoned");
+      }
+    };
+    try {
+      await service.retryNow();
+    } finally {
+      internals.outbox.upsert = originalOutboxUpsert;
+    }
+    await waitUntil(() => received.length === 2);
+    expect(durableMutationOrder.slice(0, 2)).toEqual([
+      "merged_successor_durable",
+      "stale_retry_tombstoned"
+    ]);
+    const merged = received[1];
+    expect(merged).toMatchObject({
+      eventType: "run.update",
+      runId,
+      inputTokens: 10,
+      outputTokens: 2,
+      totalTokens: 12,
+      activity: expect.arrayContaining([
+        expect.objectContaining({ name: "claude-test" }),
+        expect.objectContaining({ name: "DeliveredFactToolB" }),
+        expect.objectContaining({ name: "RetryFactToolA" }),
+        expect.objectContaining({ activityId: "activity_delivered_bash_1", name: "Bash" }),
+        expect.objectContaining({ activityId: "activity_retry_bash_2", name: "Bash" })
+      ]),
+      context: expect.objectContaining({
+        accumulatedInputTokens: 10,
+        initialInputContextTokens: 6,
+        latestInputContextTokens: 10,
+        peakInputContextTokens: 10,
+        observedLlmRequestCount: 3,
+        contextGrowthInputTokens: 4,
+        contextGrowthRatio: 10 / 6,
+        coverage: "complete_so_far"
+      })
+    });
+    const mergedActivityTotals = merged.activity.reduce((totals, activity) => ({
+      inputTokens: totals.inputTokens + (activity.inputTokens ?? 0),
+      outputTokens: totals.outputTokens + (activity.outputTokens ?? 0),
+      cacheReadInputTokens: totals.cacheReadInputTokens + (activity.cacheReadInputTokens ?? 0),
+      cacheCreationInputTokens: totals.cacheCreationInputTokens + (activity.cacheCreationInputTokens ?? 0),
+      reasoningOutputTokens: totals.reasoningOutputTokens + (activity.reasoningOutputTokens ?? 0)
+    }), {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      reasoningOutputTokens: 0
+    });
+    expect(mergedActivityTotals).toEqual({
+      inputTokens: merged.inputTokens,
+      outputTokens: merged.outputTokens,
+      cacheReadInputTokens: merged.cacheReadInputTokens,
+      cacheCreationInputTokens: merged.cacheCreationInputTokens,
+      reasoningOutputTokens: merged.reasoningOutputTokens
+    });
+    expect(merged.eventId).not.toBe(deliveredHighWaterEventId);
+    expect(merged.eventId).not.toBe(staleRetry.eventId);
+    expect(new Set(received.map((event) => event.eventId))).toHaveLength(2);
+    expect(received.some((event) => event.eventId === staleRetry.eventId)).toBe(false);
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0, blockedCount: 0 });
+    const finalRows = new Map((await storage.listAgentDocuments<{
+      event: { eventId: string };
+      deliveryState: string;
+      lastErrorCode?: string;
+    }>("webhook_outbox")).map((document) => [document.value.event.eventId, document.value]));
+    expect(finalRows.get(staleRetry.eventId)).toMatchObject({
+      deliveryState: "delivered",
+      lastErrorCode: "run_update_superseded_by_high_water"
+    });
+    expect(finalRows.get(merged.eventId)).toMatchObject({ deliveryState: "delivered" });
+  });
+
+  it("delivers a fresh run start while another run update response is in flight", async () => {
+    const received: Array<{ eventType?: string; runId?: string }> = [];
+    let releaseSlowUpdate: (() => void) | undefined;
+    const slowUpdateReleased = new Promise<void>((resolve) => {
+      releaseSlowUpdate = resolve;
+    });
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as { eventType?: string; runId?: string };
+        received.push(event);
+        if (event.eventType === "run.update" && event.runId === "run_slow_update") {
+          await slowUpdateReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_lifecycle_bypass", root: "/tmp/lifecycle-bypass" }]
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.observeSafeObservation(liveCodexPromptObservation(
+      "qry_slow_update",
+      "ses_slow_update",
+      "2026-06-08T00:00:00.000Z"
+    ));
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === "run_slow_update"
+    ));
+
+    const slowUpdate = service.observeSafeObservation(liveUsageObservation({
+      queryId: "qry_slow_update",
+      sessionId: "ses_slow_update",
+      observedAt: "2026-06-08T00:00:01.000Z",
+      atomId: "slow_update",
+      inputTokens: 10,
+      outputTokens: 2
+    }));
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.update" && event.runId === "run_slow_update"
+    ));
+
+    const freshStart = service.observeSafeObservation(liveCodexPromptObservation(
+      "qry_fresh_start",
+      "ses_fresh_start",
+      "2026-06-08T00:00:02.000Z"
+    ));
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === "run_fresh_start"
+    ));
+
+    releaseSlowUpdate?.();
+    await Promise.all([slowUpdate, freshStart]);
+    expect(received.map((event) => [event.eventType, event.runId])).toEqual([
+      ["run.start", "run_slow_update"],
+      ["run.update", "run_slow_update"],
+      ["run.start", "run_fresh_start"]
+    ]);
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0 });
+  });
+
+  it("persists a same-run terminal while that run's update response is in flight", async () => {
+    const received: Array<{ eventType?: string; runId?: string }> = [];
+    let releaseSlowUpdate: (() => void) | undefined;
+    const slowUpdateReleased = new Promise<void>((resolve) => {
+      releaseSlowUpdate = resolve;
+    });
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as { eventType?: string; runId?: string };
+        received.push(event);
+        if (event.eventType === "run.update" && event.runId === "run_same_run_terminal") {
+          await slowUpdateReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    let now = Date.parse("2026-07-13T07:21:00.000Z");
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_same_run_terminal", root: "/tmp/same-run-terminal" }]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    const startedAt = new Date(now - 1_000).toISOString();
+    const completedAt = new Date(now).toISOString();
+    const prompt = liveCodexPromptObservation(
+      "qry_same_run_terminal",
+      "ses_same_run_terminal",
+      startedAt
+    );
+    await service.observeSafeObservation(prompt);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === "run_same_run_terminal"
+    ));
+
+    const slowUpdate = service.observeSafeObservation(liveUsageObservation({
+      queryId: "qry_same_run_terminal",
+      sessionId: "ses_same_run_terminal",
+      observedAt: completedAt,
+      atomId: "same_run_terminal_slow_update",
+      inputTokens: 10,
+      outputTokens: 2
+    }));
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.update" && event.runId === "run_same_run_terminal"
+    ));
+
+    // Make the terminal already due while the settling update's response is
+    // still held. It must persist, but cannot open a concurrent same-run HTTP
+    // attempt before that update releases.
+    now += 2;
+    let terminalObservationResolved = false;
+    const terminal = service.observeSafeObservation(
+      liveCompletionObservation(prompt, completedAt, "stop_hook")
+    ).then(() => {
+      terminalObservationResolved = true;
+    });
+    try {
+      await waitUntil(() => terminalObservationResolved);
+      await expect(service.status()).resolves.toMatchObject({
+        queuedItems: expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "run.ended",
+            subjectId: "run.ended:run_same_run_terminal",
+            deliveryState: "pending"
+          })
+        ])
+      });
+      expect(received.some((event) =>
+        event.eventType === "run.ended" && event.runId === "run_same_run_terminal"
+      )).toBe(false);
+    } finally {
+      releaseSlowUpdate?.();
+      await Promise.all([slowUpdate, terminal]);
+    }
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === "run_same_run_terminal"
+    ));
+    expect(received.map((event) => [event.eventType, event.runId])).toEqual([
+      ["run.start", "run_same_run_terminal"],
+      ["run.update", "run_same_run_terminal"],
+      ["run.ended", "run_same_run_terminal"]
+    ]);
+  });
+
+  it("admits a same-run terminal before the update delivery's first outbox read completes", async () => {
+    const received: Array<{ eventType?: string; runId?: string }> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as { eventType?: string; runId?: string });
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_pre_map_terminal", root: "/tmp/pre-map-terminal" }]
+      },
+      timing: { runEndedGraceMs: 60_000 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    const startedAt = new Date(Date.now() - 1_000).toISOString();
+    const completedAt = new Date().toISOString();
+    const prompt = liveCodexPromptObservation(
+      "qry_pre_map_terminal",
+      "ses_pre_map_terminal",
+      startedAt
+    );
+    await service.observeSafeObservation(prompt);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === "run_pre_map_terminal"
+    ));
+
+    const internals = service as unknown as {
+      outbox: { read: (key: string) => Promise<unknown> };
+    };
+    const originalRead = internals.outbox.read.bind(internals.outbox);
+    let releasePreMapRead: (() => void) | undefined;
+    const preMapReadReleased = new Promise<void>((resolve) => {
+      releasePreMapRead = resolve;
+    });
+    let preMapReadHeld = false;
+    internals.outbox.read = async (key) => {
+      const entry = await originalRead(key) as {
+        event?: { eventType?: string; runId?: string };
+      } | undefined;
+      if (
+        !preMapReadHeld
+        && entry?.event?.eventType === "run.update"
+        && entry.event.runId === "run_pre_map_terminal"
+      ) {
+        preMapReadHeld = true;
+        await preMapReadReleased;
+      }
+      return entry;
+    };
+
+    const update = service.observeSafeObservation(liveUsageObservation({
+      queryId: "qry_pre_map_terminal",
+      sessionId: "ses_pre_map_terminal",
+      observedAt: completedAt,
+      atomId: "pre_map_terminal_update",
+      inputTokens: 10,
+      outputTokens: 2
+    }));
+    let terminalResolved = false;
+    let terminal = Promise.resolve();
+    try {
+      await waitUntil(() => preMapReadHeld);
+      terminal = service.admitSafeObservation(
+        liveCompletionObservation(prompt, completedAt, "stop_hook")
+      ).then(() => {
+        terminalResolved = true;
+      });
+      await waitUntil(() => terminalResolved);
+      await expect(service.status()).resolves.toMatchObject({
+        queuedItems: expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "run.ended",
+            subjectId: "run.ended:run_pre_map_terminal",
+            deliveryState: "pending"
+          })
+        ])
+      });
+      expect(received.some((event) =>
+        event.eventType === "run.update" && event.runId === "run_pre_map_terminal"
+      )).toBe(false);
+    } finally {
+      releasePreMapRead?.();
+      await Promise.all([update, terminal]);
+      internals.outbox.read = originalRead;
+    }
+  });
+
+  it("durably admits two terminals while unrelated lifecycle HTTP is blocked", async () => {
+    const received: Array<{ eventType?: string; runId?: string }> = [];
+    let releaseSlowUpdate: (() => void) | undefined;
+    let releaseUnrelatedAnchor: (() => void) | undefined;
+    const slowUpdateReleased = new Promise<void>((resolve) => {
+      releaseSlowUpdate = resolve;
+    });
+    const unrelatedAnchorReleased = new Promise<void>((resolve) => {
+      releaseUnrelatedAnchor = resolve;
+    });
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as { eventType?: string; runId?: string };
+        received.push(event);
+        if (event.eventType === "run.update" && event.runId === "run_terminal_admission_slow_update") {
+          await slowUpdateReleased;
+        }
+        if (event.eventType === "run.start" && event.runId === "run_terminal_admission_unrelated_anchor") {
+          await unrelatedAnchorReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_terminal_admission", root: "/tmp/terminal-admission" }]
+      },
+      timing: { runEndedGraceMs: 60_000 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    const startedAt = new Date(Date.now() - 1_000).toISOString();
+    const completedAt = new Date().toISOString();
+    const terminalOne = liveCodexPromptObservation(
+      "qry_terminal_admission_one",
+      "ses_terminal_admission_one",
+      startedAt
+    );
+    const terminalTwo = liveCodexPromptObservation(
+      "qry_terminal_admission_two",
+      "ses_terminal_admission_two",
+      startedAt
+    );
+    for (const prompt of [terminalOne, terminalTwo]) {
+      await service.observeSafeObservation(prompt);
+    }
+    await waitUntil(() => received.filter((event) =>
+      event.eventType === "run.start"
+      && (event.runId === "run_terminal_admission_one" || event.runId === "run_terminal_admission_two")
+    ).length === 2);
+
+    const slowPrompt = liveCodexPromptObservation(
+      "qry_terminal_admission_slow_update",
+      "ses_terminal_admission_slow_update",
+      startedAt
+    );
+    await service.observeSafeObservation(slowPrompt);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === "run_terminal_admission_slow_update"
+    ));
+    const slowUpdate = service.observeSafeObservation(liveUsageObservation({
+      queryId: "qry_terminal_admission_slow_update",
+      sessionId: "ses_terminal_admission_slow_update",
+      observedAt: completedAt,
+      atomId: "terminal_admission_slow_update",
+      inputTokens: 10,
+      outputTokens: 2
+    }));
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.update" && event.runId === "run_terminal_admission_slow_update"
+    ));
+
+    const internals = service as unknown as {
+      queueSafeObservation: (observation: SafeObservationV1) => Promise<boolean>;
+    };
+    await expect(internals.queueSafeObservation(liveCodexPromptObservation(
+      "qry_terminal_admission_unrelated_anchor",
+      "ses_terminal_admission_unrelated_anchor",
+      completedAt
+    ))).resolves.toBe(true);
+
+    let admissionsResolved = false;
+    const admissions = Promise.all([
+      service.admitSafeObservation(liveCompletionObservation(terminalOne, completedAt, "stop_hook")),
+      service.admitSafeObservation(liveCompletionObservation(terminalTwo, completedAt, "stop_hook"))
+    ]).then(() => {
+      admissionsResolved = true;
+    });
+    try {
+      await waitUntil(() => received.some((event) =>
+        event.eventType === "run.start" && event.runId === "run_terminal_admission_unrelated_anchor"
+      ));
+      await waitUntil(() => admissionsResolved);
+      await expect(service.status()).resolves.toMatchObject({
+        queuedItems: expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "run.ended",
+            subjectId: "run.ended:run_terminal_admission_one",
+            deliveryState: "pending"
+          }),
+          expect.objectContaining({
+            eventType: "run.ended",
+            subjectId: "run.ended:run_terminal_admission_two",
+            deliveryState: "pending"
+          })
+        ])
+      });
+    } finally {
+      releaseUnrelatedAnchor?.();
+      releaseSlowUpdate?.();
+      await Promise.all([slowUpdate, admissions]);
+    }
+  });
+
+  it("does not start another delivery after shutdown begins", async () => {
+    const received: Array<{ eventType?: string; runId?: string }> = [];
+    let releaseSlowUpdate: (() => void) | undefined;
+    let releaseBypassStart: (() => void) | undefined;
+    const slowUpdateReleased = new Promise<void>((resolve) => {
+      releaseSlowUpdate = resolve;
+    });
+    const bypassStartReleased = new Promise<void>((resolve) => {
+      releaseBypassStart = resolve;
+    });
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as { eventType?: string; runId?: string };
+        received.push(event);
+        if (event.eventType === "run.update" && event.runId === "run_shutdown_slow") {
+          await slowUpdateReleased;
+        }
+        if (event.eventType === "run.start" && event.runId === "run_shutdown_bypass") {
+          await bypassStartReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_shutdown_gate", root: "/tmp/shutdown-gate" }]
+      }
+    });
+    await service.start();
+    startedServices.push(service);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.observeSafeObservation(liveCodexPromptObservation(
+      "qry_shutdown_slow",
+      "ses_shutdown_slow",
+      "2026-06-08T00:00:00.000Z"
+    ));
+    const slowUpdate = service.observeSafeObservation(liveUsageObservation({
+      queryId: "qry_shutdown_slow",
+      sessionId: "ses_shutdown_slow",
+      observedAt: "2026-06-08T00:00:01.000Z",
+      atomId: "shutdown_slow",
+      inputTokens: 10,
+      outputTokens: 2
+    }));
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.update" && event.runId === "run_shutdown_slow"
+    ));
+
+    const bypassStart = service.observeSafeObservation(liveCodexPromptObservation(
+      "qry_shutdown_bypass",
+      "ses_shutdown_bypass",
+      "2026-06-08T00:00:02.000Z"
+    ));
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === "run_shutdown_bypass"
+    ));
+    await service.observeSafeObservation(liveCodexPromptObservation(
+      "qry_shutdown_pending",
+      "ses_shutdown_pending",
+      "2026-06-08T00:00:03.000Z"
+    ));
+
+    const stopping = service.stop();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseSlowUpdate?.();
+    releaseBypassStart?.();
+    await Promise.all([slowUpdate, bypassStart, stopping]);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(received).not.toContainEqual(expect.objectContaining({ runId: "run_shutdown_pending" }));
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 1 });
+
+    await service.start();
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === "run_shutdown_pending"
+    ));
+    await expect(service.status()).resolves.toMatchObject({ queuedCount: 0 });
   });
 
   it("preserves provider metric evidence on live skill activity updates", async () => {
@@ -1725,6 +4867,104 @@ describe("external webhook dispatch", () => {
     expect(secondUpdate.context.contextGrowthRatio).toBeCloseTo(38_902 / 24_360, 8);
   });
 
+  it("keeps catalog usage value on subscription Codex live run updates without claiming billed cost", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_codex_subscription_live_value",
+          root: "/tmp/codex-subscription-live-value"
+        }]
+      }
+    });
+    const queryId = "qry_codex_subscription_live_value";
+    const sessionId = "ses_codex_subscription_live_value";
+
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeSafeObservation(liveCodexPromptObservation(
+      queryId,
+      sessionId,
+      "2026-07-16T00:00:00.000Z"
+    ));
+    await waitUntil(() => received.some((event) => event.eventType === "run.start"));
+
+    const firstUsage = liveUsageObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-16T00:00:02.000Z",
+      atomId: "atom_codex_subscription_live_value_first",
+      inputTokens: 10,
+      outputTokens: 5
+    });
+    firstUsage.usageAtoms[0] = {
+      ...firstUsage.usageAtoms[0],
+      billingContext: "subscription",
+      model: "gpt-5.4"
+    };
+    await service.observeSafeObservation(firstUsage);
+    await waitUntil(() => received.some((event) => event.eventType === "run.update"));
+
+    expect(received.find((event) => event.eventType === "run.update")).toMatchObject({
+      eventType: "run.update",
+      runId: "run_codex_subscription_live_value",
+      codingHarness: "codex",
+      llmModels: ["gpt-5.4"],
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      estimatedNanoUsd: 0,
+      usageValueNanoUsd: 100_000,
+      costEstimateBasis: "unavailable",
+      costCoverage: "unavailable",
+      coverage: expect.objectContaining({
+        costCoverage: "unavailable"
+      })
+    });
+
+    const secondUsage = liveUsageObservation({
+      queryId,
+      sessionId,
+      observedAt: "2026-07-16T00:00:03.000Z",
+      atomId: "atom_codex_subscription_live_value_second",
+      inputTokens: 20,
+      outputTokens: 4
+    });
+    secondUsage.usageAtoms[0] = {
+      ...secondUsage.usageAtoms[0],
+      billingContext: "subscription",
+      model: "gpt-5.4"
+    };
+    await service.observeSafeObservation(secondUsage);
+    await waitUntil(() => received.filter((event) => event.eventType === "run.update").length >= 2);
+
+    expect(received.filter((event) => event.eventType === "run.update").at(-1)).toMatchObject({
+      eventType: "run.update",
+      runId: "run_codex_subscription_live_value",
+      codingHarness: "codex",
+      llmModels: ["gpt-5.4"],
+      inputTokens: 30,
+      outputTokens: 9,
+      totalTokens: 39,
+      estimatedNanoUsd: 0,
+      usageValueNanoUsd: 210_000,
+      costEstimateBasis: "unavailable",
+      costCoverage: "unavailable",
+      coverage: expect.objectContaining({
+        costCoverage: "unavailable"
+      })
+    });
+  });
+
   it("reconciles live Codex usage from raw authorities and excludes pre-prompt work", async () => {
     const received: unknown[] = [];
     const server = createServer((request, response) => {
@@ -1916,6 +5156,126 @@ describe("external webhook dispatch", () => {
     expect(updates.at(-1)?.activity.filter((activity) => activity.kind === "llm_request")).toHaveLength(1);
   });
 
+  it.each([
+    {
+      fixture: "exact one-event to one-request",
+      eventCount: 1,
+      requestCount: 1,
+      expectedInputTokens: 10,
+      expectedOutputTokens: 2,
+      expectedLlmActivityCount: 1
+    },
+    {
+      fixture: "ambiguous two-events to one-request",
+      eventCount: 2,
+      requestCount: 1,
+      expectedInputTokens: 30,
+      expectedOutputTokens: 6,
+      expectedLlmActivityCount: 3
+    },
+    {
+      fixture: "ambiguous one-event to two-requests",
+      eventCount: 1,
+      requestCount: 2,
+      expectedInputTokens: 30,
+      expectedOutputTokens: 6,
+      expectedLlmActivityCount: 3
+    }
+  ])("suppresses only mutually unique live usage corroboration: $fixture", async ({
+    fixture,
+    eventCount,
+    requestCount,
+    expectedInputTokens,
+    expectedOutputTokens,
+    expectedLlmActivityCount
+  }) => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const fixtureId = fixture.replace(/[^a-z0-9]+/g, "_");
+    const rootQueryId = `qry_corroboration_cardinality_${fixtureId}`;
+    const sessionId = `ses_corroboration_cardinality_${fixtureId}`;
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: `repo_corroboration_cardinality_${fixtureId}`,
+          root: `/tmp/corroboration-cardinality-${fixtureId}`
+        }]
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeSafeObservation(liveCodexPromptObservation(
+      rootQueryId,
+      sessionId,
+      "2026-06-08T00:00:00.000Z"
+    ));
+    await waitUntil(() => received.some((event) => event.eventType === "run.start"));
+
+    const template = liveUsageObservation({
+      queryId: rootQueryId,
+      sessionId,
+      observedAt: "2026-06-08T00:00:02.000Z",
+      sourceStartedAt: "2026-06-08T00:00:01.900Z",
+      sourceEndedAt: "2026-06-08T00:00:02.000Z",
+      atomId: `template_${fixtureId}`,
+      inputTokens: 10,
+      outputTokens: 2
+    });
+    const usageTemplate = template.usageAtoms[0];
+    const eventAtoms = Array.from({ length: eventCount }, (_, index) => {
+      const queryId = `${rootQueryId}_event_${index + 1}`;
+      return {
+        ...usageTemplate,
+        atomId: `atom_${fixtureId}_event_${index + 1}`,
+        correlationId: queryId,
+        queryId,
+        requestId: `req_${fixtureId}_event_${index + 1}`,
+        authority: "event" as const,
+        signal: "traces" as const,
+        sourceId: `otlp_trace_${fixtureId}_${index + 1}`
+      };
+    });
+    const requestAtoms = Array.from({ length: requestCount }, (_, index) => {
+      const queryId = index === 0 ? rootQueryId : `${rootQueryId}_request_${index + 1}`;
+      return {
+        ...usageTemplate,
+        atomId: `atom_${fixtureId}_request_${index + 1}`,
+        correlationId: queryId,
+        queryId,
+        requestId: `req_${fixtureId}_request_${index + 1}`,
+        authority: "request" as const,
+        signal: "logs" as const,
+        sourceId: `otlp_log_${fixtureId}_${index + 1}`
+      };
+    });
+    await service.observeSafeObservation({
+      ...template,
+      observationId: `obs_corroboration_cardinality_${fixtureId}`,
+      sourceId: `source_corroboration_cardinality_${fixtureId}`,
+      signal: "logs",
+      recordCount: eventCount + requestCount,
+      usageAtoms: [...eventAtoms, ...requestAtoms]
+    });
+    await waitUntil(() => received.some((event) => event.eventType === "run.update"));
+
+    const update = received.find((event) => event.eventType === "run.update") as unknown as RunUpdatedWebhookEventV1;
+    expect(update).toMatchObject({
+      inputTokens: expectedInputTokens,
+      outputTokens: expectedOutputTokens,
+      totalTokens: expectedInputTokens + expectedOutputTokens
+    });
+    expect(update.activity.filter((activity) => activity.kind === "llm_request"))
+      .toHaveLength(expectedLlmActivityCount);
+  });
+
   it("keeps live activity beside usage and replaces same-request token revisions", async () => {
     const received: unknown[] = [];
     const server = createServer((request, response) => {
@@ -2045,6 +5405,336 @@ describe("external webhook dispatch", () => {
     ]);
   });
 
+  it("retains a native permission denial through live same-identity collision replays", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+
+    for (const [suffix, replay] of [
+      ["failure_first", ["failure", "decision"]],
+      ["decision_first", ["decision", "failure"]]
+    ] as const) {
+      const queryId = `qry_live_native_decision_${suffix}`;
+      const sessionId = `ses_live_native_decision_${suffix}`;
+      const { service } = await testService({
+        repositories: {
+          listRepositories: async () => [{ repoKey: "repo_live_native_decision", root: "/tmp/live-native-decision" }]
+        }
+      });
+      await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+      await service.observeSafeObservation(livePromptObservation(
+        queryId,
+        sessionId,
+        "2026-07-14T04:00:00.000Z"
+      ));
+      await waitUntil(() => received.some((event) =>
+        event.eventType === "run.start" && event.runId === `run_live_native_decision_${suffix}`));
+
+      const base = {
+        schemaVersion: 1 as const,
+        queryId,
+        sessionId,
+        requestId: `req_live_native_decision_${suffix}`,
+        provider: "claude-code" as const,
+        runtime: "claude-code",
+        kind: "tool" as const,
+        name: "Write",
+        startedAt: "2026-07-14T04:00:01.000Z"
+      };
+      const decision: SafeObservationV1 = {
+        schemaVersion: 1,
+        observationId: `obs_live_native_decision_${suffix}`,
+        sourceId: "otlp_claude_code_logs",
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "logs",
+        profileVersion: "claude-code-otlp-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: "2026-07-14T04:00:01.000Z",
+        activityAtoms: [{
+          ...base,
+          activityId: `act_live_native_decision_${suffix}`,
+          outcome: "rejected",
+          outcomeAuthority: "native_permission_decision",
+          evidenceBasis: "otel_event",
+          evidenceSourceId: "otlp_claude_code_logs"
+        }],
+        usageAtoms: []
+      };
+      const genericFailure: SafeObservationV1 = {
+        ...decision,
+        observationId: `obs_live_native_failure_${suffix}`,
+        sourceId: "otlp_claude_code_traces",
+        signal: "traces",
+        profileVersion: "claude-code-otlp-traces-v1",
+        observedAt: "2026-07-14T04:00:02.000Z",
+        activityAtoms: [{
+          ...base,
+          // This deliberate legacy collision proves the live source map keeps
+          // the native decision until semantic projection resolves it.
+          activityId: `act_live_native_decision_${suffix}`,
+          outcome: "failure",
+          durationMs: 1_000,
+          resultSizeBytes: 256,
+          providerReportedResultTokens: 12,
+          evidenceBasis: "trace_span",
+          evidenceSourceId: "otlp_claude_code_traces",
+          endedAt: "2026-07-14T04:00:02.000Z"
+        }],
+        usageAtoms: []
+      };
+      for (const item of replay) {
+        await service.observeSafeObservation(item === "decision" ? decision : genericFailure);
+      }
+      await waitUntil(() => received.some((event) =>
+        event.eventType === "run.update"
+        && event.runId === `run_live_native_decision_${suffix}`
+        && Array.isArray(event.activity)
+        && event.activity.some((activity: { outcome?: string }) => activity.outcome === "rejected")));
+
+      const update = received.filter((event) =>
+        event.eventType === "run.update" && event.runId === `run_live_native_decision_${suffix}`
+      ).at(-1) as {
+        activity: Array<Record<string, unknown>>;
+      };
+      expect(update.activity.filter((activity) => activity.kind === "tool")).toEqual([
+        expect.objectContaining({
+          name: "Write",
+          outcome: "rejected",
+          count: 1,
+          failureCount: 1,
+          rejectedCount: 1
+        })
+      ]);
+      const [write] = update.activity.filter((activity) => activity.kind === "tool");
+      expect(write).not.toHaveProperty("endedAt");
+      expect(write).not.toHaveProperty("durationMs");
+      expect(write).not.toHaveProperty("resultSizeBytes");
+      expect(write).not.toHaveProperty("providerReportedResultTokens");
+    }
+  });
+
+  it("keeps a rejected Claude root open and isolates a later tool-free root terminal", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const sharedSessionId = "ses_claude_permission_boundary";
+    const rejectedQueryId = "qry_claude_permission_rejected";
+    const laterQueryId = "qry_claude_permission_later";
+    const rejectedStartedAt = "2026-07-14T08:25:00.000Z";
+    const laterStartedAt = "2026-07-14T08:26:00.000Z";
+    const laterCompletedAt = "2026-07-14T08:26:01.000Z";
+    let now = Date.parse(rejectedStartedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_claude_permission_boundary",
+          root: "/tmp/claude-permission-boundary"
+        }]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    const rejectedPrompt = livePromptObservation(
+      rejectedQueryId,
+      sharedSessionId,
+      rejectedStartedAt
+    );
+    await service.observeSafeObservation(rejectedPrompt);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === `run_${rejectedQueryId.slice(4)}`));
+
+    now = Date.parse("2026-07-14T08:25:01.000Z");
+    await service.observeSafeObservation({
+      schemaVersion: 1,
+      observationId: "obs_claude_permission_rejected",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "claude-code-otlp-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date(now).toISOString(),
+      activityAtoms: [{
+        schemaVersion: 1,
+        activityId: "act_claude_permission_rejected",
+        queryId: rejectedQueryId,
+        sessionId: sharedSessionId,
+        requestId: "req_claude_permission_rejected",
+        provider: "claude-code",
+        runtime: "claude-code",
+        kind: "tool",
+        name: "Bash",
+        outcome: "rejected",
+        outcomeAuthority: "native_permission_decision",
+        evidenceBasis: "otel_event",
+        evidenceSourceId: "otlp_claude_code_logs",
+        startedAt: new Date(now).toISOString()
+      }],
+      usageAtoms: []
+    });
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.update"
+      && event.runId === `run_${rejectedQueryId.slice(4)}`
+      && Array.isArray(event.activity)
+      && event.activity.some((activity: { outcome?: string }) => activity.outcome === "rejected")));
+    await service.retryNow();
+    expect(received.filter((event) =>
+      event.eventType === "run.ended" && event.runId === `run_${rejectedQueryId.slice(4)}`
+    )).toHaveLength(0);
+
+    now = Date.parse(laterStartedAt);
+    const laterPrompt = livePromptObservation(laterQueryId, sharedSessionId, laterStartedAt);
+    await service.observeSafeObservation(laterPrompt);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.start" && event.runId === `run_${laterQueryId.slice(4)}`));
+
+    now = Date.parse(laterCompletedAt);
+    await service.observeSafeObservation(liveCompletionObservation(
+      laterPrompt,
+      laterCompletedAt,
+      "stop_hook"
+    ));
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === `run_${laterQueryId.slice(4)}`));
+
+    expect(received.filter((event) => event.eventType === "run.ended")).toEqual([
+      expect.objectContaining({ runId: `run_${laterQueryId.slice(4)}` })
+    ]);
+    const laterTerminal = received.find((event) =>
+      event.eventType === "run.ended" && event.runId === `run_${laterQueryId.slice(4)}`
+    ) as {
+      filesChanged: string[];
+      activity: Array<{ outcome?: string }>;
+      traceIds: string[];
+    };
+    expect(laterTerminal.filesChanged).toEqual([]);
+    expect(laterTerminal.activity).toEqual([]);
+    expect(laterTerminal.traceIds).not.toContain(rejectedQueryId);
+    expect(received.filter((event) =>
+      event.eventType === "run.ended" && event.runId === `run_${rejectedQueryId.slice(4)}`
+    )).toHaveLength(0);
+  });
+
+  it("preserves a native denied tool outcome without a causal file claim in the final lifecycle", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const run = {
+      ...productionRun({
+        runId: "run_terminal_native_decision",
+        queryId: "qry_terminal_native_decision",
+        correlationId: "trace_terminal_native_decision",
+        provider: "claude-code",
+        runtime: "claude-code",
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        startedAt: "2026-07-14T04:00:00.000Z",
+        endedAt: "2026-07-14T04:00:03.000Z"
+      }),
+      repositoryKey: "repo_terminal_native_decision",
+      breakdown: [{
+        schemaVersion: 1 as const,
+        breakdownId: "brk_terminal_native_decision_write",
+        kind: "tool" as const,
+        name: "Write",
+        count: 1,
+        failureCount: 1,
+        rejectedCount: 1,
+        attributionBasis: "activity_only" as const,
+        coverage: "unavailable" as const
+      }]
+    };
+    const { service } = await testService({
+      attribution: {
+        listWorkEpisodes: async () => [workEpisode(
+          "run_terminal_native_decision",
+          "qry_terminal_native_decision",
+          [],
+          "repo_terminal_native_decision"
+        )]
+      },
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_terminal_native_decision", root: "/tmp/terminal-native-decision" }],
+        relativePaths: () => []
+      }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeCompletedRuns([run]);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === "run_terminal_native_decision"));
+
+    const terminal = received.find((event) =>
+      event.eventType === "run.ended" && event.runId === "run_terminal_native_decision") as {
+        filesChanged: string[];
+        activity: Array<Record<string, unknown>>;
+      };
+    expect(terminal.filesChanged).toEqual([]);
+    expect(terminal.activity).toEqual([
+      expect.objectContaining({
+        kind: "tool",
+        name: "Write",
+        outcome: "rejected",
+        count: 1,
+        failureCount: 1,
+        rejectedCount: 1
+      }),
+      expect.objectContaining({
+        kind: "unknown",
+        name: "Unallocated run usage"
+      })
+    ]);
+    const rejectedWrite = terminal.activity.find((activity) => activity.outcome === "rejected");
+    expect(rejectedWrite).toBeDefined();
+    for (const field of [
+      "endedAt",
+      "durationMs",
+      "resultSizeBytes",
+      "providerReportedResultTokens",
+      "inputTokens",
+      "outputTokens",
+      "cacheReadInputTokens",
+      "cacheCreationInputTokens",
+      "reasoningOutputTokens",
+      "totalTokens",
+      "usageAttributionBasis",
+      "usageCoverage"
+    ]) {
+      expect(rejectedWrite).not.toHaveProperty(field);
+    }
+  });
+
   it("delivers explicit terminal evidence promptly across supported harnesses", async () => {
     const received: Array<Record<string, unknown>> = [];
     const server = createServer((request, response) => {
@@ -2111,6 +5801,7 @@ describe("external webhook dispatch", () => {
       runId: string;
       evidence: { basis: string; delayed: boolean };
       coverage: { usageCoverage: string };
+      outcome?: string;
       state: string;
     }>;
     expect(terminals).toEqual(expect.arrayContaining([
@@ -2119,6 +5810,176 @@ describe("external webhook dispatch", () => {
       expect.objectContaining({ runId: "run_live_terminal_cursor", evidence: expect.objectContaining({ basis: "session_hook", delayed: false }), coverage: expect.objectContaining({ usageCoverage: "none" }), state: "completed" }),
       expect.objectContaining({ runId: "run_live_terminal_github-copilot", evidence: expect.objectContaining({ basis: "root_span", delayed: false }), coverage: expect.objectContaining({ usageCoverage: "none" }), state: "completed" })
     ]));
+    expect(terminals.every((terminal) => terminal.outcome == null)).toBe(true);
+  });
+
+  it("publishes and monotonically retains an evidence-backed failed terminal outcome", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const startedAt = "2026-07-12T06:00:00.000Z";
+    const failedAt = "2026-07-12T06:00:01.000Z";
+    const correctedAt = "2026-07-12T06:00:02.000Z";
+    const weakerFailureAt = "2026-07-12T06:00:02.500Z";
+    let now = Date.parse(startedAt);
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_live_failure", root: "/tmp/live-failure" }]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1_000 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    const prompt = livePromptObservation(
+      "qry_live_claude_stop_failure",
+      "ses_live_claude_stop_failure",
+      startedAt
+    );
+    await service.observeSafeObservation(prompt);
+    await waitUntil(() => received.some((event) => event.eventType === "run.start"));
+
+    now = Date.parse(failedAt);
+    await service.observeSafeObservation(liveCompletionObservation(
+      prompt,
+      failedAt,
+      "stop_hook",
+      "failure"
+    ));
+    now = Date.parse(correctedAt);
+    await service.observeSafeObservation({
+      ...liveCompletionObservation(prompt, correctedAt, "provider_completed_event"),
+      observationId: "obs_live_claude_stop_failure_lower_information"
+    });
+    now = Date.parse(weakerFailureAt);
+    await service.observeSafeObservation({
+      ...liveCompletionObservation(prompt, weakerFailureAt, "provider_completed_event", "failure"),
+      observationId: "obs_live_claude_stop_failure_weaker_failure_evidence"
+    });
+    now += 1_001;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    expect(received.filter((event) => event.eventType === "run.ended")).toEqual([
+      expect.objectContaining({
+        runId: "run_live_claude_stop_failure",
+        state: "completed",
+        version: 1,
+        outcome: "failure",
+        endedAt: failedAt,
+        evidence: expect.objectContaining({
+          basis: "stop_hook",
+          observedAt: failedAt,
+          delayed: false
+        })
+      })
+    ]);
+  });
+
+  it("publishes a recovered zero-usage failed occurrence with unavailable usage coverage", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const run = new DefaultProductionUsagePipeline().project(
+      [],
+      new Date("2026-07-12T06:00:03.000Z"),
+      [{
+        schemaVersion: 1,
+        queryId: "qry_recovered_claude_failure",
+        sessionId: "ses_recovered_claude_failure",
+        lifecycleVisibility: "customer",
+        provider: "claude-code",
+        runtime: "claude-code",
+        startedAt: "2026-07-12T06:00:00.000Z",
+        completedAt: "2026-07-12T06:00:01.000Z",
+        completionEvidence: "stop_hook",
+        completionOutcome: "failure",
+        repositoryKey: "repo_recovered_claude_failure",
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }]
+    )[0];
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{
+          repoKey: "repo_recovered_claude_failure",
+          root: "/tmp/recovered-claude-failure"
+        }]
+      },
+      now: () => Date.parse("2026-07-12T06:00:03.000Z"),
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeCompletedRuns([run]);
+    await waitUntil(() => received.some((event) => event.eventType === "run.ended"));
+
+    expect(received.find((event) => event.eventType === "run.ended")).toMatchObject({
+      runId: "run_recovered_claude_failure",
+      state: "completed",
+      outcome: "failure",
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      llmModels: [],
+      estimatedNanoUsd: 0,
+      costEstimateBasis: "unavailable",
+      costCoverage: "unavailable",
+      evidence: {
+        basis: "stop_hook",
+        delayed: true,
+        identityConfidence: "high",
+        timingConfidence: "high"
+      },
+      coverage: { usageCoverage: "none", costCoverage: "unavailable" }
+    });
+    const firstTerminal = received.find((event) => event.eventType === "run.ended") as RunEndedWebhookEventV1;
+    const { outcome: _outcome, ...lowerInformationTerminal } = firstTerminal;
+    const internals = service as unknown as {
+      queueRunEndedEvent: (event: RunEndedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    await internals.queueRunEndedEvent({
+      ...lowerInformationTerminal,
+      eventId: "evt_recovered_claude_failure_lower_information",
+      endedAt: "2026-07-12T06:00:02.000Z",
+      traceIds: [...lowerInformationTerminal.traceIds, "trace_lower_information_correction"],
+      evidence: {
+        ...lowerInformationTerminal.evidence,
+        basis: "otel_event"
+      }
+    }, `run.ended:${run.runId}`);
+    await internals.processDueEntries();
+    await waitUntil(() => received.filter((event) => event.eventType === "run.ended").length === 2);
+    const terminals = received.filter((event) => event.eventType === "run.ended");
+    expect(terminals.map((event) => event.version)).toEqual([1, 2]);
+    expect(terminals[1]).toMatchObject({
+      outcome: "failure",
+      endedAt: "2026-07-12T06:00:01.000Z",
+      evidence: {
+        basis: "stop_hook",
+        observedAt: "2026-07-12T06:00:01.000Z",
+        delayed: true,
+        identityConfidence: "high",
+        timingConfidence: "high"
+      },
+      coverage: { usageCoverage: "none", costCoverage: "unavailable" }
+    });
   });
 
   it("keeps Codex child turns on one root lifecycle and ends from the closed root turn", async () => {
@@ -2397,6 +6258,298 @@ describe("external webhook dispatch", () => {
     });
   });
 
+  it("keeps a delivered child terminal on its original subject through a late parent link so an exact native correction remains routable", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const parentQueryId = "qry_late_link_parent";
+    const parentSessionId = "ses_late_link_parent";
+    const childQueryId = "qry_late_link_child";
+    const childSessionId = "ses_late_link_child";
+    const childRunId = "run_late_link_child";
+    let now = Date.parse("2026-07-14T14:00:00.000Z");
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_late_link", root: "/tmp/late-link" }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const parentPrompt = livePromptObservation(parentQueryId, parentSessionId, new Date(now).toISOString());
+    await service.observeSafeObservation(parentPrompt);
+    const childPrompt = livePromptObservation(childQueryId, childSessionId, "2026-07-14T14:00:01.000Z");
+    await service.observeSafeObservation(childPrompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId: childQueryId,
+      sessionId: childSessionId,
+      observedAt: "2026-07-14T14:00:01.500Z",
+      invocationId: "invocation_late_link_rejected",
+      activityRequestId: "req_activity_late_link_rejected",
+      nodeRequestId: "req_hook_late_link_rejected",
+      artifactKeys: ["artifact_rejected"]
+    }));
+    now = Date.parse("2026-07-14T14:00:02.000Z");
+    await service.observeSafeObservation(liveCompletionObservation(childPrompt, new Date(now).toISOString(), "stop_hook"));
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === childRunId
+    ));
+
+    const lateLinkedChild: SafeObservationV1 = {
+      ...childPrompt,
+      observationId: "obs_late_link_child_parent_bound",
+      observedAt: "2026-07-14T14:00:03.000Z",
+      queryOccurrences: childPrompt.queryOccurrences?.map((occurrence) => ({
+        ...occurrence,
+        parentSessionId
+      }))
+    };
+    now = Date.parse(lateLinkedChild.observedAt);
+    await service.observeSafeObservation(lateLinkedChild);
+    now += 1;
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId: childQueryId,
+      sessionId: childSessionId,
+      observedAt: new Date(now).toISOString(),
+      startedAt: "2026-07-14T14:00:02.000Z",
+      invocationId: "invocation_late_link_rejected",
+      activityRequestId: "req_activity_late_link_rejected",
+      nodeRequestId: "req_otlp_late_link_rejected"
+    }));
+    await waitUntil(() => received.filter((event) =>
+      event.eventType === "run.ended" && event.runId === childRunId
+    ).length === 2);
+
+    const childTerminals = received.filter((event) =>
+      event.eventType === "run.ended" && event.runId === childRunId
+    ) as Array<{ version: number; filesChanged: string[] }>;
+    expect(childTerminals).toEqual([
+      expect.objectContaining({ version: 1, filesChanged: ["src/rejected.ts"] }),
+      expect.objectContaining({ version: 2, filesChanged: [] })
+    ]);
+    expect(received.filter((event) => event.eventType === "run.ended" && event.runId === "run_late_link_parent"))
+      .toHaveLength(0);
+  });
+
+  it("keeps a selected-but-not-yet-durable child terminal on its child subject during a concurrent late parent link", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const parentQueryId = "qry_terminal_barrier_parent";
+    const parentSessionId = "ses_terminal_barrier_parent";
+    const childQueryId = "qry_terminal_barrier_child";
+    const childSessionId = "ses_terminal_barrier_child";
+    let now = Date.parse("2026-07-14T15:00:00.000Z");
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_terminal_barrier", root: "/tmp/terminal-barrier" }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const parentPrompt = livePromptObservation(parentQueryId, parentSessionId, new Date(now).toISOString());
+    await service.observeSafeObservation(parentPrompt);
+    const childPrompt = livePromptObservation(childQueryId, childSessionId, "2026-07-14T15:00:01.000Z");
+    await service.observeSafeObservation(childPrompt);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId: childQueryId,
+      sessionId: childSessionId,
+      observedAt: "2026-07-14T15:00:01.500Z",
+      invocationId: "invocation_terminal_barrier",
+      activityRequestId: "req_activity_terminal_barrier",
+      nodeRequestId: "req_hook_terminal_barrier",
+      artifactKeys: ["artifact_rejected"]
+    }));
+
+    type DeliveredTerminalReader = (...args: unknown[]) => Promise<unknown>;
+    const dispatch = service as unknown as { deliveredRunEndedForSubject: DeliveredTerminalReader };
+    const originalDeliveredTerminalReader = dispatch.deliveredRunEndedForSubject;
+    let markSelectionBlocked: () => void = () => undefined;
+    const selectionBlocked = new Promise<void>((resolve) => {
+      markSelectionBlocked = resolve;
+    });
+    let releaseSelection: () => void = () => undefined;
+    const selectionReleased = new Promise<void>((resolve) => {
+      releaseSelection = resolve;
+    });
+    let blockNextRead = true;
+    dispatch.deliveredRunEndedForSubject = async (...args) => {
+      if (blockNextRead) {
+        blockNextRead = false;
+        markSelectionBlocked();
+        await selectionReleased;
+      }
+      return await originalDeliveredTerminalReader.apply(service, args);
+    };
+
+    now = Date.parse("2026-07-14T15:00:02.000Z");
+    const terminalAdmission = service.observeSafeObservation(
+      liveCompletionObservation(childPrompt, new Date(now).toISOString(), "stop_hook")
+    );
+    await selectionBlocked;
+
+    const lateLinkedChild: SafeObservationV1 = {
+      ...childPrompt,
+      observationId: "obs_terminal_barrier_child_parent_bound",
+      observedAt: "2026-07-14T15:00:02.100Z",
+      queryOccurrences: childPrompt.queryOccurrences?.map((occurrence) => ({
+        ...occurrence,
+        parentSessionId
+      }))
+    };
+    let lateLinkCompleted = false;
+    const lateLinkAdmission = service.observeSafeObservation(lateLinkedChild).then(() => {
+      lateLinkCompleted = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lateLinkCompleted).toBe(false);
+
+    releaseSelection();
+    await Promise.all([terminalAdmission, lateLinkAdmission]);
+    await service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId: childQueryId,
+      sessionId: childSessionId,
+      observedAt: "2026-07-14T15:00:02.200Z",
+      startedAt: "2026-07-14T15:00:02.000Z",
+      invocationId: "invocation_terminal_barrier",
+      activityRequestId: "req_activity_terminal_barrier",
+      nodeRequestId: "req_otlp_terminal_barrier"
+    }));
+
+    now += 2;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === "run_terminal_barrier_child"
+    ));
+    const childTerminals = received.filter((event) =>
+      event.eventType === "run.ended" && event.runId === "run_terminal_barrier_child"
+    ) as Array<{ version: number; filesChanged: string[] }>;
+    expect(childTerminals).toEqual([
+      expect.objectContaining({ version: 1, filesChanged: [] })
+    ]);
+    expect(received.filter((event) => event.eventType === "run.ended" && event.runId === "run_terminal_barrier_parent"))
+      .toHaveLength(0);
+  });
+
+  it("admits a fresh run while a same-run terminal correction waits behind a slow terminal delivery", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    let releaseFirstTerminal: () => void = () => undefined;
+    const firstTerminalReleased = new Promise<void>((resolve) => {
+      releaseFirstTerminal = resolve;
+    });
+    let holdFirstTerminal = true;
+    const server = createServer((request, response) => {
+      collectJson(request).then(async (body) => {
+        const event = body as Record<string, unknown>;
+        received.push(event);
+        if (
+          holdFirstTerminal
+          && event.eventType === "run.ended"
+          && event.runId === "run_terminal_hol_a"
+          && event.version === 1
+        ) {
+          holdFirstTerminal = false;
+          await firstTerminalReleased;
+        }
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryA = "qry_terminal_hol_a";
+    const sessionA = "ses_terminal_hol_a";
+    const queryB = "qry_terminal_hol_b";
+    const sessionB = "ses_terminal_hol_b";
+    let now = Date.parse("2026-07-14T15:30:00.000Z");
+    const { service } = await testService({
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_terminal_hol", root: "/tmp/terminal-hol" }],
+        relativePaths: () => ["src/rejected.ts"]
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const promptA = livePromptObservation(queryA, sessionA, new Date(now).toISOString());
+    await service.observeSafeObservation(promptA);
+    await service.observeSafeObservation(liveClaudeWriteProofObservation({
+      queryId: queryA,
+      sessionId: sessionA,
+      observedAt: "2026-07-14T15:30:00.500Z",
+      invocationId: "invocation_terminal_hol_a",
+      activityRequestId: "req_activity_terminal_hol_a",
+      nodeRequestId: "req_hook_terminal_hol_a",
+      artifactKeys: ["artifact_terminal_hol_a"]
+    }));
+    now = Date.parse("2026-07-14T15:30:01.000Z");
+    await service.observeSafeObservation(liveCompletionObservation(promptA, new Date(now).toISOString(), "stop_hook"));
+    now += 2;
+    const firstDelivery = service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === "run_terminal_hol_a" && event.version === 1
+    ));
+
+    let correctionResolved = false;
+    const correction = service.observeSafeObservation(liveClaudeNativeDecisionObservation({
+      queryId: queryA,
+      sessionId: sessionA,
+      observedAt: "2026-07-14T15:30:01.100Z",
+      startedAt: "2026-07-14T15:30:01.000Z",
+      invocationId: "invocation_terminal_hol_a",
+      activityRequestId: "req_activity_terminal_hol_a",
+      nodeRequestId: "req_otlp_terminal_hol_a"
+    })).then(() => {
+      correctionResolved = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(correctionResolved).toBe(false);
+
+    const promptB = livePromptObservation(queryB, sessionB, "2026-07-14T15:30:01.200Z");
+    const freshAdmission = service.observeSafeObservation(promptB);
+    try {
+      await waitUntil(() => received.some((event) =>
+        event.eventType === "run.start" && event.runId === "run_terminal_hol_b"
+      ));
+      expect(correctionResolved).toBe(false);
+    } finally {
+      releaseFirstTerminal();
+      await Promise.all([firstDelivery, correction, freshAdmission]);
+    }
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === "run_terminal_hol_a" && event.version === 2
+    ));
+    const terminalA = received.filter((event) =>
+      event.eventType === "run.ended" && event.runId === "run_terminal_hol_a"
+    ) as Array<{ version: number; filesChanged: string[] }>;
+    expect(terminalA).toEqual([
+      expect.objectContaining({ version: 1, filesChanged: ["src/rejected.ts"] }),
+      expect.objectContaining({ version: 2, filesChanged: [] })
+    ]);
+  });
+
   it("refreshes a pending hook terminal with late live usage before delivery", async () => {
     const received: Array<Record<string, unknown>> = [];
     const server = createServer((request, response) => {
@@ -2440,6 +6593,11 @@ describe("external webhook dispatch", () => {
       queryId,
       sessionId,
       observedAt: "2026-06-08T00:00:01.001Z",
+      // Late arrival is not late provider work: this is the same completed
+      // turn delivered after the hook terminal, so retain its source time at
+      // the explicit completion boundary.
+      sourceStartedAt: completedAt,
+      sourceEndedAt: completedAt,
       atomId: "terminal_refresh_turn",
       inputTokens: 12,
       outputTokens: 3
@@ -2450,6 +6608,9 @@ describe("external webhook dispatch", () => {
       completionMode: "explicit"
     };
     await service.observeSafeObservation(closedTurn);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.update" && event.totalTokens === 15
+    ));
     now += 1_000;
     await service.retryNow();
 
@@ -2468,6 +6629,12 @@ describe("external webhook dispatch", () => {
     expect((ended.activity as Array<{ kind: string }>).filter((activity) =>
       activity.kind === "llm_request"
     )).toHaveLength(1);
+    const lateUsageUpdateIndex = received.findIndex((event) =>
+      event.eventType === "run.update" && event.totalTokens === 15
+    );
+    const terminalIndex = received.findIndex((event) => event.eventType === "run.ended");
+    expect(lateUsageUpdateIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeGreaterThan(lateUsageUpdateIndex);
   });
 
   it("publishes a late closed-root correction immediately after a provisional terminal", async () => {
@@ -2546,6 +6713,95 @@ describe("external webhook dispatch", () => {
     });
     expect(received.filter((event) => event.eventType === "run.start")).toHaveLength(1);
     expect(received.filter((event) => event.eventType === "run.update" && event.totalTokens === 10)).toHaveLength(0);
+  });
+
+  it("lets stronger final terminal usage replace a stale complete-cost estimate with partial coverage", async () => {
+    const received: RunEndedWebhookEventV1[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as RunEndedWebhookEventV1);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const { service } = await testService({ timing: { runEndedGraceMs: 1 } });
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      queueRunEndedEvent: (event: RunEndedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const runId = "run_terminal_partial_cost_correction";
+    const update = runUpdatedEvent({
+      runId,
+      eventId: "evt_terminal_partial_cost_update",
+      state: "running",
+      updatedAt: "2026-07-12T18:19:01.000Z",
+      inputTokens: 8,
+      outputTokens: 2
+    });
+    const {
+      sequence: _sequence,
+      updatedAt: _updatedAt,
+      ...terminalBase
+    } = update;
+    const provisional: RunEndedWebhookEventV1 = {
+      ...terminalBase,
+      eventType: "run.ended",
+      eventId: "evt_terminal_partial_cost_v1",
+      version: 1,
+      endedAt: "2026-07-12T18:19:01.000Z",
+      evidence: {
+        ...terminalBase.evidence,
+        basis: "stop_hook",
+        sourceId: "hook_claude_code_lifecycle"
+      },
+      coverage: {
+        usageCoverage: "complete_so_far",
+        activityCoverage: "partial",
+        costCoverage: "complete"
+      },
+      estimatedNanoUsd: 100_000,
+      costEstimateBasis: "catalog_estimate",
+      costCoverage: "complete",
+      filesChanged: [],
+      state: "completed"
+    };
+    await expect(internals.queueRunEndedEvent(provisional, `run.ended:${runId}`)).resolves.toBe(true);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 1);
+
+    const authoritative: RunEndedWebhookEventV1 = {
+      ...provisional,
+      eventId: "evt_terminal_partial_cost_v2",
+      version: 2,
+      coverage: {
+        ...provisional.coverage,
+        usageCoverage: "final",
+        costCoverage: "partial"
+      },
+      estimatedNanoUsd: 80_000,
+      costCoverage: "partial"
+    };
+    await expect(internals.queueRunEndedEvent(authoritative, `run.ended:${runId}`)).resolves.toBe(true);
+    await internals.processDueEntries();
+    await waitUntil(() => received.length === 2);
+
+    expect(received[1]).toMatchObject({
+      version: 2,
+      inputTokens: 8,
+      outputTokens: 2,
+      totalTokens: 10,
+      estimatedNanoUsd: 80_000,
+      costEstimateBasis: "catalog_estimate",
+      costCoverage: "partial",
+      coverage: {
+        usageCoverage: "final",
+        costCoverage: "partial"
+      }
+    });
   });
 
   it("coalesces an unresolved-child correction and releases it after the bound", async () => {
@@ -3045,6 +7301,8 @@ describe("external webhook dispatch", () => {
       queryId,
       sessionId,
       observedAt: new Date(now).toISOString(),
+      sourceStartedAt: completedAt,
+      sourceEndedAt: completedAt,
       atomId: "cumulative_parent_child_llm_usage",
       inputTokens: 20,
       outputTokens: 5
@@ -3458,7 +7716,13 @@ describe("external webhook dispatch", () => {
             run.runId,
             scenario.root.queryId,
             scenario.writes.map((write) => write.artifactKey),
-            scenario.repositoryKey
+            scenario.repositoryKey,
+            undefined,
+            successfulWriteArtifactProofs(
+              scenario.root.queryId,
+              scenario.repositoryKey,
+              scenario.writes.map((write) => write.artifactKey)
+            )
           )]
         },
         repositories: {
@@ -4041,7 +8305,14 @@ describe("external webhook dispatch", () => {
     const runId = "run_copilot_lifecycle";
     const { service } = await testService({
       attribution: {
-        listWorkEpisodes: async () => [workEpisode(runId, queryId, ["artifact_copilot"], "repo_copilot")]
+        listWorkEpisodes: async () => [workEpisode(
+          runId,
+          queryId,
+          ["artifact_copilot"],
+          "repo_copilot",
+          undefined,
+          successfulWriteArtifactProofs(queryId, "repo_copilot", ["artifact_copilot"])
+        )]
       },
       repositories: {
         listRepositories: async (provider?: "github-copilot" | "claude-code" | "codex") =>
@@ -4057,7 +8328,7 @@ describe("external webhook dispatch", () => {
     await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.start"));
     await service.observeSafeObservation(liveCopilotToolObservation(queryId, sessionId, "2026-06-08T00:00:01.000Z"));
     await waitUntil(() => received.some(isCopilotToolUpdate));
-    await service.observeCompletedRuns([productionRun({
+    await service.observeCompletedRuns([withSuccessfulWriteActivity(productionRun({
       runId,
       queryId,
       sessionId,
@@ -4074,7 +8345,7 @@ describe("external webhook dispatch", () => {
       models: ["gpt-5.4"],
       startedAt: "2026-06-08T00:00:00.000Z",
       endedAt: "2026-06-08T00:00:02.000Z"
-    })]);
+    }))]);
     await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
 
     expect(received.map((event) => (event as { eventType?: string }).eventType))
@@ -4268,7 +8539,7 @@ describe("external webhook dispatch", () => {
     });
   });
 
-  it("versions authoritative terminal corrections without re-emitting run-update", async () => {
+  it("versions late pre-boundary authoritative terminal usage without re-emitting run-update", async () => {
     const diagnostics: DiagnosticEvent[] = [];
     const received: unknown[] = [];
     const server = createServer((request, response) => {
@@ -4313,11 +8584,15 @@ describe("external webhook dispatch", () => {
       "run.ended"
     ]);
 
+    // A later receipt may add provider evidence that began before the already
+    // fixed completion boundary. It is a higher complete replacement terminal,
+    // not a post-terminal running update, even when the first terminal had
+    // authoritative coverage for the evidence received at that version.
     await service.observeCompletedRuns([{
       ...baseRun,
-      outputTokens: 2,
-      totalTokens: 12,
-      endedAt: "2026-06-08T00:00:03.000Z"
+      inputTokens: 12,
+      outputTokens: 6,
+      totalTokens: 18
     }]);
     await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -4340,13 +8615,15 @@ describe("external webhook dispatch", () => {
         version: 1,
         totalTokens: 15,
         endedAt: "2026-06-08T00:00:02.000Z",
+        coverage: expect.objectContaining({ usageCoverage: "final" }),
         activity: [expect.objectContaining({ totalTokens: 15 })]
       }),
       expect.objectContaining({
         version: 2,
-        totalTokens: 12,
-        endedAt: "2026-06-08T00:00:03.000Z",
-        activity: [expect.objectContaining({ totalTokens: 12 })]
+        totalTokens: 18,
+        endedAt: "2026-06-08T00:00:02.000Z",
+        coverage: expect.objectContaining({ usageCoverage: "final" }),
+        activity: [expect.objectContaining({ totalTokens: 18 })]
       })
     ]);
     expect(diagnostics).toEqual(expect.arrayContaining([
@@ -4679,6 +8956,11 @@ describe("external webhook dispatch", () => {
     servers.push(server);
     const address = server.address() as AddressInfo;
     let artifactKeys = ["artifact_src"];
+    let causalWriteArtifacts = successfulWriteArtifactProofs(
+      "qry_delivered_files_stable",
+      "repo_code",
+      artifactKeys
+    );
     const baseRun: ProductionRunV1 = {
       ...productionRun({
         runId: "run_delivered_files_stable",
@@ -4697,8 +8979,9 @@ describe("external webhook dispatch", () => {
         breakdownId: "brk_write_delivered_files_stable",
         kind: "tool",
         name: "Write",
-        count: 1,
-        failureCount: 0,
+        count: 2,
+        failureCount: 1,
+        rejectedCount: 1,
         totalDurationMs: 10,
         attributionBasis: "activity_only",
         coverage: "unavailable"
@@ -4706,11 +8989,22 @@ describe("external webhook dispatch", () => {
     };
     const { service } = await testService({
       attribution: {
-        listWorkEpisodes: async () => [workEpisode("run_delivered_files_stable", "qry_delivered_files_stable", artifactKeys, "repo_code")]
+        listWorkEpisodes: async () => [workEpisode(
+          "run_delivered_files_stable",
+          "qry_delivered_files_stable",
+          artifactKeys,
+          "repo_code",
+          undefined,
+          causalWriteArtifacts
+        )]
       },
       repositories: {
         listRepositories: async () => [{ repoKey: "repo_code", root: "/tmp/code" }],
-        relativePaths: (_repoKey, keys) => keys.map((key) => key === "artifact_src" ? "src/answer.ts" : "src/later.ts")
+        relativePaths: (_repoKey, keys) => keys.map((key) => ({
+          artifact_src: "src/answer.ts",
+          artifact_later: "src/later.ts",
+          artifact_rejected: "src/rejected.ts"
+        }[key] ?? key))
       }
     });
 
@@ -4718,7 +9012,12 @@ describe("external webhook dispatch", () => {
     await service.observeCompletedRuns([baseRun]);
     await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
 
-    artifactKeys = ["artifact_src", "artifact_later"];
+    artifactKeys = ["artifact_src", "artifact_later", "artifact_rejected"];
+    causalWriteArtifacts = successfulWriteArtifactProofs(
+      "qry_delivered_files_stable",
+      "repo_code",
+      ["artifact_src", "artifact_later"]
+    );
     await service.observeCompletedRuns([{
       ...baseRun,
       outputTokens: 5,
@@ -4729,11 +9028,19 @@ describe("external webhook dispatch", () => {
 
     const endedEvents = received
       .filter((event) => (event as { eventType?: string }).eventType === "run.ended")
-      .map((event) => event as { version?: number; filesChanged?: string[] });
+      .map((event) => event as {
+        version?: number;
+        filesChanged?: string[];
+        activity?: Array<{ name: string; outcome: string; count: number; failureCount: number }>;
+      });
     expect(endedEvents).toEqual([
       expect.objectContaining({ version: 1, filesChanged: ["src/answer.ts"] }),
       expect.objectContaining({ version: 2, filesChanged: ["src/answer.ts", "src/later.ts"] })
     ]);
+    expect(endedEvents[0]?.activity).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "Write", outcome: "unknown", count: 2, failureCount: 1 })
+    ]));
+    expect(endedEvents[1]?.filesChanged).not.toContain("src/rejected.ts");
   });
 
   it("does not regress delivered terminal repository or files during late commit reconciliation", async () => {
@@ -4774,7 +9081,14 @@ describe("external webhook dispatch", () => {
         coverage: "unavailable"
       }]
     };
-    const episode = workEpisode(run.runId, run.queryId!, ["artifact_src"], "repo_code");
+    const episode = workEpisode(
+      run.runId,
+      run.queryId!,
+      ["artifact_src"],
+      "repo_code",
+      undefined,
+      successfulWriteArtifactProofs(run.queryId!, "repo_code", ["artifact_src"])
+    );
     const summary = {
       ...commitSummary("active", 0),
       repoKey: "repo_code",
@@ -4828,7 +9142,6 @@ describe("external webhook dispatch", () => {
   });
 
   it("does not turn a delivered read-only Codex terminal into a writer without write activity", async () => {
-    const diagnostics: DiagnosticEvent[] = [];
     const received: unknown[] = [];
     const server = createServer((request, response) => {
       collectJson(request).then((body) => {
@@ -4862,8 +9175,7 @@ describe("external webhook dispatch", () => {
         listRepositories: async () => [{ repoKey: "repo_code", root: "/tmp/code" }],
         relativePaths: (_repoKey, keys) => keys.map(() => "src/later.ts")
       },
-      now: () => now,
-      recordEvent: (event) => diagnostics.push(event)
+      now: () => now
     });
 
     await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
@@ -4881,16 +9193,92 @@ describe("external webhook dispatch", () => {
     }]);
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    expect(received.filter((event) => (event as { eventType?: string }).eventType === "run.ended")).toHaveLength(1);
-    expect(diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        construct: "ExternalWebhookDispatch",
-        operation: "queue",
-        state: "blocked",
-        reason: "webhook_run_delivered_read_only_files_changed_without_write_activity",
-        runId: "run_delivered_read_only"
-      })
-    ]));
+    const ended = received.filter((event) => (event as { eventType?: string }).eventType === "run.ended") as Array<{
+      filesChanged: string[];
+      version: number;
+    }>;
+    expect(ended).toHaveLength(2);
+    expect(ended.map((event) => event.filesChanged)).toEqual([[], []]);
+    expect(ended.map((event) => event.version)).toEqual([1, 2]);
+  });
+
+  it("does not let a rejected Claude Write authorize a later file correction", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    let now = Date.parse("2026-07-14T04:00:00.000Z");
+    let artifactKeys: string[] = [];
+    const rejectedWriteRun: ProductionRunV1 = {
+      ...productionRun({
+        runId: "run_rejected_write_read_only",
+        queryId: "qry_rejected_write_read_only",
+        correlationId: "trace_rejected_write_read_only",
+        provider: "claude-code",
+        runtime: "claude-code",
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        startedAt: "2026-07-14T04:00:00.000Z",
+        endedAt: "2026-07-14T04:00:02.000Z"
+      }),
+      breakdown: [{
+        schemaVersion: 1,
+        breakdownId: "brk_rejected_write_read_only",
+        kind: "tool",
+        name: "Write",
+        count: 1,
+        failureCount: 1,
+        rejectedCount: 1,
+        attributionBasis: "activity_only",
+        coverage: "unavailable"
+      }]
+    };
+    const { service } = await testService({
+      attribution: {
+        listWorkEpisodes: async () => [workEpisode(
+          "run_rejected_write_read_only",
+          "qry_rejected_write_read_only",
+          artifactKeys,
+          "repo_code"
+        )]
+      },
+      repositories: {
+        listRepositories: async () => [{ repoKey: "repo_code", root: "/tmp/code" }],
+        relativePaths: (_repoKey, keys) => keys.map(() => "src/later.ts")
+      },
+      now: () => now
+    });
+
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeCompletedRuns([rejectedWriteRun]);
+    now += 16_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
+
+    artifactKeys = ["artifact_later"];
+    await service.observeCompletedRuns([{
+      ...rejectedWriteRun,
+      outputTokens: 5,
+      totalTokens: 15,
+      endedAt: "2026-07-14T04:00:03.000Z"
+    }]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const ended = received.filter((event) => (event as { eventType?: string }).eventType === "run.ended") as Array<{
+      filesChanged: string[];
+      version: number;
+    }>;
+    expect(ended).toHaveLength(2);
+    expect(ended.map((event) => event.filesChanged)).toEqual([[], []]);
+    expect(ended.map((event) => event.version)).toEqual([1, 2]);
   });
 
   it("suppresses stale pending run-update retries after run-ended is delivered", async () => {
@@ -5097,7 +9485,16 @@ describe("external webhook dispatch", () => {
       queryIds: runs.map((run) => run.queryId),
       evidence: [
         { runId: "run_codex_read_turn", queryId: "qry_codex_read_turn", artifactKeys: [] },
-        { runId: "run_codex_write_turn", queryId: "qry_codex_write_turn", artifactKeys: ["artifact_answer", "artifact_readme"] },
+        {
+          runId: "run_codex_write_turn",
+          queryId: "qry_codex_write_turn",
+          artifactKeys: ["artifact_answer", "artifact_readme"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(
+            "qry_codex_write_turn",
+            "repo_tirion",
+            ["artifact_answer", "artifact_readme"]
+          )
+        },
         { runId: "run_codex_config_turn", queryId: "qry_codex_config_turn", artifactKeys: ["artifact_settings"] }
       ]
     });
@@ -5138,7 +9535,7 @@ describe("external webhook dispatch", () => {
       outputTokens: 23,
       totalTokens: 133,
       llmModels: ["gpt-5.3-codex", "gpt-5.4-codex"],
-      filesChanged: ["README.md", "config/settings.json", "src/answer.ts"],
+      filesChanged: ["README.md", "src/answer.ts"],
       estimatedNanoUsd: 350_000,
       costEstimateBasis: "catalog_estimate",
       costCoverage: "complete",
@@ -5204,7 +9601,7 @@ describe("external webhook dispatch", () => {
         models: ["gpt-5.4-codex"],
         sessionId
       }),
-      productionRun({
+      withSuccessfulWriteActivity(productionRun({
         runId: childRunId,
         queryId: childQueryId,
         correlationId: "trace_codex_desktop_child",
@@ -5219,7 +9616,7 @@ describe("external webhook dispatch", () => {
         endedAt: "2026-06-08T01:00:14.000Z",
         models: ["gpt-5.4-codex"],
         sessionId
-      })
+      }))
     ];
     const episode = workEpisodeWithEvidence({
       episodeId: "episode_codex_desktop",
@@ -5229,7 +9626,16 @@ describe("external webhook dispatch", () => {
       queryIds: runs.map((run) => run.queryId),
       evidence: [
         { runId: subjectRunId, queryId: promptQueryId, artifactKeys: [] },
-        { runId: childRunId, queryId: childQueryId, artifactKeys: ["artifact_answer"] }
+        {
+          runId: childRunId,
+          queryId: childQueryId,
+          artifactKeys: ["artifact_answer"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(
+            childQueryId,
+            "repo_tirion",
+            ["artifact_answer"]
+          )
+        }
       ]
     });
     const { service, storage } = await testService({
@@ -5290,6 +9696,319 @@ describe("external webhook dispatch", () => {
     ]));
   });
 
+  it("keeps a live Codex root open when a linked child completes first after episode attribution disappears", async () => {
+    const diagnostics: DiagnosticEvent[] = [];
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const sessionId = "ses_codex_child_first";
+    const promptQueryId = "qry_codex_child_first_prompt";
+    const childQueryId = "qry_codex_child_first_child";
+    const subjectRunId = "run_codex_child_first_prompt";
+    const childRunId = "run_codex_child_first_child";
+    const rootRun: ProductionRunV1 = {
+      ...productionRun({
+        runId: subjectRunId,
+        queryId: promptQueryId,
+        correlationId: "trace_codex_child_first_prompt",
+        provider: "codex",
+        runtime: "codex",
+        inputTokens: 25,
+        outputTokens: 5,
+        totalTokens: 30,
+        estimatedNanoUsd: 90_000,
+        costEstimateBasis: "catalog_estimate",
+        startedAt: "2026-06-08T01:10:00.000Z",
+        endedAt: "2026-06-08T01:10:10.000Z",
+        models: ["gpt-5.4-codex"],
+        sessionId
+      }),
+      repositoryKey: "repo_tirion"
+    };
+    const childRun: ProductionRunV1 = {
+      ...withSuccessfulWriteActivity(productionRun({
+        runId: childRunId,
+        queryId: childQueryId,
+        correlationId: "trace_codex_child_first_child",
+        provider: "codex",
+        runtime: "codex",
+        inputTokens: 80,
+        outputTokens: 20,
+        totalTokens: 100,
+        estimatedNanoUsd: 260_000,
+        costEstimateBasis: "catalog_estimate",
+        startedAt: "2026-06-08T01:10:02.000Z",
+        endedAt: "2026-06-08T01:10:06.000Z",
+        models: ["gpt-5.4-codex"],
+        sessionId
+      })),
+      repositoryKey: "repo_tirion"
+    };
+    const episode = workEpisodeWithEvidence({
+      episodeId: "episode_codex_child_first",
+      repoKey: "repo_tirion",
+      chatSessionId: sessionId,
+      runIds: [subjectRunId, childRunId],
+      queryIds: [promptQueryId, childQueryId],
+      evidence: [
+        { runId: subjectRunId, queryId: promptQueryId, artifactKeys: [] },
+        {
+          runId: childRunId,
+          queryId: childQueryId,
+          artifactKeys: ["artifact_answer"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(
+            childQueryId,
+            "repo_tirion",
+            ["artifact_answer"]
+          )
+        }
+      ]
+    });
+    const attribution = {
+      ...emptyAttribution(),
+      listWorkEpisodes: async () => [episode]
+    } as AgentVerifiedAttributionService;
+    const repositories = {
+      ...emptyRepositories(),
+      listRepositories: async () => [{ repoKey: "repo_tirion", root: "/tmp/tirion" }],
+      relativePaths: () => ["src/answer.ts"],
+      resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+    } as AgentRepositoryObservationService;
+    const { service, storage, root } = await testService({
+      attribution,
+      repositories,
+      recordEvent: (event) => diagnostics.push(event)
+    });
+    await storage.replaceProductionRuns([childRun]);
+
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeSafeObservation(liveCodexPromptObservation(
+      promptQueryId,
+      sessionId,
+      "2026-06-08T01:10:00.000Z"
+    ));
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.start"));
+    await service.observeSafeObservation(liveCodexSkillMetricObservation(
+      childQueryId,
+      sessionId,
+      "2026-06-08T01:10:03.000Z"
+    ));
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.update"));
+    const updatesBeforeChildCompletion = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "run.update").length;
+    const metadata = await storage.metadata();
+    let attributionAvailable = false;
+    const laggingAttribution = {
+      ...emptyAttribution(),
+      listWorkEpisodes: async () => attributionAvailable ? [episode] : []
+    } as AgentVerifiedAttributionService;
+    const restartedService = new ExternalWebhookDispatchService(
+      storage,
+      { configurationPath: join(root, "webhook-config.json") },
+      laggingAttribution,
+      repositories,
+      undefined,
+      (event) => diagnostics.push(event),
+      metadata.installationId
+    );
+
+    await restartedService.observeCompletedRuns([childRun]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(received).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventType: "run.ended" })
+    ]));
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "suppressed",
+        reason: "codex_child_completion_waiting_for_root",
+        runId: childRunId,
+        queryId: childQueryId,
+        details: { subjectRunId }
+      })
+    ]));
+    expect(diagnostics.find((event) =>
+      event.reason === "codex_child_completion_waiting_for_root"
+    )).not.toHaveProperty("episodeId");
+
+    await service.observeSafeObservation(liveCodexToolObservation(
+      promptQueryId,
+      sessionId,
+      [{
+        activityId: "act_codex_child_first_root_read",
+        name: "Read",
+        startedAt: "2026-06-08T01:10:08.000Z"
+      }],
+      "2026-06-08T01:10:08.000Z"
+    ));
+    await waitUntil(() => received.filter((event) =>
+      (event as { eventType?: string }).eventType === "run.update").length > updatesBeforeChildCompletion);
+    expect(received).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventType: "run.ended" })
+    ]));
+
+    await storage.replaceProductionRuns([rootRun, childRun]);
+    await restartedService.observeCompletedRuns([rootRun]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(received).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventType: "run.ended" })
+    ]));
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "suppressed",
+        reason: "codex_root_completion_waiting_for_attribution",
+        runId: subjectRunId,
+        queryId: promptQueryId,
+        details: {
+          subjectRunId,
+          missingDurableChildRunCount: 1
+        }
+      })
+    ]));
+
+    attributionAvailable = true;
+    await restartedService.observeCompletedRuns([rootRun]);
+    await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const ended = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "run.ended");
+    expect(ended).toHaveLength(1);
+    expect(ended[0]).toMatchObject({
+      eventType: "run.ended",
+      runId: subjectRunId,
+      sessionId,
+      inputTokens: 105,
+      outputTokens: 25,
+      totalTokens: 130,
+      version: 1
+    });
+  });
+
+  it("recovers a start-only synthetic Codex episode after dispatcher restart", async () => {
+    const diagnostics: DiagnosticEvent[] = [];
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const run: ProductionRunV1 = {
+      ...productionRun({
+        runId: "run_codex_start_only_fragment",
+        queryId: "qry_codex_start_only_fragment",
+        correlationId: "trace_codex_start_only_fragment",
+        provider: "codex",
+        runtime: "codex",
+        inputTokens: 40,
+        outputTokens: 8,
+        totalTokens: 48,
+        estimatedNanoUsd: 120_000,
+        costEstimateBasis: "catalog_estimate",
+        startedAt: "2026-06-08T01:20:00.000Z",
+        endedAt: "2026-06-08T01:20:08.000Z",
+        models: ["gpt-5.4-codex"],
+        sessionId: "ses_codex_start_only"
+      }),
+      repositoryKey: "repo_tirion"
+    };
+    const episode = workEpisodeWithEvidence({
+      episodeId: "episode_codex_start_only_recovery",
+      repoKey: "repo_tirion",
+      chatSessionId: "ses_codex_start_only",
+      runIds: [run.runId, "run_codex_start_only_future_fragment"],
+      queryIds: [run.queryId!, "qry_codex_start_only_future_fragment"],
+      evidence: [{ runId: run.runId, queryId: run.queryId!, artifactKeys: [] }]
+    });
+    const attribution = {
+      ...emptyAttribution(),
+      listWorkEpisodes: async () => [episode]
+    } as AgentVerifiedAttributionService;
+    const repositories = {
+      ...emptyRepositories(),
+      listRepositories: async () => [{ repoKey: "repo_tirion", root: "/tmp/tirion" }],
+      resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+    } as AgentRepositoryObservationService;
+    const { service, storage, root } = await testService({
+      attribution,
+      repositories,
+      recordEvent: (event) => diagnostics.push(event)
+    });
+    await storage.replaceProductionRuns([run]);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    const internals = service as unknown as {
+      projectRunLifecycleEvents: (candidate: ProductionRunV1) => Promise<{
+        subjectRunId: string;
+        started: RunStartedWebhookEventV1;
+      } | undefined>;
+      queueEvent: (event: RunStartedWebhookEventV1, subjectId: string) => Promise<boolean>;
+      processDueEntries: () => Promise<void>;
+    };
+    const projection = await internals.projectRunLifecycleEvents(run);
+    expect(projection?.subjectRunId).toBe(episode.episodeId);
+    if (!projection) {
+      throw new Error("missing_start_only_projection");
+    }
+    await internals.queueEvent(projection.started, `run.start:${projection.subjectRunId}`);
+    await internals.processDueEntries();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string }).eventType === "run.start"
+    ));
+    expect(received).toHaveLength(1);
+
+    const metadata = await storage.metadata();
+    const restartedService = new ExternalWebhookDispatchService(
+      storage,
+      { configurationPath: join(root, "webhook-config.json") },
+      attribution,
+      repositories,
+      undefined,
+      (event) => diagnostics.push(event),
+      metadata.installationId
+    );
+    await restartedService.observeCompletedRuns([run]);
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string }).eventType === "run.ended"
+    ));
+
+    expect(received.filter((event) =>
+      (event as { eventType?: string }).eventType === "run.start"
+    )).toHaveLength(1);
+    expect(received.filter((event) =>
+      (event as { eventType?: string }).eventType === "run.ended"
+    )).toEqual([
+      expect.objectContaining({
+        runId: episode.episodeId,
+        inputTokens: 40,
+        outputTokens: 8,
+        totalTokens: 48
+      })
+    ]);
+    expect(diagnostics).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        reason: "codex_child_completion_waiting_for_root",
+        runId: run.runId
+      })
+    ]));
+  });
+
   it("emits later Codex completed runs even when the same session episode already delivered a terminal", async () => {
     const diagnostics: DiagnosticEvent[] = [];
     const received: unknown[] = [];
@@ -5304,7 +10023,7 @@ describe("external webhook dispatch", () => {
     servers.push(server);
     const address = server.address() as AddressInfo;
 
-    const first = productionRun({
+    const first = withSuccessfulWriteActivity(productionRun({
       runId: "run_codex_first_prompt",
       queryId: "qry_codex_first_prompt",
       correlationId: "trace_codex_first_prompt",
@@ -5319,8 +10038,8 @@ describe("external webhook dispatch", () => {
       endedAt: "2026-06-08T00:10:02.000Z",
       models: ["gpt-5.4-codex"],
       sessionId: "ses_codex_thread"
-    });
-    const later = productionRun({
+    }));
+    const later = withSuccessfulWriteActivity(productionRun({
       runId: "run_codex_later_prompt",
       queryId: "qry_codex_later_prompt",
       correlationId: "trace_codex_later_prompt",
@@ -5335,7 +10054,7 @@ describe("external webhook dispatch", () => {
       endedAt: "2026-06-08T00:42:08.000Z",
       models: ["gpt-5.4-codex"],
       sessionId: "ses_codex_thread"
-    });
+    }));
     let episode = workEpisodeWithEvidence({
       episodeId: "episode_codex_thread",
       repoKey: "repo_tirion",
@@ -5343,7 +10062,12 @@ describe("external webhook dispatch", () => {
       runIds: [first.runId],
       queryIds: [first.queryId],
       evidence: [
-        { runId: first.runId, queryId: first.queryId!, artifactKeys: ["artifact_first"] }
+        {
+          runId: first.runId,
+          queryId: first.queryId!,
+          artifactKeys: ["artifact_first"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(first.queryId!, "repo_tirion", ["artifact_first"])
+        }
       ]
     });
     const { service, storage } = await testService({
@@ -5372,8 +10096,18 @@ describe("external webhook dispatch", () => {
       runIds: [first.runId, later.runId],
       queryIds: [first.queryId, later.queryId],
       evidence: [
-        { runId: first.runId, queryId: first.queryId!, artifactKeys: ["artifact_first"] },
-        { runId: later.runId, queryId: later.queryId!, artifactKeys: ["artifact_later"] }
+        {
+          runId: first.runId,
+          queryId: first.queryId!,
+          artifactKeys: ["artifact_first"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(first.queryId!, "repo_tirion", ["artifact_first"])
+        },
+        {
+          runId: later.runId,
+          queryId: later.queryId!,
+          artifactKeys: ["artifact_later"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(later.queryId!, "repo_tirion", ["artifact_later"])
+        }
       ]
     });
     await storage.replaceProductionRuns([first, later]);
@@ -5430,7 +10164,7 @@ describe("external webhook dispatch", () => {
     const address = server.address() as AddressInfo;
 
     const sessionId = "ses_codex_pending_thread";
-    const first = productionRun({
+    const first = withSuccessfulWriteActivity(productionRun({
       runId: "run_codex_pending_first",
       queryId: "qry_codex_pending_first",
       correlationId: "trace_codex_pending_first",
@@ -5443,8 +10177,8 @@ describe("external webhook dispatch", () => {
       startedAt: "2026-06-08T00:10:00.000Z",
       endedAt: "2026-06-08T00:10:05.000Z",
       sessionId
-    });
-    const later = productionRun({
+    }));
+    const later = withSuccessfulWriteActivity(productionRun({
       runId: "run_codex_pending_later",
       queryId: "qry_codex_pending_later",
       correlationId: "trace_codex_pending_later",
@@ -5457,7 +10191,7 @@ describe("external webhook dispatch", () => {
       startedAt: "2026-06-08T00:10:20.000Z",
       endedAt: "2026-06-08T00:10:28.000Z",
       sessionId
-    });
+    }));
     let episode = workEpisodeWithEvidence({
       episodeId: "episode_codex_pending_thread",
       repoKey: "repo_tirion",
@@ -5465,7 +10199,12 @@ describe("external webhook dispatch", () => {
       runIds: [first.runId],
       queryIds: [first.queryId],
       evidence: [
-        { runId: first.runId, queryId: first.queryId!, artifactKeys: ["artifact_first"] }
+        {
+          runId: first.runId,
+          queryId: first.queryId!,
+          artifactKeys: ["artifact_first"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(first.queryId!, "repo_tirion", ["artifact_first"])
+        }
       ]
     });
     const { service, storage } = await testService({
@@ -5493,8 +10232,18 @@ describe("external webhook dispatch", () => {
       runIds: [first.runId, later.runId],
       queryIds: [first.queryId, later.queryId],
       evidence: [
-        { runId: first.runId, queryId: first.queryId!, artifactKeys: ["artifact_first"] },
-        { runId: later.runId, queryId: later.queryId!, artifactKeys: ["artifact_later"] }
+        {
+          runId: first.runId,
+          queryId: first.queryId!,
+          artifactKeys: ["artifact_first"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(first.queryId!, "repo_tirion", ["artifact_first"])
+        },
+        {
+          runId: later.runId,
+          queryId: later.queryId!,
+          artifactKeys: ["artifact_later"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(later.queryId!, "repo_tirion", ["artifact_later"])
+        }
       ]
     });
     await storage.replaceProductionRuns([first, later]);
@@ -5696,7 +10445,13 @@ describe("external webhook dispatch", () => {
           runIds: ["run_query_a", "run_query_b"],
           queryIds: ["qry_query_a", "qry_query_b"],
           evidence: [
-            { runId: "run_query_a", queryId: "qry_query_a", repoKey: "repo_a", artifactKeys: ["artifact_a"] },
+            {
+              runId: "run_query_a",
+              queryId: "qry_query_a",
+              repoKey: "repo_a",
+              artifactKeys: ["artifact_a"],
+              causalWriteArtifacts: successfulWriteArtifactProofs("qry_query_a", "repo_a", ["artifact_a"])
+            },
             { runId: "run_query_b", queryId: "qry_query_b", repoKey: "repo_b", artifactKeys: ["artifact_b"] }
           ]
         })]
@@ -5709,7 +10464,7 @@ describe("external webhook dispatch", () => {
     });
 
     await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
-    await service.observeCompletedRuns([productionRun({
+    await service.observeCompletedRuns([withSuccessfulWriteActivity(productionRun({
       runId: "run_query_a",
       queryId: "qry_query_a",
       correlationId: "trace_query_a",
@@ -5720,7 +10475,7 @@ describe("external webhook dispatch", () => {
       totalTokens: 12,
       startedAt: "2026-06-08T00:20:00.000Z",
       endedAt: "2026-06-08T00:20:01.000Z"
-    })]);
+    }))]);
 
     await service.retryNow();
     await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
@@ -5734,6 +10489,147 @@ describe("external webhook dispatch", () => {
       },
       filesChanged: ["tirion-webhook-smoke-2.txt"]
     });
+  });
+
+  it("fails closed when a persisted causal write proof lacks an exact successful source node", async () => {
+    const received: Array<{ eventType?: string; runId?: string; filesChanged?: string[] }> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as { eventType?: string; runId?: string; filesChanged?: string[] });
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const cases: Array<{
+      fixtureId: string;
+      sourceNode?: (node: ExecutionNodeAtomV1) => ExecutionNodeAtomV1;
+    }> = [
+      { fixtureId: "missing" },
+      { fixtureId: "node_identity", sourceNode: (node) => ({ ...node, nodeId: "node_different_identity" }) },
+      { fixtureId: "query_scope", sourceNode: (node) => ({ ...node, queryId: "qry_other_scope" }) },
+      { fixtureId: "repo_scope", sourceNode: (node) => ({ ...node, repositoryKey: "repo_other_scope" }) },
+      { fixtureId: "repo_missing", sourceNode: (node) => ({ ...node, repositoryKey: undefined }) },
+      { fixtureId: "artifact_mismatch", sourceNode: (node) => ({ ...node, artifactKeys: ["artifact_other"] }) },
+      { fixtureId: "artifact_evidence_missing", sourceNode: (node) => ({ ...node, artifactEvidence: undefined }) },
+      { fixtureId: "rejected", sourceNode: (node) => ({ ...node, outcome: "rejected" }) },
+      { fixtureId: "read_only", sourceNode: (node) => ({ ...node, name: "Read", toolName: "Read" }) }
+    ];
+
+    for (const fixture of cases) {
+      const runId = `run_proof_${fixture.fixtureId}`;
+      const queryId = `qry_proof_${fixture.fixtureId}`;
+      const repoKey = "repo_proof_exact";
+      const proof = successfulWriteArtifactProofs(queryId, repoKey, [`artifact_${fixture.fixtureId}`])[0]!;
+      const episode = workEpisodeWithoutTestExecutionNodes(
+        runId,
+        queryId,
+        [proof.artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      );
+      const { service, storage } = await testService({
+        attribution: { listWorkEpisodes: async () => [episode] },
+        repositories: {
+          relativePaths: () => [`src/${fixture.fixtureId}.ts`],
+          listRepositories: async () => [{ repoKey, root: "/tmp/proof-exact" }]
+        },
+        timing: { runEndedGraceMs: 1 }
+      });
+      if (fixture.sourceNode) {
+        const sourceNode = fixture.sourceNode(successfulWriteSourceNode(proof, queryId, repoKey));
+        // Store under the proof key even if its payload's nodeId disagrees, so
+        // this exercises the document-key/node-identity validation directly.
+        await storage.upsertAgentDocument("execution_node_atom", {
+          key: proof.executionNodeId,
+          sortAt: sourceNode.startedAt,
+          value: sourceNode
+        });
+      }
+
+      await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+      await service.observeCompletedRuns([withSuccessfulWriteActivity(productionRun({
+        runId,
+        queryId,
+        correlationId: `trace_proof_${fixture.fixtureId}`,
+        provider: "claude-code",
+        runtime: "claude-code",
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        startedAt: "2026-06-08T00:20:00.000Z",
+        endedAt: "2026-06-08T00:20:01.000Z"
+      }))]);
+      await waitUntil(() => received.some((event) =>
+        event.eventType === "run.ended" && event.runId === runId
+      ));
+      expect(received.find((event) => event.eventType === "run.ended" && event.runId === runId))
+        .toMatchObject({ filesChanged: [] });
+    }
+  });
+
+  it("accepts an exact successful write node with matching durable artifact evidence", async () => {
+    const received: Array<{ eventType?: string; runId?: string; filesChanged?: string[] }> = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as { eventType?: string; runId?: string; filesChanged?: string[] });
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const runId = "run_path_derived_proof";
+    const queryId = "qry_path_derived_proof";
+    const repoKey = "repo_path_derived_proof";
+    const proof = successfulWriteArtifactProofs(queryId, repoKey, ["artifact_path_derived"])[0]!;
+    const episode = workEpisodeWithoutTestExecutionNodes(
+      runId,
+      queryId,
+      [proof.artifactKey],
+      repoKey,
+      undefined,
+      [proof]
+    );
+    const { service, storage } = await testService({
+      attribution: { listWorkEpisodes: async () => [episode] },
+      repositories: {
+        relativePaths: () => ["src/path-derived.ts"],
+        listRepositories: async () => [{ repoKey, root: "/tmp/path-derived" }]
+      },
+      timing: { runEndedGraceMs: 1 }
+    });
+    // The persisted source node is the authority boundary: it must retain the
+    // opaque artifact pair and allowlisted provider write evidence that the
+    // workspace claim points to.
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: proof.executionNodeId,
+      sortAt: "2026-06-08T00:20:00.000Z",
+      value: successfulWriteSourceNode(proof, queryId, repoKey)
+    });
+
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.observeCompletedRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: "trace_path_derived_proof",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 10,
+      outputTokens: 2,
+      totalTokens: 12,
+      startedAt: "2026-06-08T00:20:00.000Z",
+      endedAt: "2026-06-08T00:20:01.000Z"
+    }))]);
+    await waitUntil(() => received.some((event) =>
+      event.eventType === "run.ended" && event.runId === runId
+    ));
+    expect(received.find((event) => event.eventType === "run.ended" && event.runId === runId))
+      .toMatchObject({ filesChanged: ["src/path-derived.ts"] });
   });
 
   it("blocks privacy-invalid changed-file paths before outbound delivery", async () => {
@@ -5751,17 +10647,24 @@ describe("external webhook dispatch", () => {
     const address = server.address() as AddressInfo;
     const { service } = await testService({
       attribution: {
-        listWorkEpisodes: async () => [workEpisode("run_privacy", "qry_privacy", ["artifact_secret"], "repo_tirion")]
+        listWorkEpisodes: async () => [workEpisode(
+          "run_privacy",
+          "qry_privacy",
+          ["artifact_secret"],
+          "repo_tirion",
+          undefined,
+          successfulWriteArtifactProofs("qry_privacy", "repo_tirion", ["artifact_secret"])
+        )]
       },
       repositories: {
-        relativePaths: () => ["/Users/asafaltagar/Documents/Tirion/src/secret.ts"],
+        relativePaths: () => ["/Users/example/Documents/Tirion/src/secret.ts"],
         resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
       },
       recordEvent: (event) => diagnostics.push(event)
     });
 
     await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
-    await service.observeCompletedRuns([productionRun({
+    await service.observeCompletedRuns([withSuccessfulWriteActivity(productionRun({
       runId: "run_privacy",
       queryId: "qry_privacy",
       correlationId: "trace_privacy",
@@ -5772,7 +10675,7 @@ describe("external webhook dispatch", () => {
       totalTokens: 12,
       startedAt: "2026-06-08T00:21:00.000Z",
       endedAt: "2026-06-08T00:21:01.000Z"
-    })]);
+    }))]);
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(received).toEqual([]);
@@ -5814,14 +10717,20 @@ describe("external webhook dispatch", () => {
           "run_mixed_paths",
           "qry_mixed_paths",
           ["artifact_answer", "artifact_settings", "artifact_absolute"],
-          "repo_tirion"
+          "repo_tirion",
+          undefined,
+          successfulWriteArtifactProofs(
+            "qry_mixed_paths",
+            "repo_tirion",
+            ["artifact_answer", "artifact_settings", "artifact_absolute"]
+          )
         )]
       },
       repositories: {
         relativePaths: () => [
           "src/answer.ts",
           "config/settings.json",
-          "/Users/asafaltagar/Documents/Tirion/src/secret.ts"
+          "/Users/example/Documents/Tirion/src/secret.ts"
         ],
         resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
       },
@@ -5829,7 +10738,7 @@ describe("external webhook dispatch", () => {
     });
 
     await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
-    await service.observeCompletedRuns([productionRun({
+    await service.observeCompletedRuns([withSuccessfulWriteActivity(productionRun({
       runId: "run_mixed_paths",
       queryId: "qry_mixed_paths",
       correlationId: "trace_mixed_paths",
@@ -5840,7 +10749,7 @@ describe("external webhook dispatch", () => {
       totalTokens: 12,
       startedAt: "2026-06-08T00:21:00.000Z",
       endedAt: "2026-06-08T00:21:01.000Z"
-    })]);
+    }))]);
 
     await waitUntil(() => received.some((event) => (event as { eventType?: string }).eventType === "run.ended"));
     expect(received.find((event) => (event as { eventType?: string }).eventType === "run.ended")).toMatchObject({
@@ -5876,7 +10785,7 @@ describe("external webhook dispatch", () => {
     servers.push(server);
     const address = server.address() as AddressInfo;
     const runs = [
-      productionRun({
+      withSuccessfulWriteActivity(productionRun({
         runId: "run_expensive_a",
         queryId: "qry_expensive_a",
         correlationId: "trace_expensive_a",
@@ -5888,8 +10797,8 @@ describe("external webhook dispatch", () => {
         estimatedNanoUsd: 1_000_000,
         startedAt: "2026-06-08T00:30:00.000Z",
         endedAt: "2026-06-08T00:30:01.000Z"
-      }),
-      productionRun({
+      })),
+      withSuccessfulWriteActivity(productionRun({
         runId: "run_expensive_b",
         queryId: "qry_expensive_b",
         correlationId: "trace_expensive_b",
@@ -5901,7 +10810,7 @@ describe("external webhook dispatch", () => {
         estimatedNanoUsd: 2_000_000,
         startedAt: "2026-06-08T00:30:02.000Z",
         endedAt: "2026-06-08T00:30:03.000Z"
-      })
+      }))
     ];
     const storageRoot = mkdtempSync(join(tmpdir(), "tirion-webhook-dispatch-"));
     roots.push(storageRoot);
@@ -5915,6 +10824,25 @@ describe("external webhook dispatch", () => {
     await storage.beginProductionUsageEpoch("2026-06-08T00:00:00.000Z");
     await storage.replaceProductionRuns(runs);
     let now = Date.parse("2026-06-08T00:31:05.000Z");
+    const workEpisodes = [
+      workEpisode(
+        "run_expensive_a",
+        "qry_expensive_a",
+        ["artifact_a"],
+        "repo_tirion",
+        undefined,
+        successfulWriteArtifactProofs("qry_expensive_a", "repo_tirion", ["artifact_a"])
+      ),
+      workEpisode(
+        "run_expensive_b",
+        "qry_expensive_b",
+        ["artifact_b"],
+        "repo_tirion",
+        undefined,
+        successfulWriteArtifactProofs("qry_expensive_b", "repo_tirion", ["artifact_b"])
+      )
+    ];
+    await persistExecutionNodeFixtures(storage, executionNodeFixturesForEpisodes(workEpisodes));
     const service = new ExternalWebhookDispatchService(
       storage,
       { configurationPath: join(storageRoot, "webhook-config.json") },
@@ -5926,10 +10854,7 @@ describe("external webhook dispatch", () => {
           queryIds: ["qry_expensive_a", "qry_expensive_b"]
         }],
         listCommitPublicationSnapshots: async () => [commitSnapshot("active", 125_000, "2026-06-08T00:31:00.000Z")],
-        listWorkEpisodes: async () => [
-          workEpisode("run_expensive_a", "qry_expensive_a", ["artifact_a"], "repo_tirion"),
-          workEpisode("run_expensive_b", "qry_expensive_b", ["artifact_b"], "repo_tirion")
-        ]
+        listWorkEpisodes: async () => workEpisodes
       } as unknown as AgentVerifiedAttributionService,
       {
         relativePaths: () => ["src/answer.ts"],
@@ -5981,7 +10906,14 @@ describe("external webhook dispatch", () => {
         }],
         listCommitPublicationSnapshots: async () => [commitSnapshot("active", 42_000, "2026-06-08T00:03:00.000Z")],
         listWorkEpisodes: async () => [{
-          ...workEpisode("run_copilot_write", "qry_copilot_write", ["artifact_copilot_write"], "repo_tirion"),
+          ...workEpisode(
+            "run_copilot_write",
+            "qry_copilot_write",
+            ["artifact_copilot_write"],
+            "repo_tirion",
+            undefined,
+            successfulWriteArtifactProofs("qry_copilot_write", "repo_tirion", ["artifact_copilot_write"])
+          ),
           claimedByCommitHash: "a".repeat(40)
         }]
       },
@@ -5991,7 +10923,7 @@ describe("external webhook dispatch", () => {
       },
       now: () => now
     });
-    await storage.replaceProductionRuns([productionRun({
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
       runId: "run_copilot_write",
       queryId: "qry_copilot_write",
       correlationId: "trace_copilot_write",
@@ -6007,7 +10939,7 @@ describe("external webhook dispatch", () => {
       models: ["gpt-5.4"],
       startedAt: "2026-06-08T00:01:00.000Z",
       endedAt: "2026-06-08T00:01:05.000Z"
-    })]);
+    }))]);
 
     await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
     await service.reconcileCommitEvents();
@@ -6040,7 +10972,7 @@ describe("external webhook dispatch", () => {
     roots.push(root);
 
     const runs = [
-      productionRun({
+      withSuccessfulWriteActivity(productionRun({
         runId: "run_commit_a",
         queryId: "qry_commit_a",
         correlationId: "trace_commit_a",
@@ -6052,8 +10984,8 @@ describe("external webhook dispatch", () => {
         estimatedNanoUsd: 100_000,
         startedAt: "2026-06-08T00:00:00.000Z",
         endedAt: "2026-06-08T00:00:01.000Z"
-      }),
-      productionRun({
+      })),
+      withSuccessfulWriteActivity(productionRun({
         runId: "run_commit_b",
         queryId: "qry_commit_b",
         correlationId: "trace_commit_b",
@@ -6065,7 +10997,7 @@ describe("external webhook dispatch", () => {
         estimatedNanoUsd: 200_000,
         startedAt: "2026-06-08T00:01:00.000Z",
         endedAt: "2026-06-08T00:01:02.000Z"
-      })
+      }))
     ];
     const storage = serviceStorage(root);
     storages.push(storage);
@@ -6080,16 +11012,32 @@ describe("external webhook dispatch", () => {
     let summaries: CommitAttributionSummary[] = [commitSummary("active", 300_000)];
     let snapshots: CommitPublicationSnapshot[] = [commitSnapshot("active", 300_000, "2026-06-08T00:02:00.000Z")];
     let now = Date.parse("2026-06-08T00:10:00.000Z");
+    const workEpisodes = [
+      workEpisode(
+        "run_commit_a",
+        "qry_commit_a",
+        ["artifact_a"],
+        "repo_tirion",
+        undefined,
+        successfulWriteArtifactProofs("qry_commit_a", "repo_tirion", ["artifact_a"])
+      ),
+      workEpisode(
+        "run_commit_b",
+        "qry_commit_b",
+        ["artifact_b"],
+        "repo_tirion",
+        undefined,
+        successfulWriteArtifactProofs("qry_commit_b", "repo_tirion", ["artifact_b"])
+      )
+    ];
+    await persistExecutionNodeFixtures(storage, executionNodeFixturesForEpisodes(workEpisodes));
     const service = new ExternalWebhookDispatchService(
       storage,
       { configurationPath: join(root, "webhook-config.json") },
       {
         listCommitAttributions: async () => summaries,
         listCommitPublicationSnapshots: async () => snapshots,
-        listWorkEpisodes: async () => [
-          workEpisode("run_commit_a", "qry_commit_a", ["artifact_a"], "repo_tirion"),
-          workEpisode("run_commit_b", "qry_commit_b", ["artifact_b"], "repo_tirion")
-        ]
+        listWorkEpisodes: async () => workEpisodes
       } as unknown as AgentVerifiedAttributionService,
       {
         relativePaths: (_repoKey, artifactKeys) => artifactKeys.map((key) => `src/${key}.ts`),
@@ -6163,6 +11111,976 @@ describe("external webhook dispatch", () => {
     });
   });
 
+  it("replaces a pending active commit with one native-retraction supersession before first delivery", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const runId = "run_commit_native_pending";
+    const queryId = "qry_commit_native_pending";
+    const artifactKey = "artifact_native_pending";
+    const repoKey = "repo_tirion";
+    const proof = successfulWriteArtifactProofs(queryId, repoKey, [artifactKey])[0]!;
+    let now = Date.parse("2026-07-14T16:00:00.000Z");
+    let summary: CommitAttributionSummary = {
+      ...commitSummary("active", 45_000),
+      queryIds: [queryId],
+      runIds: [runId],
+      anchorQueryIds: [queryId],
+      inheritedQueryIds: []
+    };
+    let snapshot: CommitPublicationSnapshot = commitSnapshot("active", 45_000, "2026-07-14T16:00:00.000Z");
+    let episode = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        runId,
+        queryId,
+        [artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      ),
+      claimedByCommitHash: "a".repeat(40)
+    };
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [summary],
+        listCommitPublicationSnapshots: async () => [snapshot],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/native-pending.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now
+    });
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: "trace_commit_native_pending",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 20,
+      outputTokens: 5,
+      totalTokens: 25,
+      estimatedNanoUsd: 45_000,
+      startedAt: "2026-07-14T15:59:00.000Z",
+      endedAt: "2026-07-14T15:59:01.000Z"
+    }))]);
+    const invocationId = "invocation_commit_native_pending";
+    await persistExecutionNodeFixtures(storage, [{
+      ...successfulWriteSourceNode(proof, queryId, repoKey),
+      requestId: "request_commit_native_pending_success",
+      invocationId
+    }]);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.reconcileCommitEvents();
+    episode = {
+      ...episode,
+      evidence: episode.evidence.map((evidence) => ({
+        ...evidence,
+        causalWriteArtifacts: [],
+        nativeRejectedCausalWriteArtifacts: [proof],
+        causalWriteArtifactsComplete: true
+      }))
+    };
+    summary = {
+      ...summary,
+      status: "superseded",
+      evidenceReasons: ["native_causal_write_retracted"]
+    };
+    snapshot = {
+      ...snapshot,
+      state: "superseded",
+      updatedAt: "2026-07-14T16:00:01.000Z"
+    };
+    await persistExecutionNodeFixtures(storage, [
+      nativeRejectedWriteSourceNode(proof, queryId, repoKey, invocationId)
+    ]);
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    ));
+
+    const commits = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    );
+    expect(commits).toEqual([
+      expect.objectContaining({
+        state: "superseded",
+        // The pending row keeps its stable eventId but its corrected semantic
+        // payload is versioned; only this superseded revision is delivered.
+        version: 2,
+        runIds: [],
+        traceIds: [],
+        estimatedNanoUsd: 0,
+        costCoverage: "unavailable"
+      })
+    ]);
+  });
+
+  it("emits a later V2 native-retraction supersession after an active commit was delivered", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const runId = "run_commit_native_delivered";
+    const queryId = "qry_commit_native_delivered";
+    const artifactKey = "artifact_native_delivered";
+    const repoKey = "repo_tirion";
+    const proof = successfulWriteArtifactProofs(queryId, repoKey, [artifactKey])[0]!;
+    let now = Date.parse("2026-07-14T16:10:00.000Z");
+    let summary: CommitAttributionSummary = {
+      ...commitSummary("active", 46_000),
+      queryIds: [queryId],
+      runIds: [runId],
+      anchorQueryIds: [queryId],
+      inheritedQueryIds: []
+    };
+    let snapshot: CommitPublicationSnapshot = commitSnapshot("active", 46_000, "2026-07-14T16:10:00.000Z");
+    let episode = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        runId,
+        queryId,
+        [artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      ),
+      claimedByCommitHash: "a".repeat(40)
+    };
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [summary],
+        listCommitPublicationSnapshots: async () => [snapshot],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/native-delivered.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now
+    });
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: "trace_commit_native_delivered",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 20,
+      outputTokens: 6,
+      totalTokens: 26,
+      estimatedNanoUsd: 46_000,
+      startedAt: "2026-07-14T16:09:00.000Z",
+      endedAt: "2026-07-14T16:09:01.000Z"
+    }))]);
+    const invocationId = "invocation_commit_native_delivered";
+    await persistExecutionNodeFixtures(storage, [{
+      ...successfulWriteSourceNode(proof, queryId, repoKey),
+      requestId: "request_commit_native_delivered_success",
+      invocationId
+    }]);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 1
+    ));
+
+    episode = {
+      ...episode,
+      evidence: episode.evidence.map((evidence) => ({
+        ...evidence,
+        causalWriteArtifacts: [],
+        nativeRejectedCausalWriteArtifacts: [proof],
+        causalWriteArtifactsComplete: true
+      }))
+    };
+    summary = {
+      ...summary,
+      status: "superseded",
+      evidenceReasons: ["native_causal_write_retracted"]
+    };
+    snapshot = {
+      ...snapshot,
+      state: "superseded",
+      updatedAt: "2026-07-14T16:10:01.000Z"
+    };
+    await persistExecutionNodeFixtures(storage, [
+      nativeRejectedWriteSourceNode(proof, queryId, repoKey, invocationId)
+    ]);
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 2
+    ));
+
+    const commits = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    );
+    expect(commits).toEqual([
+      expect.objectContaining({
+        state: "active",
+        version: 1,
+        runIds: [runId],
+        traceIds: ["trace_commit_native_delivered"]
+      }),
+      expect.objectContaining({
+        state: "superseded",
+        version: 2,
+        runIds: [],
+        traceIds: [],
+        estimatedNanoUsd: 0,
+        costCoverage: "unavailable"
+      })
+    ]);
+  });
+
+  it("keeps the earliest duplicate-query completion boundary for commit native-retraction verification", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const earlyRunId = "run_commit_duplicate_boundary_early";
+    const laterRunId = "run_commit_duplicate_boundary_later";
+    const queryId = "qry_commit_duplicate_boundary";
+    const repoKey = "repo_tirion";
+    const artifactKey = "artifact_duplicate_boundary";
+    const proof = successfulWriteArtifactProofs(queryId, repoKey, [artifactKey])[0]!;
+    const startedAt = "2026-07-14T16:40:00.000Z";
+    const earlyCompletedAt = "2026-07-14T16:40:02.000Z";
+    const laterCompletedAt = "2026-07-14T16:40:04.000Z";
+    const nativeRejectionAt = "2026-07-14T16:40:03.000Z";
+    const invocationId = "invocation_commit_duplicate_boundary";
+    let now = Date.parse("2026-07-14T16:40:10.000Z");
+    let summary: CommitAttributionSummary = {
+      ...commitSummary("active", 51_000),
+      queryIds: [queryId],
+      runIds: [earlyRunId, laterRunId],
+      anchorQueryIds: [queryId],
+      inheritedQueryIds: []
+    };
+    let snapshot: CommitPublicationSnapshot = commitSnapshot(
+      "active",
+      51_000,
+      "2026-07-14T16:40:05.000Z"
+    );
+    const initialEvidence = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        earlyRunId,
+        queryId,
+        [artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      ).evidence[0],
+      runIds: [earlyRunId, laterRunId],
+      causalWriteArtifactsComplete: true
+    };
+    let episode = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        earlyRunId,
+        queryId,
+        [artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      ),
+      runIds: [earlyRunId, laterRunId],
+      claimedByCommitHash: "a".repeat(40),
+      evidence: [initialEvidence]
+    };
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [summary],
+        listCommitPublicationSnapshots: async () => [snapshot],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/duplicate-boundary.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now
+    });
+    const earlyRun = withSuccessfulWriteActivity(productionRun({
+      runId: earlyRunId,
+      queryId,
+      correlationId: "trace_commit_duplicate_boundary_early",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 20,
+      outputTokens: 6,
+      totalTokens: 26,
+      estimatedNanoUsd: 25_500,
+      startedAt,
+      endedAt: earlyCompletedAt
+    }));
+    const laterRun = withSuccessfulWriteActivity(productionRun({
+      runId: laterRunId,
+      queryId,
+      correlationId: "trace_commit_duplicate_boundary_later",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 20,
+      outputTokens: 6,
+      totalTokens: 26,
+      estimatedNanoUsd: 25_500,
+      startedAt,
+      endedAt: laterCompletedAt
+    }));
+    await storage.replaceProductionRuns([earlyRun, laterRun]);
+    await persistExecutionNodeFixtures(storage, [{
+      ...successfulWriteSourceNode(proof, queryId, repoKey),
+      requestId: "request_commit_duplicate_boundary_success",
+      invocationId,
+      startedAt: "2026-07-14T16:40:01.000Z"
+    }]);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 1
+    ));
+
+    // This source begins after the earliest completion, although a duplicate
+    // replay row has a later terminal. It is therefore ineligible everywhere:
+    // no lifecycle source-pruning revision and no native commit retraction.
+    episode = {
+      ...episode,
+      evidence: episode.evidence.map((evidence) => ({
+        ...evidence,
+        causalWriteArtifacts: [],
+        nativeRejectedCausalWriteArtifacts: [proof],
+        causalWriteArtifactsComplete: true
+      }))
+    };
+    summary = {
+      ...summary,
+      status: "superseded",
+      evidenceReasons: ["native_causal_write_retracted"]
+    };
+    snapshot = {
+      ...snapshot,
+      state: "superseded",
+      updatedAt: "2026-07-14T16:40:06.000Z"
+    };
+    await persistExecutionNodeFixtures(storage, [{
+      ...nativeRejectedWriteSourceNode(proof, queryId, repoKey, invocationId),
+      startedAt: nativeRejectionAt
+    }]);
+
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const commits = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    ) as Array<{ version: number; state: string; runIds: string[]; estimatedNanoUsd: number }>;
+    expect(commits).toEqual([
+      expect.objectContaining({
+        version: 1,
+        state: "active",
+        runIds: [earlyRunId, laterRunId],
+        estimatedNanoUsd: 51_000
+      })
+    ]);
+  });
+
+  it("keeps a delivered active commit when its retained causal source becomes unreadable", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const runId = "run_commit_unreadable_source";
+    const queryId = "qry_commit_unreadable_source";
+    const artifactKey = "artifact_unreadable_source";
+    const repoKey = "repo_tirion";
+    const proof = successfulWriteArtifactProofs(queryId, repoKey, [artifactKey])[0]!;
+    let now = Date.parse("2026-07-14T16:15:00.000Z");
+    const summary: CommitAttributionSummary = {
+      ...commitSummary("active", 48_000),
+      queryIds: [queryId],
+      runIds: [runId],
+      anchorQueryIds: [queryId],
+      inheritedQueryIds: [],
+      evidenceReasons: ["content_continuity"]
+    };
+    let snapshot: CommitPublicationSnapshot = commitSnapshot("active", 48_000, "2026-07-14T16:15:00.000Z");
+    const episode = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        runId,
+        queryId,
+        [artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      ),
+      claimedByCommitHash: "a".repeat(40)
+    };
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [summary],
+        listCommitPublicationSnapshots: async () => [snapshot],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/unreadable.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now
+    });
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: "trace_commit_unreadable_source",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 20,
+      outputTokens: 5,
+      totalTokens: 25,
+      estimatedNanoUsd: 48_000,
+      startedAt: "2026-07-14T16:14:00.000Z",
+      endedAt: "2026-07-14T16:14:01.000Z"
+    }))]);
+    await persistExecutionNodeFixtures(storage, [{
+      ...successfulWriteSourceNode(proof, queryId, repoKey),
+      requestId: "request_commit_unreadable_source",
+      invocationId: "invocation_commit_unreadable_source"
+    }]);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 1
+    ));
+
+    expect(await storage.removeAgentDocument("execution_node_atom", proof.executionNodeId)).toBe(true);
+    snapshot = {
+      ...snapshot,
+      state: "superseded",
+      updatedAt: "2026-07-14T16:15:01.000Z"
+    };
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const commits = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    );
+    expect(commits).toEqual([
+      expect.objectContaining({
+        state: "active",
+        version: 1,
+        runIds: [runId],
+        traceIds: ["trace_commit_unreadable_source"]
+      })
+    ]);
+  });
+
+  it("keeps a delivered active commit when the native marker census is incomplete", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const runId = "run_commit_incomplete_marker";
+    const queryId = "qry_commit_incomplete_marker";
+    const artifactKey = "artifact_incomplete_marker";
+    const repoKey = "repo_tirion";
+    const proof = successfulWriteArtifactProofs(queryId, repoKey, [artifactKey])[0]!;
+    let now = Date.parse("2026-07-14T16:18:00.000Z");
+    let summary: CommitAttributionSummary = {
+      ...commitSummary("active", 49_000),
+      queryIds: [queryId],
+      runIds: [runId],
+      anchorQueryIds: [queryId],
+      inheritedQueryIds: []
+    };
+    let snapshot: CommitPublicationSnapshot = commitSnapshot("active", 49_000, "2026-07-14T16:18:00.000Z");
+    let episode = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        runId,
+        queryId,
+        [artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      ),
+      claimedByCommitHash: "a".repeat(40)
+    };
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [summary],
+        listCommitPublicationSnapshots: async () => [snapshot],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/incomplete-marker.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now
+    });
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: "trace_commit_incomplete_marker",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 20,
+      outputTokens: 5,
+      totalTokens: 25,
+      estimatedNanoUsd: 49_000,
+      startedAt: "2026-07-14T16:17:00.000Z",
+      endedAt: "2026-07-14T16:17:01.000Z"
+    }))]);
+    const invocationId = "invocation_commit_incomplete_marker";
+    await persistExecutionNodeFixtures(storage, [{
+      ...successfulWriteSourceNode(proof, queryId, repoKey),
+      requestId: "request_commit_incomplete_marker_success",
+      invocationId
+    }]);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 1
+    ));
+
+    episode = {
+      ...episode,
+      evidence: episode.evidence.map((evidence) => ({
+        ...evidence,
+        causalWriteArtifacts: [],
+        nativeRejectedCausalWriteArtifacts: [proof],
+        // Mark the census incomplete deliberately: a partial marker report
+        // can never revoke a historical externally delivered commit.
+        causalWriteArtifactsComplete: false
+      }))
+    };
+    summary = {
+      ...summary,
+      status: "superseded",
+      evidenceReasons: ["native_causal_write_retracted"]
+    };
+    snapshot = {
+      ...snapshot,
+      state: "superseded",
+      updatedAt: "2026-07-14T16:18:01.000Z"
+    };
+    await persistExecutionNodeFixtures(storage, [
+      nativeRejectedWriteSourceNode(proof, queryId, repoKey, invocationId)
+    ]);
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const commits = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    );
+    expect(commits).toEqual([
+      expect.objectContaining({
+        state: "active",
+        version: 1,
+        runIds: [runId],
+        traceIds: ["trace_commit_incomplete_marker"]
+      })
+    ]);
+  });
+
+  it("does not create a standalone commit supersession from a marker without an earlier active event", async () => {
+    const runId = "run_commit_native_no_prior";
+    const queryId = "qry_commit_native_no_prior";
+    const artifactKey = "artifact_native_no_prior";
+    const repoKey = "repo_tirion";
+    const proof = successfulWriteArtifactProofs(queryId, repoKey, [artifactKey])[0]!;
+    const episode = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        runId,
+        queryId,
+        [artifactKey],
+        repoKey,
+        undefined,
+        [proof]
+      ),
+      claimedByCommitHash: "a".repeat(40),
+      evidence: [{
+        ...workEpisodeWithoutTestExecutionNodes(
+          runId,
+          queryId,
+          [artifactKey],
+          repoKey,
+          undefined,
+          [proof]
+        ).evidence[0],
+        causalWriteArtifacts: [],
+        nativeRejectedCausalWriteArtifacts: [proof],
+        causalWriteArtifactsComplete: true
+      }]
+    };
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [{
+          ...commitSummary("superseded", 0),
+          queryIds: [queryId],
+          runIds: [runId],
+          anchorQueryIds: [queryId],
+          inheritedQueryIds: [],
+          evidenceReasons: ["native_causal_write_retracted"]
+        }],
+        listCommitPublicationSnapshots: async () => [
+          commitSnapshot("superseded", 0, "2026-07-14T16:20:00.000Z")
+        ],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/no-prior.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      }
+    });
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: "trace_commit_native_no_prior",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 10,
+      outputTokens: 2,
+      totalTokens: 12,
+      estimatedNanoUsd: 0,
+      startedAt: "2026-07-14T16:19:00.000Z",
+      endedAt: "2026-07-14T16:19:01.000Z"
+    }))]);
+    const invocationId = "invocation_commit_native_no_prior";
+    await persistExecutionNodeFixtures(storage, [
+      {
+        ...successfulWriteSourceNode(proof, queryId, repoKey),
+        requestId: "request_commit_native_no_prior_success",
+        invocationId
+      },
+      nativeRejectedWriteSourceNode(proof, queryId, repoKey, invocationId)
+    ]);
+
+    await service.reconcileCommitEvents();
+    const status = await service.status();
+    expect(status.queuedItems?.some((item) => item.eventType === "commit.attributed") ?? false).toBe(false);
+    expect(status.blockedItems?.some((item) => item.eventType === "commit.attributed") ?? false).toBe(false);
+  });
+
+  it("does not supersede an active commit for a generic snapshot transition plus an unrelated native marker", async () => {
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const runId = "run_commit_generic_snapshot";
+    const queryId = "qry_commit_generic_snapshot";
+    const repoKey = "repo_tirion";
+    const activeProof = successfulWriteArtifactProofs(queryId, repoKey, ["artifact_active"])[0]!;
+    const unrelatedMarker = successfulWriteArtifactProofs(queryId, repoKey, ["artifact_unrelated_marker"])[0]!;
+    let now = Date.parse("2026-07-14T16:25:00.000Z");
+    const summary: CommitAttributionSummary = {
+      ...commitSummary("active", 47_000),
+      queryIds: [queryId],
+      runIds: [runId],
+      anchorQueryIds: [queryId],
+      inheritedQueryIds: [],
+      // This deliberately lacks native_causal_write_retracted: the ledger
+      // says the snapshot changed for a generic reason, not this marker.
+      evidenceReasons: ["content_continuity"]
+    };
+    let snapshot: CommitPublicationSnapshot = commitSnapshot("active", 47_000, "2026-07-14T16:25:00.000Z");
+    let episode = {
+      ...workEpisodeWithoutTestExecutionNodes(
+        runId,
+        queryId,
+        ["artifact_active"],
+        repoKey,
+        undefined,
+        [activeProof]
+      ),
+      claimedByCommitHash: "a".repeat(40)
+    };
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [summary],
+        listCommitPublicationSnapshots: async () => [snapshot],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/active.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now
+    });
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: "trace_commit_generic_snapshot",
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 20,
+      outputTokens: 6,
+      totalTokens: 26,
+      estimatedNanoUsd: 47_000,
+      startedAt: "2026-07-14T16:24:00.000Z",
+      endedAt: "2026-07-14T16:24:01.000Z"
+    }))]);
+    await persistExecutionNodeFixtures(storage, [{
+      ...successfulWriteSourceNode(activeProof, queryId, repoKey),
+      requestId: "request_commit_generic_active",
+      invocationId: "invocation_commit_generic_active"
+    }]);
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 1
+    ));
+
+    episode = {
+      ...episode,
+      evidence: episode.evidence.map((evidence) => ({
+        ...evidence,
+        causalWriteArtifacts: [],
+        nativeRejectedCausalWriteArtifacts: [unrelatedMarker],
+        causalWriteArtifactsComplete: true
+      }))
+    };
+    snapshot = {
+      ...snapshot,
+      state: "superseded",
+      updatedAt: "2026-07-14T16:25:01.000Z"
+    };
+    await persistExecutionNodeFixtures(storage, [{
+      ...successfulWriteSourceNode(unrelatedMarker, queryId, repoKey),
+      requestId: "request_commit_generic_unrelated_success",
+      invocationId: "invocation_commit_generic_unrelated"
+    }, nativeRejectedWriteSourceNode(
+      unrelatedMarker,
+      queryId,
+      repoKey,
+      "invocation_commit_generic_unrelated"
+    )]);
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const commits = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    );
+    expect(commits).toEqual([
+      expect.objectContaining({
+        state: "active",
+        version: 1,
+        runIds: [runId],
+        traceIds: ["trace_commit_generic_snapshot"]
+      })
+    ]);
+  });
+
+  it("keeps a valid sibling writer active when a native marker retracts a shared artifact pair", async () => {
+    const repoKey = "repo_tirion";
+    const artifactKey = "artifact_shared_native_marker";
+    const rejectedRunId = "run_commit_native_shared_rejected";
+    const rejectedQueryId = "qry_commit_native_shared_rejected";
+    const validRunId = "run_commit_native_shared_valid";
+    const validQueryId = "qry_commit_native_shared_valid";
+    const rejectedProof = successfulWriteArtifactProofs(rejectedQueryId, repoKey, [artifactKey])[0]!;
+    const validProof = successfulWriteArtifactProofs(validQueryId, repoKey, [artifactKey])[0]!;
+    const withFixtures = workEpisodeWithEvidence({
+      episodeId: "episode_commit_native_shared",
+      repoKey,
+      runIds: [rejectedRunId, validRunId],
+      queryIds: [rejectedQueryId, validQueryId],
+      evidence: [{
+        runId: rejectedRunId,
+        queryId: rejectedQueryId,
+        artifactKeys: [artifactKey],
+        causalWriteArtifacts: [rejectedProof]
+      }, {
+        runId: validRunId,
+        queryId: validQueryId,
+        artifactKeys: [artifactKey],
+        causalWriteArtifacts: [validProof]
+      }]
+    });
+    const { testExecutionNodes: _testExecutionNodes, ...episodeBase } = withFixtures;
+    const episode = {
+      ...episodeBase,
+      claimedByCommitHash: "a".repeat(40),
+      evidence: episodeBase.evidence.map((evidence) => evidence.queryId === rejectedQueryId
+        ? {
+            ...evidence,
+            causalWriteArtifacts: [],
+            nativeRejectedCausalWriteArtifacts: [rejectedProof],
+            causalWriteArtifactsComplete: true
+          }
+        : {
+            ...evidence,
+            causalWriteArtifactsComplete: true
+          })
+    };
+    let now = Date.parse("2026-07-14T16:30:00.000Z");
+    const { service, storage } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [{
+          ...commitSummary("mixed", 90_000),
+          episodeIds: [episode.episodeId],
+          queryIds: [rejectedQueryId, validQueryId],
+          runIds: [rejectedRunId, validRunId],
+          anchorQueryIds: [rejectedQueryId],
+          inheritedQueryIds: [validQueryId],
+          evidenceReasons: ["content_continuity", "native_causal_write_retracted"]
+        }],
+        listCommitPublicationSnapshots: async () => [
+          commitSnapshot("active", 90_000, "2026-07-14T16:30:00.000Z")
+        ],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/shared-valid.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now
+    });
+    await storage.replaceProductionRuns([
+      withSuccessfulWriteActivity(productionRun({
+        runId: rejectedRunId,
+        queryId: rejectedQueryId,
+        correlationId: "trace_commit_native_shared_rejected",
+        provider: "claude-code",
+        runtime: "claude-code",
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        estimatedNanoUsd: 45_000,
+        startedAt: "2026-07-14T16:29:00.000Z",
+        endedAt: "2026-07-14T16:29:01.000Z"
+      })),
+      withSuccessfulWriteActivity(productionRun({
+        runId: validRunId,
+        queryId: validQueryId,
+        correlationId: "trace_commit_native_shared_valid",
+        provider: "claude-code",
+        runtime: "claude-code",
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        estimatedNanoUsd: 45_000,
+        startedAt: "2026-07-14T16:29:02.000Z",
+        endedAt: "2026-07-14T16:29:03.000Z"
+      }))
+    ]);
+    const rejectedInvocationId = "invocation_commit_native_shared_rejected";
+    await persistExecutionNodeFixtures(storage, [
+      {
+        ...successfulWriteSourceNode(rejectedProof, rejectedQueryId, repoKey),
+        requestId: "request_commit_native_shared_rejected_success",
+        invocationId: rejectedInvocationId
+      },
+      nativeRejectedWriteSourceNode(rejectedProof, rejectedQueryId, repoKey, rejectedInvocationId),
+      {
+        ...successfulWriteSourceNode(validProof, validQueryId, repoKey),
+        requestId: "request_commit_native_shared_valid_success",
+        invocationId: "invocation_commit_native_shared_valid"
+      }
+    ]);
+
+    const received: unknown[] = [];
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    ));
+
+    const commits = received.filter((event) =>
+      (event as { eventType?: string }).eventType === "commit.attributed"
+    );
+    expect(commits).toEqual([
+      expect.objectContaining({
+        state: "active",
+        version: 1,
+        runIds: [validRunId],
+        traceIds: ["trace_commit_native_shared_valid"]
+      })
+    ]);
+  });
+
   it("uses work evidence to populate commit-attributed run IDs before run-ended outbox projection", async () => {
     const root = mkdtempSync(join(tmpdir(), "tirion-webhook-dispatch-"));
     roots.push(root);
@@ -6177,10 +12095,11 @@ describe("external webhook dispatch", () => {
         outputTokens: 5,
         totalTokens: 15,
         estimatedNanoUsd: 20_000,
+        usageValueNanoUsd: 20_000,
         startedAt: "2026-06-08T00:00:00.000Z",
         endedAt: "2026-06-08T00:00:01.000Z"
       }),
-      productionRun({
+      withSuccessfulWriteActivity(productionRun({
         runId: "run_write",
         queryId: "qry_write",
         correlationId: "trace_write",
@@ -6190,9 +12109,10 @@ describe("external webhook dispatch", () => {
         outputTokens: 10,
         totalTokens: 30,
         estimatedNanoUsd: 10_000,
+        usageValueNanoUsd: 10_000,
         startedAt: "2026-06-08T00:01:00.000Z",
         endedAt: "2026-06-08T00:01:02.000Z"
-      })
+      }))
     ];
     const storage = serviceStorage(root);
     storages.push(storage);
@@ -6219,7 +12139,7 @@ describe("external webhook dispatch", () => {
     });
 
     const summary: CommitAttributionSummary = {
-      ...commitSummary("active", 10_000),
+      ...commitSummary("active", 30_000),
       queryIds: ["qry_read_only", "qry_write"],
       runIds: ["run_read_only"],
       linkedQueryCount: 2,
@@ -6227,22 +12147,38 @@ describe("external webhook dispatch", () => {
       inheritedQueryIds: ["qry_read_only"]
     };
     let now = Date.parse("2026-06-08T00:02:00.000Z");
+    let snapshotState: CommitPublicationSnapshot["state"] = "active";
+    let snapshotAllocatedNanoUsd = 30_000;
+    let snapshotUpdatedAt = "2026-06-08T00:02:00.000Z";
     let refreshed = false;
+    const workEpisodes = [
+      // Simulates a stale post-commit snapshot later matching an already delivered
+      // read-only run. The explicit empty run.ended projection must remain authoritative.
+      workEpisode("run_read_only", "qry_read_only", ["artifact_stale"], "repo_tirion"),
+      {
+        ...workEpisode(
+          "run_write",
+          "qry_write",
+          ["artifact_src"],
+          "repo_tirion",
+          undefined,
+          successfulWriteArtifactProofs("qry_write", "repo_tirion", ["artifact_src"])
+        ),
+        claimedByCommitHash: "a".repeat(40)
+      }
+    ];
+    await persistExecutionNodeFixtures(storage, executionNodeFixturesForEpisodes(workEpisodes));
     const service = new ExternalWebhookDispatchService(
       storage,
       { configurationPath: join(root, "webhook-config.json") },
       {
         listCommitAttributions: async () => [summary],
-        listCommitPublicationSnapshots: async () => [commitSnapshot("active", 10_000, "2026-06-08T00:02:00.000Z")],
-        listWorkEpisodes: async () => [
-          // Simulates a stale post-commit snapshot later matching an already delivered
-          // read-only run. The explicit empty run.ended projection must remain authoritative.
-          workEpisode("run_read_only", "qry_read_only", ["artifact_stale"], "repo_tirion"),
-          {
-            ...workEpisode("run_write", "qry_write", ["artifact_src"], "repo_tirion"),
-            claimedByCommitHash: "a".repeat(40)
-          }
-        ]
+        listCommitPublicationSnapshots: async () => [commitSnapshot(
+          snapshotState,
+          snapshotAllocatedNanoUsd,
+          snapshotUpdatedAt
+        )],
+        listWorkEpisodes: async () => workEpisodes
       } as unknown as AgentVerifiedAttributionService,
       {
         relativePaths: () => refreshed ? ["src/answer.ts"] : [],
@@ -6286,7 +12222,55 @@ describe("external webhook dispatch", () => {
       runIds: ["run_write"],
       traceIds: ["trace_write"],
       estimatedNanoUsd: 10_000,
+      usageValueNanoUsd: 10_000,
       costCoverage: "complete"
+    });
+
+    snapshotState = "rewrite_pending";
+    snapshotAllocatedNanoUsd = 25_000;
+    snapshotUpdatedAt = "2026-06-08T00:02:06.000Z";
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 2
+    ));
+    expect(received.find((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 2
+    )).toMatchObject({
+      eventType: "commit.attributed",
+      runIds: ["run_write"],
+      estimatedNanoUsd: 0,
+      usageValueNanoUsd: 10_000,
+      costCoverage: "unavailable",
+      state: "rewrite_pending",
+      version: 2
+    });
+
+    await storage.replaceProductionRuns(runs.filter((run) => run.runId === "run_write"));
+    snapshotState = "active";
+    snapshotAllocatedNanoUsd = 10_000;
+    snapshotUpdatedAt = "2026-06-08T00:02:11.000Z";
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 3
+    ));
+    expect(received.find((event) =>
+      (event as { eventType?: string; version?: number }).eventType === "commit.attributed"
+      && (event as { version?: number }).version === 3
+    )).toMatchObject({
+      eventType: "commit.attributed",
+      runIds: ["run_write"],
+      estimatedNanoUsd: 0,
+      usageValueNanoUsd: 10_000,
+      costCoverage: "unavailable",
+      state: "active",
+      version: 3
     });
   });
 
@@ -6307,7 +12291,7 @@ describe("external webhook dispatch", () => {
         startedAt: "2026-06-08T00:00:00.000Z",
         endedAt: "2026-06-08T00:05:00.000Z"
       }),
-      productionRun({
+      withSuccessfulWriteActivity(productionRun({
         runId: "run_codex_write",
         queryId: "qry_codex_write",
         correlationId: "trace_codex_write",
@@ -6319,7 +12303,7 @@ describe("external webhook dispatch", () => {
         estimatedNanoUsd: 10_000,
         startedAt: "2026-06-08T00:06:00.000Z",
         endedAt: "2026-06-08T00:06:02.000Z"
-      })
+      }))
     ];
     const storage = serviceStorage(root);
     storages.push(storage);
@@ -6354,26 +12338,37 @@ describe("external webhook dispatch", () => {
       inheritedQueryIds: ["qry_codex_read_only"]
     };
     let now = Date.parse("2026-06-08T00:07:00.000Z");
+    const workEpisodes = [{
+      ...workEpisodeWithEvidence({
+        episodeId: "episode_codex_session",
+        repoKey: "repo_tirion",
+        chatSessionId: "session_codex",
+        runIds: ["run_codex_read_only", "run_codex_write"],
+        queryIds: ["qry_codex_read_only", "qry_codex_write"],
+        evidence: [
+          { runId: "run_codex_read_only", queryId: "qry_codex_read_only", artifactKeys: [] },
+          {
+            runId: "run_codex_write",
+            queryId: "qry_codex_write",
+            artifactKeys: ["artifact_src"],
+            causalWriteArtifacts: successfulWriteArtifactProofs(
+              "qry_codex_write",
+              "repo_tirion",
+              ["artifact_src"]
+            )
+          }
+        ]
+      }),
+      claimedByCommitHash: "a".repeat(40)
+    }];
+    await persistExecutionNodeFixtures(storage, executionNodeFixturesForEpisodes(workEpisodes));
     const service = new ExternalWebhookDispatchService(
       storage,
       { configurationPath: join(root, "webhook-config.json") },
       {
         listCommitAttributions: async () => [summary],
         listCommitPublicationSnapshots: async () => [commitSnapshot("active", 10_000, "2026-06-08T00:07:00.000Z")],
-        listWorkEpisodes: async () => [{
-          ...workEpisodeWithEvidence({
-            episodeId: "episode_codex_session",
-            repoKey: "repo_tirion",
-            chatSessionId: "session_codex",
-            runIds: ["run_codex_read_only", "run_codex_write"],
-            queryIds: ["qry_codex_read_only", "qry_codex_write"],
-            evidence: [
-              { runId: "run_codex_read_only", queryId: "qry_codex_read_only", artifactKeys: [] },
-              { runId: "run_codex_write", queryId: "qry_codex_write", artifactKeys: ["artifact_src"] }
-            ]
-          }),
-          claimedByCommitHash: "a".repeat(40)
-        }]
+        listWorkEpisodes: async () => workEpisodes
       } as unknown as AgentVerifiedAttributionService,
       {
         relativePaths: (_repoKey, artifactKeys) => artifactKeys.map((key) => `src/${key}.ts`),
@@ -6418,10 +12413,10 @@ describe("external webhook dispatch", () => {
     });
   });
 
-  it("publishes commit-attributed Codex fragment writes under the live public lifecycle subject", async () => {
+  it("publishes commit-attributed Codex fragment writes as a completed public lifecycle correction", async () => {
     const root = mkdtempSync(join(tmpdir(), "tirion-webhook-dispatch-"));
     roots.push(root);
-    const run = productionRun({
+    const run = withSuccessfulWriteActivity(productionRun({
       runId: "run_fragment",
       queryId: "qry_fragment",
       correlationId: "trace_fragment",
@@ -6433,7 +12428,7 @@ describe("external webhook dispatch", () => {
       estimatedNanoUsd: 10_000,
       startedAt: "2026-06-08T00:00:02.000Z",
       endedAt: "2026-06-08T00:00:20.000Z"
-    });
+    }));
     const storage = serviceStorage(root);
     storages.push(storage);
     await storage.initialize({
@@ -6452,27 +12447,34 @@ describe("external webhook dispatch", () => {
       inheritedQueryIds: []
     };
     let now = Date.parse("2026-06-08T00:00:30.000Z");
+    const workEpisodes = [{
+      ...workEpisodeWithEvidence({
+        episodeId: "episode_codex_public",
+        repoKey: "repo_tirion",
+        chatSessionId: "session_codex_public",
+        runIds: ["run_public"],
+        queryIds: ["qry_public"],
+        evidence: [{
+          runId: "run_fragment",
+          queryId: "qry_fragment",
+          artifactKeys: ["artifact_src"],
+          causalWriteArtifacts: successfulWriteArtifactProofs(
+            "qry_fragment",
+            "repo_tirion",
+            ["artifact_src"]
+          )
+        }]
+      }),
+      claimedByCommitHash: "a".repeat(40)
+    }];
+    await persistExecutionNodeFixtures(storage, executionNodeFixturesForEpisodes(workEpisodes));
     const service = new ExternalWebhookDispatchService(
       storage,
       { configurationPath: join(root, "webhook-config.json") },
       {
         listCommitAttributions: async () => [summary],
         listCommitPublicationSnapshots: async () => [commitSnapshot("active", 10_000, "2026-06-08T00:00:30.000Z")],
-        listWorkEpisodes: async () => [{
-          ...workEpisodeWithEvidence({
-            episodeId: "episode_codex_public",
-            repoKey: "repo_tirion",
-            chatSessionId: "session_codex_public",
-            runIds: ["run_public"],
-            queryIds: ["qry_public"],
-            evidence: [{
-              runId: "run_fragment",
-              queryId: "qry_fragment",
-              artifactKeys: ["artifact_src"]
-            }]
-          }),
-          claimedByCommitHash: "a".repeat(40)
-        }]
+        listWorkEpisodes: async () => workEpisodes
       } as unknown as AgentVerifiedAttributionService,
       {
         relativePaths: (_repoKey, artifactKeys) => artifactKeys.map((key) => `src/${key}.ts`),
@@ -6501,7 +12503,12 @@ describe("external webhook dispatch", () => {
     const address = server.address() as AddressInfo;
 
     await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
-    await service.observeSafeObservation(liveCodexPromptObservation("qry_public", "session_codex_public", "2026-06-08T00:00:00.000Z"));
+    const publicPrompt = liveCodexPromptObservation(
+      "qry_public",
+      "session_codex_public",
+      "2026-06-08T00:00:00.000Z"
+    );
+    await service.observeSafeObservation(publicPrompt);
     await service.observeSafeObservation(liveUsageObservation({
       queryId: "qry_fragment",
       sessionId: "session_codex_public",
@@ -6510,6 +12517,14 @@ describe("external webhook dispatch", () => {
       inputTokens: 1,
       outputTokens: 1
     }));
+    await service.observeSafeObservation(liveCompletionObservation(
+      publicPrompt,
+      "2026-06-08T00:00:20.000Z",
+      "stop_hook"
+    ));
+    await waitUntil(() => received.some((event) =>
+      (event as { eventType?: string }).eventType === "run.ended"
+    ));
     await service.reconcileCommitEvents();
     now += 20_000;
     await service.retryNow();
@@ -6615,8 +12630,17 @@ describe("external webhook dispatch", () => {
             runIds: ["run_hook_only", "run_write"],
             queryIds: ["qry_hook_only", "qry_write"],
             evidence: [
-              { runId: "run_hook_only", queryId: "qry_hook_only", artifactKeys: ["src/answer.ts"] },
-              { runId: "run_write", queryId: "qry_write", artifactKeys: ["src/answer.ts"] }
+              { runId: "run_hook_only", queryId: "qry_hook_only", artifactKeys: ["artifact_src"] },
+              {
+                runId: "run_write",
+                queryId: "qry_write",
+                artifactKeys: ["artifact_src"],
+                causalWriteArtifacts: successfulWriteArtifactProofs(
+                  "qry_write",
+                  "repo_tirion",
+                  ["artifact_src"]
+                )
+              }
             ]
           }),
           claimedByCommitHash: "a".repeat(40)
@@ -6628,7 +12652,7 @@ describe("external webhook dispatch", () => {
       },
       now: () => now
     });
-    await storage.replaceProductionRuns([productionRun({
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
       runId: "run_write",
       queryId: "qry_write",
       correlationId: "trace_write",
@@ -6640,7 +12664,7 @@ describe("external webhook dispatch", () => {
       startedAt: "2026-06-08T00:00:00.000Z",
       endedAt: "2026-06-08T00:00:02.000Z",
       estimatedNanoUsd: 10_000
-    })]);
+    }))]);
 
     await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
     await service.reconcileCommitEvents();
@@ -6656,11 +12680,154 @@ describe("external webhook dispatch", () => {
       costCoverage: "complete"
     });
   });
+
+  it("excludes tagged and corroborating untagged title requests from run and commit trace IDs", async () => {
+    const received: Array<Record<string, unknown>> = [];
+    let now = Date.parse("2026-07-12T10:00:10.000Z");
+    const server = createServer((request, response) => {
+      collectJson(request).then((body) => {
+        received.push(body as Record<string, unknown>);
+        response.statusCode = 200;
+        response.end("ok");
+      });
+    });
+    await listen(server);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+    const queryId = "qry_claude_customer_trace_ids";
+    const runId = "run_claude_customer_trace_ids";
+    const customerTraceId = "trace_claude_customer_root";
+    const customerRequestId = "req_claude_customer_main";
+    const auxiliaryRequestId = "req_claude_auxiliary_title";
+    const summary: CommitAttributionSummary = {
+      ...commitSummary("active", 10_000),
+      runIds: [runId],
+      queryIds: [queryId],
+      anchorQueryIds: [queryId],
+      inheritedQueryIds: []
+    };
+    const episode = {
+      ...workEpisode(
+        runId,
+        queryId,
+        ["artifact_claude_trace_ids"],
+        "repo_tirion",
+        undefined,
+        successfulWriteArtifactProofs(queryId, "repo_tirion", ["artifact_claude_trace_ids"])
+      ),
+      claimedByCommitHash: "a".repeat(40)
+    };
+    const { storage, service } = await testService({
+      attribution: {
+        listCommitAttributions: async () => [summary],
+        listCommitPublicationSnapshots: async () => [
+          commitSnapshot("active", 10_000, "2026-07-12T10:00:05.000Z")
+        ],
+        listWorkEpisodes: async () => [episode]
+      },
+      repositories: {
+        relativePaths: () => ["src/answer.ts"],
+        resolveGitHubRepository: async () => githubRepository("asafaltagar", "Tirion")
+      },
+      now: () => now,
+      timing: { runEndedGraceMs: 1 }
+    });
+    await storage.replaceProductionRuns([withSuccessfulWriteActivity(productionRun({
+      runId,
+      queryId,
+      correlationId: customerTraceId,
+      provider: "claude-code",
+      runtime: "claude-code",
+      inputTokens: 10,
+      outputTokens: 2,
+      totalTokens: 12,
+      startedAt: "2026-07-12T10:00:00.000Z",
+      endedAt: "2026-07-12T10:00:02.000Z",
+      estimatedNanoUsd: 10_000
+    }))]);
+    await appendDurableObservation(storage, {
+      schemaVersion: 1,
+      observationId: "obs_claude_trace_id_filter",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "claude-code-enhanced-logs-beta-v1",
+      resourceCount: 1,
+      recordCount: 3,
+      observedAt: "2026-07-12T10:00:02.000Z",
+      usageAtoms: [{
+        schemaVersion: 1,
+        atomId: "atom_claude_auxiliary_title_tagged",
+        correlationId: queryId,
+        queryId,
+        requestId: auxiliaryRequestId,
+        signal: "logs",
+        sourceId: "otlp_claude_code_logs",
+        profileVersion: "claude-code-enhanced-logs-beta-v1",
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        usagePurpose: "auxiliary_session_title",
+        inputTokens: 500,
+        outputTokens: 10,
+        startedAt: "2026-07-12T10:00:00.500Z"
+      }, {
+        schemaVersion: 1,
+        atomId: "atom_claude_auxiliary_title_untagged_trace",
+        correlationId: queryId,
+        queryId,
+        requestId: auxiliaryRequestId,
+        signal: "traces",
+        sourceId: "otlp_claude_code_traces",
+        profileVersion: "claude-code-enhanced-traces-beta-v1",
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        inputTokens: 500,
+        outputTokens: 10,
+        startedAt: "2026-07-12T10:00:00.500Z"
+      }, {
+        schemaVersion: 1,
+        atomId: "atom_claude_customer_main",
+        correlationId: queryId,
+        queryId,
+        requestId: customerRequestId,
+        signal: "logs",
+        sourceId: "otlp_claude_code_logs",
+        profileVersion: "claude-code-enhanced-logs-beta-v1",
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        usagePurpose: "customer",
+        inputTokens: 10,
+        outputTokens: 2,
+        startedAt: "2026-07-12T10:00:01.000Z"
+      }]
+    });
+
+    await service.configureUrl({ schemaVersion: 1, url: `http://127.0.0.1:${address.port}/hooks` });
+    await service.reconcileCommitEvents();
+    now += 5_000;
+    await service.retryNow();
+    await waitUntil(() => received.some((event) => event.eventType === "commit.attributed"));
+
+    const ended = received.find((event) => event.eventType === "run.ended") as { traceIds: string[] };
+    const commit = received.find((event) => event.eventType === "commit.attributed") as { traceIds: string[] };
+    const expectedTraceIds = [customerTraceId, queryId, customerRequestId].sort();
+    expect([...ended.traceIds].sort()).toEqual(expectedTraceIds);
+    expect([...commit.traceIds].sort()).toEqual(expectedTraceIds);
+    expect(commit.traceIds.length).toBeGreaterThan(0);
+    expect(commit.traceIds.every((traceId) => ended.traceIds.includes(traceId))).toBe(true);
+    expect(JSON.stringify([ended, commit])).not.toContain(auxiliaryRequestId);
+  });
 });
 
 async function testService(options: {
   attribution?: Partial<AgentVerifiedAttributionService>;
   repositories?: Partial<AgentRepositoryObservationService>;
+  /** Exact durable source nodes used by focused provenance tests. */
+  executionNodes?: ExecutionNodeAtomV1[];
   now?: () => number;
   recordEvent?: (event: DiagnosticEvent) => void;
   timing?: {
@@ -6679,19 +12846,171 @@ async function testService(options: {
     protocolVersion: "1.0"
   });
   await storage.beginProductionUsageEpoch("2026-06-08T00:00:00.000Z");
+  await persistExecutionNodeFixtures(storage, options.executionNodes ?? []);
+  const providedAttribution = { ...emptyAttribution(), ...options.attribution };
+  const listWorkEpisodes = providedAttribution.listWorkEpisodes!;
+  const attribution = {
+    ...providedAttribution,
+    listWorkEpisodes: async (query = {}) => {
+      const episodes = await listWorkEpisodes(query);
+      await persistExecutionNodeFixtures(storage, executionNodeFixturesForEpisodes(episodes));
+      return episodes;
+    }
+  } as unknown as AgentVerifiedAttributionService;
   return {
     root,
     storage,
     service: new ExternalWebhookDispatchService(
       storage,
       { configurationPath: join(root, "webhook-config.json") },
-      { ...emptyAttribution(), ...options.attribution } as unknown as AgentVerifiedAttributionService,
+      attribution,
       { ...emptyRepositories(), ...options.repositories } as unknown as AgentRepositoryObservationService,
       options.now,
       options.recordEvent,
       metadata.installationId,
       options.timing
     )
+  };
+}
+
+function runUpdatedEvent(input: {
+  runId: string;
+  eventId: string;
+  state: RunUpdatedWebhookEventV1["state"];
+  updatedAt: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  activity?: RunUpdatedWebhookEventV1["activity"];
+}): RunUpdatedWebhookEventV1 {
+  const inputTokens = input.inputTokens ?? 0;
+  const outputTokens = input.outputTokens ?? 0;
+  const startedAt = "2026-07-12T18:19:00.000Z";
+  const evidence = {
+    basis: "trace_span" as const,
+    sourceId: `trace_${input.runId}`,
+    profileVersion: "cc06-webhook-test-v1",
+    observedAt: input.updatedAt,
+    delayed: false,
+    identityConfidence: "high" as const,
+    timingConfidence: "high" as const
+  };
+  const activity = input.activity ?? [{
+    activityId: `activity_${input.runId}_llm`,
+    kind: "llm_request" as const,
+    name: "claude-test",
+    outcome: "success" as const,
+    count: 1,
+    failureCount: 0,
+    startedAt,
+    endedAt: input.updatedAt,
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: inputTokens + outputTokens,
+    usageAttributionBasis: "provider_reported" as const,
+    usageCoverage: "complete" as const,
+    evidence
+  }];
+  return {
+    schemaVersion: 1,
+    eventType: "run.update",
+    eventId: input.eventId,
+    runId: input.runId,
+    sessionId: `ses_${input.runId}`,
+    traceIds: [`trace_${input.runId}`],
+    sender: { installationId: "install_cc06_webhook_test" },
+    repository: {
+      repoKey: "repo_cc06_webhook_test",
+      owner: "local",
+      name: "cc06-webhook-test",
+      fullName: "local/cc06-webhook-test"
+    },
+    codingHarness: "claude-code",
+    runtime: "claude-code",
+    startedAt,
+    evidence,
+    coverage: {
+      usageCoverage: inputTokens + outputTokens > 0 ? "complete_so_far" : "none",
+      activityCoverage: activity.length > 0 ? "partial" : "none",
+      costCoverage: "unavailable"
+    },
+    sequence: 2,
+    updatedAt: input.updatedAt,
+    state: input.state,
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: inputTokens + outputTokens,
+    llmModels: inputTokens + outputTokens > 0 ? ["claude-test"] : [],
+    estimatedNanoUsd: 0,
+    costEstimateBasis: "unavailable",
+    costCoverage: "unavailable",
+    activity
+  };
+}
+
+function runEndedFromUpdate(
+  update: RunUpdatedWebhookEventV1,
+  input: {
+    eventId: string;
+    endedAt: string;
+    evidence: Partial<RunEndedWebhookEventV1["evidence"]>;
+  }
+): RunEndedWebhookEventV1 {
+  const {
+    sequence: _sequence,
+    updatedAt: _updatedAt,
+    ...base
+  } = update;
+  return {
+    ...base,
+    eventType: "run.ended",
+    eventId: input.eventId,
+    version: 1,
+    endedAt: input.endedAt,
+    evidence: {
+      ...update.evidence,
+      ...input.evidence
+    },
+    coverage: {
+      ...update.coverage,
+      usageCoverage: "final"
+    },
+    state: "completed",
+    filesChanged: []
+  };
+}
+
+function runUpdateActivity(
+  activityId: string,
+  kind: RunUpdatedWebhookEventV1["activity"][number]["kind"],
+  name: string,
+  startedAt: string
+): RunUpdatedWebhookEventV1["activity"][number] {
+  return {
+    activityId,
+    kind,
+    name,
+    outcome: "success",
+    count: 1,
+    failureCount: 0,
+    startedAt,
+    endedAt: startedAt,
+    usageAttributionBasis: "activity_only",
+    usageCoverage: "unavailable",
+    evidence: {
+      basis: "subagent_hook",
+      sourceId: "hook_claude_code_lifecycle",
+      profileVersion: "cc06-webhook-test-v1",
+      observedAt: startedAt,
+      delayed: false,
+      identityConfidence: "high",
+      timingConfidence: "high"
+    }
   };
 }
 
@@ -6746,8 +13065,10 @@ function workEpisode(
   queryId: string,
   artifactKeys: string[],
   repoKey: string,
-  causalArtifactKeys = artifactKeys
+  causalArtifactKeys = artifactKeys,
+  causalWriteArtifacts: Array<{ artifactKey: string; executionNodeId: string }> = []
 ) {
+  const testExecutionNodes = successfulWriteExecutionNodeFixtures(queryId, repoKey, causalWriteArtifacts);
   return {
     episodeId: `episode_${runId}`,
     repoKeys: [repoKey],
@@ -6767,10 +13088,19 @@ function workEpisode(
       observedChangeCount: artifactKeys.length,
       artifactKeys,
       causalArtifactKeys,
+      causalWriteArtifacts,
       addedLines: 0,
       deletedLines: 0
-    }]
+    }],
+    // Test-only durable execution-node fixtures. They model the independently
+    // persisted source proof that production dispatch now requires.
+    testExecutionNodes
   };
+}
+
+function workEpisodeWithoutTestExecutionNodes(...input: Parameters<typeof workEpisode>) {
+  const { testExecutionNodes: _testExecutionNodes, ...episode } = workEpisode(...input);
+  return episode;
 }
 
 function workEpisodeWithEvidence(input: {
@@ -6780,8 +13110,29 @@ function workEpisodeWithEvidence(input: {
   chatSessionId?: string;
   runIds: string[];
   queryIds: string[];
-  evidence: Array<{ runId: string; queryId: string; repoKey?: string; artifactKeys: string[] }>;
+  evidence: Array<{
+    runId: string;
+    queryId: string;
+    repoKey?: string;
+    artifactKeys: string[];
+    causalWriteArtifacts?: Array<{ artifactKey: string; executionNodeId: string }>;
+  }>;
 }) {
+  const evidence = input.evidence.map((item) => ({
+    queryId: item.queryId,
+    runIds: [item.runId],
+    repoKey: item.repoKey ?? input.repoKey,
+    startedAt: "2026-06-08T00:00:00.000Z",
+    baselineTrusted: true,
+    baselineReasons: ["repo_bound"],
+    dirtyAtStart: false,
+    observedChangeCount: item.artifactKeys.length,
+    artifactKeys: item.artifactKeys,
+    causalArtifactKeys: item.artifactKeys,
+    causalWriteArtifacts: item.causalWriteArtifacts ?? [],
+    addedLines: 0,
+    deletedLines: 0
+  }));
   return {
     episodeId: input.episodeId,
     chatSessionId: input.chatSessionId,
@@ -6791,21 +13142,130 @@ function workEpisodeWithEvidence(input: {
     startedAt: "2026-06-08T00:00:00.000Z",
     lastAgentActivityAt: "2026-06-08T00:00:02.000Z",
     status: "claimed",
-    evidence: input.evidence.map((item) => ({
-      queryId: item.queryId,
-      runIds: [item.runId],
-      repoKey: item.repoKey ?? input.repoKey,
-      startedAt: "2026-06-08T00:00:00.000Z",
-      baselineTrusted: true,
-      baselineReasons: ["repo_bound"],
-      dirtyAtStart: false,
-      observedChangeCount: item.artifactKeys.length,
-      artifactKeys: item.artifactKeys,
-      causalArtifactKeys: item.artifactKeys,
-      addedLines: 0,
-      deletedLines: 0
-    }))
+    evidence,
+    testExecutionNodes: evidence.flatMap((item) => successfulWriteExecutionNodeFixtures(
+      item.queryId,
+      item.repoKey,
+      item.causalWriteArtifacts
+    ))
   };
+}
+
+function successfulWriteArtifactProofs(
+  queryId: string,
+  repoKey: string,
+  artifactKeys: string[]
+): Array<{
+  artifactKey: string;
+  executionNodeId: string;
+}> {
+  return artifactKeys.map((artifactKey, index) => ({
+    artifactKey,
+    executionNodeId: `node_successful_write_${testFixtureNodeSuffix(queryId, repoKey, artifactKey, index)}`
+  }));
+}
+
+function successfulWriteExecutionNodeFixtures(
+  queryId: string,
+  repoKey: string,
+  proofs: Array<{ artifactKey: string; executionNodeId: string }>
+): ExecutionNodeAtomV1[] {
+  return proofs.map((proof) => ({
+    schemaVersion: 1,
+    nodeId: proof.executionNodeId,
+    queryId,
+    repositoryKey: repoKey,
+    provider: "codex",
+    runtime: "codex",
+    signal: "logs",
+    nodeKind: "tool",
+    name: "Write",
+    toolName: "Write",
+    outcome: "success",
+    startedAt: "2026-06-08T00:00:00.000Z",
+    artifactKeys: [proof.artifactKey],
+    artifactEvidence: "provider_tool_event"
+  }));
+}
+
+function successfulWriteSourceNode(
+  proof: { executionNodeId: string },
+  queryId: string,
+  repoKey: string
+): ExecutionNodeAtomV1 {
+  return {
+    schemaVersion: 1,
+    nodeId: proof.executionNodeId,
+    queryId,
+    repositoryKey: repoKey,
+    provider: "claude-code",
+    runtime: "claude-code",
+    signal: "logs",
+    nodeKind: "tool",
+    name: "Write",
+    toolName: "Write",
+    outcome: "success",
+    startedAt: "2026-06-08T00:20:00.000Z",
+    artifactKeys: [proof.artifactKey],
+    artifactEvidence: "provider_write_hook"
+  };
+}
+
+/** A separate Claude permission-decision record for the exact same opaque tool use. */
+function nativeRejectedWriteSourceNode(
+  proof: { executionNodeId: string },
+  queryId: string,
+  repoKey: string,
+  invocationId: string
+): ExecutionNodeAtomV1 {
+  return {
+    schemaVersion: 1,
+    nodeId: `node_native_rejected_${proof.executionNodeId}`,
+    queryId,
+    repositoryKey: repoKey,
+    requestId: `request_native_rejected_${proof.executionNodeId}`,
+    invocationId,
+    provider: "claude-code",
+    runtime: "claude-code",
+    signal: "logs",
+    nodeKind: "tool",
+    name: "Write",
+    toolName: "Write",
+    outcome: "rejected",
+    outcomeAuthority: "native_permission_decision",
+    startedAt: "2026-06-08T00:20:01.000Z"
+  };
+}
+
+function testFixtureNodeSuffix(queryId: string, repoKey: string, artifactKey: string, index: number): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ queryId, repoKey, artifactKey, index }))
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function executionNodeFixturesForEpisodes(episodes: unknown[]): ExecutionNodeAtomV1[] {
+  return episodes.flatMap((episode) => {
+    if (!episode || typeof episode !== "object") {
+      return [];
+    }
+    const fixtures = (episode as { testExecutionNodes?: unknown }).testExecutionNodes;
+    return Array.isArray(fixtures) ? fixtures as ExecutionNodeAtomV1[] : [];
+  });
+}
+
+async function persistExecutionNodeFixtures(
+  storage: AgentStorageClient,
+  nodes: ExecutionNodeAtomV1[]
+): Promise<void> {
+  const byNodeId = new Map(nodes.map((node) => [node.nodeId, node]));
+  for (const node of byNodeId.values()) {
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: node.nodeId,
+      sortAt: node.startedAt,
+      value: node
+    });
+  }
 }
 
 function commitSummary(
@@ -6866,6 +13326,8 @@ function productionRun(input: {
   estimatedNanoUsd?: number;
   usageValueNanoUsd?: number;
   costEstimateBasis?: ProductionRunV1["costEstimateBasis"];
+  completionEvidence?: ProductionRunV1["completionEvidence"];
+  completionOutcome?: ProductionRunV1["completionOutcome"];
   billingContext?: ProductionRunV1["billingContext"];
   models?: string[];
   sessionId?: string;
@@ -6890,6 +13352,8 @@ function productionRun(input: {
     estimatedNanoUsd: input.estimatedNanoUsd,
     usageValueNanoUsd: input.usageValueNanoUsd,
     costEstimateBasis: input.costEstimateBasis ?? "unavailable",
+    ...(input.completionEvidence ? { completionEvidence: input.completionEvidence } : {}),
+    ...(input.completionOutcome ? { completionOutcome: input.completionOutcome } : {}),
     billingContext: input.billingContext ?? "openai-direct",
     costCoverage: input.estimatedNanoUsd == null ? "unavailable" : "complete",
     evidenceGrade: "estimated_usage_cost_unattributed",
@@ -6899,6 +13363,24 @@ function productionRun(input: {
     startedAt: input.startedAt,
     endedAt: input.endedAt,
     warnings: []
+  };
+}
+
+function withSuccessfulWriteActivity(run: ProductionRunV1): ProductionRunV1 {
+  return {
+    ...run,
+    toolCallCount: Math.max(1, run.toolCallCount),
+    breakdown: [...(run.breakdown ?? []), {
+      schemaVersion: 1,
+      breakdownId: `brk_${run.runId}_write`,
+      kind: "tool",
+      name: "Write",
+      count: 1,
+      failureCount: 0,
+      totalDurationMs: 1,
+      attributionBasis: "activity_only",
+      coverage: "unavailable"
+    }]
   };
 }
 
@@ -6983,6 +13465,115 @@ function liveToolObservation(queryId: string, sessionId: string, observedAt: str
       startedAt: observedAt,
       endedAt: observedAt,
       durationMs: 12
+    }],
+    usageAtoms: []
+  };
+}
+
+/**
+ * Models the hook-side successful Write proof.  The hook request identifier is
+ * deliberately distinct from OTLP's decision request identifier: the opaque
+ * invocation identity is the only safe cross-surface join for this test.
+ */
+function liveClaudeWriteProofObservation(input: {
+  queryId: string;
+  sessionId: string;
+  observedAt: string;
+  invocationId?: string;
+  activityRequestId: string;
+  nodeRequestId: string;
+  artifactKeys: string[];
+}): SafeObservationV1 {
+  const base = liveToolObservation(input.queryId, input.sessionId, input.observedAt);
+  return {
+    ...base,
+    observationId: `obs_live_claude_write_${input.invocationId ?? input.nodeRequestId}`,
+    activityAtoms: [{
+      ...base.activityAtoms![0],
+      activityId: `act_live_claude_write_${input.invocationId ?? input.nodeRequestId}`,
+      requestId: input.activityRequestId,
+      ...(input.invocationId ? { invocationId: input.invocationId } : {}),
+      name: "Write",
+      outcome: "success",
+      evidenceBasis: "tool_hook",
+      evidenceSourceId: "hook_claude_code_tools"
+    }],
+    executionNodes: [{
+      ...base.executionNodes![0],
+      nodeId: `node_live_claude_write_${input.invocationId ?? input.nodeRequestId}`,
+      requestId: input.nodeRequestId,
+      ...(input.invocationId ? { invocationId: input.invocationId } : {}),
+      name: "Write",
+      toolName: "Write",
+      outcome: "success",
+      artifactKeys: input.artifactKeys,
+      artifactEvidence: "provider_write_hook"
+    }]
+  };
+}
+
+/**
+ * Models a Claude OTLP native permission decision.  It has a separate OTLP
+ * request identifier, while preserving the same provider tool-use identity.
+ */
+function liveClaudeNativeDecisionObservation(input: {
+  queryId: string;
+  sessionId: string;
+  observedAt: string;
+  /** Source event time; `observedAt` is permitted to be a later arrival. */
+  startedAt?: string;
+  endedAt?: string;
+  invocationId?: string;
+  activityRequestId: string;
+  nodeRequestId: string;
+}): SafeObservationV1 {
+  const startedAt = input.startedAt ?? input.observedAt;
+  return {
+    schemaVersion: 1,
+    observationId: `obs_live_claude_native_decision_${input.invocationId ?? input.nodeRequestId}`,
+    sourceId: "otlp_claude_code_logs",
+    provider: "claude-code",
+    runtime: "claude-code",
+    signal: "logs",
+    profileVersion: "claude-code-otlp-logs-v1",
+    resourceCount: 1,
+    recordCount: 1,
+    observedAt: input.observedAt,
+    activityAtoms: [{
+      schemaVersion: 1,
+      activityId: `act_live_claude_native_decision_${input.invocationId ?? input.nodeRequestId}`,
+      queryId: input.queryId,
+      sessionId: input.sessionId,
+      requestId: input.activityRequestId,
+      ...(input.invocationId ? { invocationId: input.invocationId } : {}),
+      provider: "claude-code",
+      runtime: "claude-code",
+      kind: "tool",
+      name: "Write",
+      outcome: "rejected",
+      outcomeAuthority: "native_permission_decision",
+      evidenceBasis: "otel_event",
+      evidenceSourceId: "otlp_claude_code_logs",
+      startedAt,
+      ...(input.endedAt ? { endedAt: input.endedAt } : {})
+    }],
+    executionNodes: [{
+      schemaVersion: 1,
+      nodeId: `node_live_claude_native_decision_${input.invocationId ?? input.nodeRequestId}`,
+      queryId: input.queryId,
+      sessionId: input.sessionId,
+      requestId: input.nodeRequestId,
+      ...(input.invocationId ? { invocationId: input.invocationId } : {}),
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      nodeKind: "tool",
+      name: "Write",
+      toolName: "Write",
+      outcome: "rejected",
+      outcomeAuthority: "native_permission_decision",
+      startedAt,
+      ...(input.endedAt ? { endedAt: input.endedAt } : {})
     }],
     usageAtoms: []
   };
@@ -7206,7 +13797,8 @@ function liveClosedCodexTurnObservation(input: {
 function liveCompletionObservation(
   prompt: SafeObservationV1,
   completedAt: string,
-  completionEvidence: "stop_hook" | "session_hook" | "closed_root_span" | "provider_completed_event"
+  completionEvidence: "stop_hook" | "session_hook" | "closed_root_span" | "provider_completed_event",
+  completionOutcome?: QueryOccurrenceV1["completionOutcome"]
 ): SafeObservationV1 {
   const occurrences = prompt.queryOccurrences ?? [];
   if (occurrences.length === 0) {
@@ -7219,7 +13811,8 @@ function liveCompletionObservation(
     queryOccurrences: occurrences.map((occurrence) => ({
       ...occurrence,
       completedAt,
-      completionEvidence
+      completionEvidence,
+      ...(completionOutcome ? { completionOutcome } : {})
     })),
     executionNodes: [],
     usageAtoms: []
@@ -7385,6 +13978,8 @@ function liveUsageObservation(input: {
   queryId: string;
   sessionId: string;
   observedAt: string;
+  sourceStartedAt?: string;
+  sourceEndedAt?: string;
   atomId: string;
   inputTokens: number;
   outputTokens: number;
@@ -7423,8 +14018,8 @@ function liveUsageObservation(input: {
       outputTokens: input.outputTokens,
       cacheReadInputTokens: input.cacheReadInputTokens,
       cacheCreationInputTokens: input.cacheCreationInputTokens,
-      startedAt: input.observedAt,
-      endedAt: input.observedAt
+      startedAt: input.sourceStartedAt ?? input.observedAt,
+      endedAt: input.sourceEndedAt ?? input.sourceStartedAt ?? input.observedAt
     }]
   };
 }

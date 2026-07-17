@@ -303,6 +303,13 @@ export class AgentStorageClient {
     await this.post("upsertProductionRuns", { runs });
   }
 
+  async applyProductionRunRetention(
+    runs: ProductionRunV1[],
+    retainAfter: string
+  ): Promise<ProductionUsageEpochV1> {
+    return await this.post<ProductionUsageEpochV1>("applyProductionRunRetention", { runs, retainAfter });
+  }
+
   async listProductionRuns(): Promise<ProductionRunV1[]> {
     return await this.post<ProductionRunV1[]>("listProductionRuns", {});
   }
@@ -514,6 +521,7 @@ type WorkerCommandName =
   | "productionUsageEpoch"
   | "replaceProductionRuns"
   | "upsertProductionRuns"
+  | "applyProductionRunRetention"
   | "listProductionRuns"
   | "clearProductionRuns"
   | "upsertRepositoryScope"

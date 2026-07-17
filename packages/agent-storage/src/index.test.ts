@@ -439,6 +439,10 @@ describe("agent storage worker", () => {
       baselineReasons: [],
       artifactKeys: ["artifact_legacy"],
       causalArtifactKeys: ["artifact_legacy"],
+      causalWriteArtifacts: Array.from({ length: 3 }, (_, index) => ({
+        artifactKey: `artifact_causal_${index}`,
+        executionNodeId: `node_causal_${index}`
+      })),
       baselineArtifactStates: [{ artifactKey: "baseline_1" }, { artifactKey: "baseline_2" }, { artifactKey: "baseline_3" }],
       artifactStates: [{ artifactKey: "artifact_1" }, { artifactKey: "artifact_2" }, { artifactKey: "artifact_3" }],
       observedChangeCount: 3,
@@ -496,13 +500,25 @@ describe("agent storage worker", () => {
       workEpisodes: { totalCount: 2, statusCounts: { open: 1, claimed: 1 }, unboundCount: 1 }
     });
     expect(await storage.sanitizeOversizedAttributionDocuments(2)).toEqual({
-      workspaceEvidenceSanitized: 1,
+      workspaceEvidenceSanitized: 2,
       workEpisodesSanitized: 1
     });
-    expect((await storage.listWorkspaceEvidenceDocuments<{ baselineTrusted: boolean; artifactStates: unknown[] }>({ queryId: "qry_scope_a" }))[0]?.value)
-      .toMatchObject({ baselineTrusted: false, artifactStates: [] });
-    expect((await storage.listWorkEpisodeDocuments<{ evidence: Array<{ artifactStates: unknown[]; artifactKeys: unknown[] }> }>({ runId: "run_scope_a" }))[0]?.value.evidence[0])
-      .toMatchObject({ artifactStates: [], artifactKeys: [] });
+    expect((await storage.listWorkspaceEvidenceDocuments<{
+      baselineTrusted: boolean;
+      artifactStates: unknown[];
+      causalWriteArtifacts: unknown[];
+    }>({ queryId: "qry_scope_a" }))[0]?.value)
+      .toMatchObject({ baselineTrusted: false, artifactStates: [], causalWriteArtifacts: [] });
+    expect((await storage.listWorkspaceEvidenceDocuments<{
+      baselineTrusted: boolean;
+      artifactStates: unknown[];
+      causalWriteArtifacts: unknown[];
+    }>({ queryId: "qry_scope_b" }))[0]?.value)
+      .toMatchObject({ baselineTrusted: false, artifactStates: [], causalWriteArtifacts: [] });
+    expect((await storage.listWorkEpisodeDocuments<{
+      evidence: Array<{ artifactStates: unknown[]; artifactKeys: unknown[]; causalWriteArtifacts: unknown[] }>;
+    }>({ runId: "run_scope_a" }))[0]?.value.evidence[0])
+      .toMatchObject({ artifactStates: [], artifactKeys: [], causalWriteArtifacts: [] });
 
     const deliveredWriting = {
       schemaVersion: 1,
@@ -735,6 +751,258 @@ describe("agent storage worker", () => {
     await storage.close();
   });
 
+  it("retains Claude request-owner conflicts monotonically across replay and restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-owner-conflict-"));
+    roots.push(root);
+    const databasePath = join(root, "agent.db");
+    const storage = new AgentStorageClient({ databasePath });
+    const metadata = await storage.initialize({
+      now: "2026-07-12T22:46:34.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertSource(
+      { ...source("source_owner_conflict"), environmentId: metadata.environmentId },
+      "2026-07-12T22:46:34.000Z"
+    );
+    const base = {
+      schemaVersion: 1 as const,
+      sourceId: "source_owner_conflict",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      signal: "traces" as const,
+      profileVersion: "claude-code-enhanced-traces-beta-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: "2026-07-12T22:46:34.000Z"
+    };
+    const atom = {
+      schemaVersion: 1 as const,
+      atomId: "atom_owner_conflict",
+      correlationId: "qry_owner_conflict",
+      queryId: "qry_owner_conflict",
+      requestId: "req_owner_conflict",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      authority: "request" as const,
+      inputTokens: 2,
+      outputTokens: 79,
+      startedAt: "2026-07-12T22:46:34.000Z"
+    };
+    await storage.appendSafeObservation({
+      ...base,
+      observationId: "observation_owner_a",
+      usageAtoms: [{ ...atom, owningActivityId: "act_owner_a" }]
+    });
+    await storage.appendSafeObservation({
+      ...base,
+      observationId: "observation_owner_conflict",
+      usageAtoms: [{ ...atom, ownershipConflictActivityIds: ["act_owner_a", "act_owner_b"] }]
+    });
+    await storage.close();
+
+    const reopened = new AgentStorageClient({ databasePath });
+    await reopened.initialize({
+      now: "2026-07-12T22:46:35.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await reopened.appendSafeObservation({
+      ...base,
+      observationId: "observation_owner_replay",
+      usageAtoms: [{ ...atom, owningActivityId: "act_owner_a" }]
+    });
+    await reopened.appendSafeObservation({
+      ...base,
+      observationId: "observation_owner_c_first",
+      usageAtoms: [{ ...atom, atomId: "atom_owner_direct_conflict", owningActivityId: "act_owner_c" }]
+    });
+    await reopened.appendSafeObservation({
+      ...base,
+      observationId: "observation_owner_d_second",
+      usageAtoms: [{ ...atom, atomId: "atom_owner_direct_conflict", owningActivityId: "act_owner_d" }]
+    });
+
+    expect(await reopened.listSafeUsageAtoms()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        atomId: "atom_owner_conflict",
+        ownershipConflictActivityIds: ["act_owner_a", "act_owner_b"]
+      }),
+      expect.objectContaining({
+        atomId: "atom_owner_direct_conflict",
+        ownershipConflictActivityIds: ["act_owner_c", "act_owner_d"]
+      })
+    ]));
+    for (const retained of await reopened.listSafeUsageAtoms()) {
+      expect(retained).not.toHaveProperty("owningActivityId");
+    }
+    await reopened.close();
+  });
+
+  it("persists distinct activity and execution-node revisions by semantic identity", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-activity-revision-"));
+    roots.push(root);
+    const databasePath = join(root, "agent.db");
+    const storage = new AgentStorageClient({ databasePath });
+    const metadata = await storage.initialize({
+      now: "2026-06-08T00:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertSource(
+      { ...source("source_activity_revision"), environmentId: metadata.environmentId },
+      "2026-06-08T00:00:00.000Z"
+    );
+    const base = {
+      schemaVersion: 1 as const,
+      sourceId: "source_activity_revision",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      signal: "logs" as const,
+      profileVersion: "claude-code-hooks-v1",
+      resourceCount: 1,
+      recordCount: 1
+    };
+    const activity = {
+      schemaVersion: 1 as const,
+      activityId: "activity_revision_12345678",
+      queryId: "qry_revision_12345678",
+      requestId: "req_revision_12345678",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      kind: "subagent" as const,
+      name: "Explore",
+      startedAt: "2026-06-08T00:00:01.000Z"
+    };
+    const node = {
+      schemaVersion: 1 as const,
+      nodeId: "node_revision_12345678",
+      queryId: "qry_revision_12345678",
+      requestId: "req_revision_12345678",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      nodeKind: "subagent" as const,
+      name: "Explore",
+      startedAt: "2026-06-08T00:00:01.000Z"
+    };
+    await storage.appendSafeObservation({
+      ...base,
+      observationId: "observation_activity_revision_open",
+      observedAt: "2026-06-08T00:00:01.000Z",
+      usageAtoms: [],
+      activityAtoms: [{ ...activity, outcome: "unknown" }],
+      executionNodes: [{ ...node, outcome: "unknown" }]
+    });
+    await storage.appendSafeObservation({
+      ...base,
+      observationId: "observation_activity_revision_terminal",
+      observedAt: "2026-06-08T00:00:03.000Z",
+      usageAtoms: [],
+      activityAtoms: [{
+        ...activity,
+        outcome: "success",
+        endedAt: "2026-06-08T00:00:03.000Z"
+      }],
+      executionNodes: [{
+        ...node,
+        outcome: "success",
+        endedAt: "2026-06-08T00:00:03.000Z"
+      }]
+    });
+    await storage.close();
+
+    const reopened = new AgentStorageClient({ databasePath });
+    await reopened.initialize({
+      now: "2026-06-08T00:00:04.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    expect(await reopened.safeObservationCount()).toBe(2);
+    expect(await reopened.listSafeActivityAtoms()).toEqual([expect.objectContaining({
+      activityId: activity.activityId,
+      outcome: "success",
+      endedAt: "2026-06-08T00:00:03.000Z"
+    })]);
+    expect(await reopened.readAgentDocument("execution_node_atom", node.nodeId)).toMatchObject({
+      value: expect.objectContaining({
+        nodeId: node.nodeId,
+        outcome: "success",
+        endedAt: "2026-06-08T00:00:03.000Z"
+      })
+    });
+    await reopened.close();
+  });
+
+  it("retains a native permission rejection across legacy same-identity activity revisions", async () => {
+    const decision = {
+      schemaVersion: 1 as const,
+      activityId: "activity_native_permission_decision",
+      queryId: "qry_native_permission_decision",
+      requestId: "req_native_permission_decision",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      kind: "tool" as const,
+      name: "Write",
+      outcome: "rejected" as const,
+      outcomeAuthority: "native_permission_decision" as const,
+      startedAt: "2026-07-14T04:00:00.000Z"
+    };
+    const genericFailure = {
+      ...decision,
+      outcome: "failure" as const,
+      outcomeAuthority: undefined,
+      durationMs: 1_000,
+      resultSizeBytes: 256,
+      providerReportedResultTokens: 12,
+      endedAt: "2026-07-14T04:00:01.000Z"
+    };
+    for (const [index, atoms] of [
+      [decision, genericFailure],
+      [genericFailure, decision]
+    ].entries()) {
+      const root = mkdtempSync(join(tmpdir(), `tirion-storage-native-decision-${index}-`));
+      roots.push(root);
+      const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+      const metadata = await storage.initialize({
+        now: "2026-07-14T04:00:00.000Z",
+        ownershipState: "agent_full_owner",
+        protocolVersion: "1.0"
+      });
+      await storage.upsertSource(
+        { ...source("source_native_permission_decision"), environmentId: metadata.environmentId },
+        "2026-07-14T04:00:00.000Z"
+      );
+      for (const [revision, atom] of atoms.entries()) {
+        await storage.appendSafeObservation({
+          schemaVersion: 1,
+          observationId: `observation_native_permission_decision_${index}_${revision}`,
+          sourceId: "source_native_permission_decision",
+          provider: "claude-code",
+          runtime: "claude-code",
+          signal: "logs",
+          profileVersion: "claude-code-otlp-v1",
+          resourceCount: 1,
+          recordCount: 1,
+          observedAt: `2026-07-14T04:00:0${revision}.000Z`,
+          activityAtoms: [atom],
+          usageAtoms: []
+        });
+      }
+      expect(await storage.safeObservationCount()).toBe(2);
+      expect(await storage.listSafeActivityAtoms()).toEqual([expect.objectContaining({
+        activityId: decision.activityId,
+        outcome: "rejected",
+        outcomeAuthority: "native_permission_decision"
+      })]);
+      const [retained] = await storage.listSafeActivityAtoms();
+      expect(retained).not.toHaveProperty("endedAt");
+      expect(retained).not.toHaveProperty("durationMs");
+      expect(retained).not.toHaveProperty("resultSizeBytes");
+      expect(retained).not.toHaveProperty("providerReportedResultTokens");
+      await storage.close();
+    }
+  });
+
   it("bounds safe-journal replay and accounts for overflow after downstream projection", async () => {
     const root = mkdtempSync(join(tmpdir(), "tirion-storage-journal-retention-"));
     roots.push(root);
@@ -872,6 +1140,84 @@ describe("agent storage worker", () => {
     expect(await reopened.applyQueryOccurrenceRetention("2026-06-09T00:00:00.000Z")).toBe(1);
     expect(await reopened.listQueryOccurrences()).toEqual([]);
     await reopened.close();
+  });
+
+  it("retains failed completion evidence across duplicates and lower-information revisions", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-storage-failed-completion-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: "2026-07-12T06:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    await storage.upsertSource(
+      { ...source("source_claude_stop_failure"), environmentId: metadata.environmentId },
+      "2026-07-12T06:00:00.000Z"
+    );
+    const failedObservation = {
+      schemaVersion: 1 as const,
+      observationId: "observation_claude_stop_failure",
+      sourceId: "source_claude_stop_failure",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      signal: "logs" as const,
+      profileVersion: "claude-code-hooks-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: "2026-07-12T06:00:01.000Z",
+      queryOccurrences: [{
+        schemaVersion: 1 as const,
+        queryId: "qry_claude_stop_failure",
+        sessionId: "ses_claude_stop_failure",
+        provider: "claude-code" as const,
+        runtime: "claude-code",
+        startedAt: "2026-07-12T06:00:00.000Z",
+        completedAt: "2026-07-12T06:00:01.000Z",
+        completionEvidence: "stop_hook" as const,
+        completionOutcome: "failure" as const,
+        completionFailureCategory: "authentication_failed" as const,
+        promptState: "disabled" as const,
+        evidence: "submission_hook" as const
+      }],
+      usageAtoms: []
+    };
+    const {
+      completionOutcome: _completionOutcome,
+      completionFailureCategory: _completionFailureCategory,
+      ...lowerInformationOccurrence
+    } = failedObservation.queryOccurrences[0];
+
+    await expect(storage.appendSafeObservation(failedObservation)).resolves.toBe(true);
+    await expect(storage.appendSafeObservation(failedObservation)).resolves.toBe(false);
+    await storage.appendSafeObservation({
+      ...failedObservation,
+      observationId: "observation_claude_stop_failure_lower_information",
+      observedAt: "2026-07-12T06:00:02.000Z",
+      queryOccurrences: [{
+        ...lowerInformationOccurrence,
+        completedAt: "2026-07-12T06:00:02.000Z",
+        completionEvidence: "provider_completed_event"
+      }]
+    });
+    await storage.appendSafeObservation({
+      ...failedObservation,
+      observationId: "observation_claude_stop_failure_equal_outcome_weaker_evidence",
+      observedAt: "2026-07-12T06:00:03.000Z",
+      queryOccurrences: [{
+        ...failedObservation.queryOccurrences[0],
+        completedAt: "2026-07-12T06:00:03.000Z",
+        completionEvidence: "provider_completed_event"
+      }]
+    });
+
+    await expect(storage.readQueryOccurrence("qry_claude_stop_failure")).resolves.toMatchObject({
+      completedAt: "2026-07-12T06:00:01.000Z",
+      completionEvidence: "stop_hook",
+      completionOutcome: "failure",
+      completionFailureCategory: "authentication_failed"
+    });
+    await storage.close();
   });
 
 });

@@ -182,6 +182,19 @@ validate_provider_selection() {
   done
 }
 
+validate_direct_agent_socket_path() {
+  [[ "$DIRECT_AGENT" == "1" ]] || return 0
+  local platform max_path_length
+  platform="$(uname -s)"
+  case "$platform" in
+    Darwin) max_path_length=103 ;;
+    Linux) max_path_length=107 ;;
+    *) return 0 ;;
+  esac
+  (( ${#AGENT_SOCKET} <= max_path_length )) \
+    || fail "direct-agent socket path is too long for ${platform} (${#AGENT_SOCKET} > ${max_path_length}); choose a shorter TIRION_TEST_ROOT such as /tmp/tw"
+}
+
 cleanup() {
   set +e
   if [[ -n "${WEBHOOK_PID:-}" ]]; then
@@ -406,6 +419,15 @@ assert_run_event_common() {
   assert_no_forbidden_keys "$file"
 }
 
+assert_claude_customer_usage() {
+  local file="$1"
+  [[ -n "$CLAUDE_MODEL" ]] || fail "TIRION_TEST_CLAUDE_MODEL is required for exact Claude usage acceptance"
+  assert_json "$file" --arg model "$CLAUDE_MODEL" '(.llmModels | index($model)) != null'
+  assert_json "$file" '(.llmModels | index("claude-haiku-4-5-20251001")) == null'
+  assert_json "$file" '.inputTokens > 0 and .outputTokens > 0 and .totalTokens == (.inputTokens + .outputTokens)'
+  assert_json "$file" '.estimatedNanoUsd > 0 and .costEstimateBasis == "provider_reported_estimate"'
+}
+
 event_index() {
   local target="$1" index=0
   sync_external_events
@@ -606,6 +628,31 @@ assert_run_stream_integrity() {
 query_trace_id_for_run_id() {
   local run_id="$1"
   echo "qry_${run_id#run_}"
+}
+
+assert_commit_trace_subset_for_run() {
+  local commit_file="$1" run_file="$2" run_id query_trace_id
+  run_id="$(jq -r '.runId' "$run_file")"
+  query_trace_id="$(query_trace_id_for_run_id "$run_id")"
+  assert_json "$commit_file" --arg trace_id "$query_trace_id" '(.traceIds | index($trace_id)) != null'
+  jq -e --slurpfile run "$run_file" '
+    (.traceIds | length) >= 1
+    and all(.traceIds[]; . as $trace_id | ($run[0].traceIds | index($trace_id)) != null)
+  ' "$commit_file" >/dev/null \
+    || fail "commit attribution trace IDs are not a non-empty subset of the writing run trace IDs"
+}
+
+assert_single_write_commit_cost() {
+  local commit_file="$1" run_file="$2" expected_cost expected_usage_value
+  expected_cost="$(jq -r '.estimatedNanoUsd' "$run_file")"
+  expected_usage_value="$(jq -r '.usageValueNanoUsd // empty' "$run_file")"
+  assert_json "$commit_file" --argjson expected_cost "$expected_cost" '.estimatedNanoUsd == $expected_cost'
+  if [[ -n "$expected_usage_value" ]]; then
+    assert_json "$commit_file" --argjson expected_usage_value "$expected_usage_value" \
+      '.usageValueNanoUsd == $expected_usage_value'
+  fi
+  assert_json "$commit_file" --arg expected_coverage "$(jq -r '.costCoverage' "$run_file")" \
+    '.costCoverage == $expected_coverage'
 }
 
 clear_captured_events() {
@@ -1010,6 +1057,7 @@ PY
 ###############################################################################
 
 validate_provider_selection
+validate_direct_agent_socket_path
 require_command python3
 require_command jq
 require_command git
@@ -1118,6 +1166,7 @@ run_claude_code "Inspect this repository and summarize what it does. Do not modi
 [[ -z "$(git status --short)" ]] || fail "Claude Code read-only run modified the repo"
 CC_RUN_RO="$(wait_for_event '.eventType == "run.ended" and .codingHarness == "claude-code" and .repository.name == "claude-code-repo" and .filesChanged == []')"
 assert_run_event_common "$CC_RUN_RO"
+assert_claude_customer_usage "$CC_RUN_RO"
 assert_json "$CC_RUN_RO" '.runtime == "claude-code"'
 CC_RUN_RO_ID="$(jq -r '.runId' "$CC_RUN_RO")"
 assert_run_lifecycle_for_ended "$CC_RUN_RO" "claude-code" "claude-code-repo" "Claude Code read-only"
@@ -1134,23 +1183,20 @@ CC_BUG_COMMIT_SHA="$(commit_fixture_and_capture_sha "$CC_BUG_COMMIT_MESSAGE" \
 CC_RUN_WR="$(wait_for_event '.eventType == "run.ended" and .codingHarness == "claude-code" and .repository.name == "claude-code-repo" and (.filesChanged | length) >= 2')"
 CC_BUG_COMMIT_EV="$(wait_for_event --arg sha "$CC_BUG_COMMIT_SHA" '.eventType == "commit.attributed" and .commitSha == $sha')"
 assert_run_event_common "$CC_RUN_WR"
+assert_claude_customer_usage "$CC_RUN_WR"
 assert_run_lifecycle_for_ended "$CC_RUN_WR" "claude-code" "claude-code-repo" "Claude Code write"
 assert_json "$CC_RUN_WR" '(.filesChanged | index("src/answer.ts")) != null'
 assert_json "$CC_RUN_WR" '(.filesChanged | index("config/settings.json")) != null'
 assert_json "$CC_RUN_WR" '(.filesChanged | any(. == "docs/claude-notes.md"))'
 CC_RUN_WR_ID="$(jq -r '.runId' "$CC_RUN_WR")"
 CC_REPO_KEY="$(jq -r '.repository.repoKey' "$CC_RUN_WR")"
-CC_RUN_WR_TRACE_IDS=()
-while IFS= read -r t; do CC_RUN_WR_TRACE_IDS+=("$t"); done < <(jq -r '.traceIds[]' "$CC_RUN_WR")
-
 assert_commit_event_common "$CC_BUG_COMMIT_EV"
 assert_commit_message "$CC_BUG_COMMIT_EV" "$CC_BUG_COMMIT_MESSAGE"
 assert_json "$CC_BUG_COMMIT_EV" --arg key "$CC_REPO_KEY" '.repository.repoKey == $key'
 assert_json "$CC_BUG_COMMIT_EV" --arg id "$CC_RUN_WR_ID" '(.runIds | index($id)) != null'
 assert_json "$CC_BUG_COMMIT_EV" --arg id "$CC_RUN_RO_ID" '(.runIds | index($id)) == null'
-for trace_id in "${CC_RUN_WR_TRACE_IDS[@]}"; do
-  assert_json "$CC_BUG_COMMIT_EV" --arg trace_id "$trace_id" '(.traceIds | index($trace_id)) != null'
-done
+assert_commit_trace_subset_for_run "$CC_BUG_COMMIT_EV" "$CC_RUN_WR"
+assert_single_write_commit_cost "$CC_BUG_COMMIT_EV" "$CC_RUN_WR"
 pass "Claude Code [BUG] write run and bucketable commit attribution validated"
 
 run_claude_code "Create docs/claude-story.md containing a short non-secret product story note about lifecycle webhook coverage. Do not include this sentinel anywhere in files or output: DO_NOT_LEAK_CLAUDE_SECRET."
@@ -1160,6 +1206,7 @@ CC_STORY_COMMIT_SHA="$(commit_fixture_and_capture_sha "$CC_STORY_COMMIT_MESSAGE"
 CC_RUN_STORY="$(wait_for_event '.eventType == "run.ended" and .codingHarness == "claude-code" and .repository.name == "claude-code-repo" and (.filesChanged | any(. == "docs/claude-story.md"))')"
 CC_STORY_COMMIT_EV="$(wait_for_event --arg sha "$CC_STORY_COMMIT_SHA" '.eventType == "commit.attributed" and .commitSha == $sha')"
 assert_run_event_common "$CC_RUN_STORY"
+assert_claude_customer_usage "$CC_RUN_STORY"
 assert_run_lifecycle_for_ended "$CC_RUN_STORY" "claude-code" "claude-code-repo" "Claude Code Story write"
 assert_json "$CC_RUN_STORY" '(.filesChanged | any(. == "docs/claude-story.md"))'
 CC_RUN_STORY_ID="$(jq -r '.runId' "$CC_RUN_STORY")"
@@ -1168,6 +1215,7 @@ assert_commit_message "$CC_STORY_COMMIT_EV" "$CC_STORY_COMMIT_MESSAGE"
 assert_json "$CC_STORY_COMMIT_EV" --arg key "$CC_REPO_KEY" '.repository.repoKey == $key'
 assert_json "$CC_STORY_COMMIT_EV" --arg id "$CC_RUN_STORY_ID" '(.runIds | index($id)) != null'
 assert_json "$CC_STORY_COMMIT_EV" --arg id "$CC_RUN_RO_ID" '(.runIds | index($id)) == null'
+assert_single_write_commit_cost "$CC_STORY_COMMIT_EV" "$CC_RUN_STORY"
 pass "Claude Code Story write run and bucketable commit attribution validated"
 
 tirionctl repo remove "$CC_SCOPE_ID" >/dev/null
@@ -1335,8 +1383,6 @@ assert_json "$CP_RUN_WR" --arg model "$COPILOT_MODEL" '(.llmModels | index($mode
 assert_json "$CP_RUN_WR" '.costEstimateBasis == "catalog_estimate"'
 assert_json "$CP_RUN_WR" '.costCoverage == "complete"'
 CP_REPO_KEY="$(jq -r '.repository.repoKey' "$CP_RUN_WR")"
-CP_RUN_WR_TRACE_IDS=()
-while IFS= read -r t; do CP_RUN_WR_TRACE_IDS+=("$t"); done < <(jq -r '.traceIds[]' "$CP_RUN_WR")
 CP_BUG_COMMIT_MESSAGE="[BUG] github-copilot lifecycle multi-file change"
 CP_BUG_COMMIT_SHA="$(commit_fixture_and_capture_sha "$CP_BUG_COMMIT_MESSAGE" \
   src/answer.ts docs/copilot-notes.md config/settings.json)"
@@ -1346,9 +1392,7 @@ assert_commit_message "$CP_BUG_COMMIT_EV" "$CP_BUG_COMMIT_MESSAGE"
 assert_json "$CP_BUG_COMMIT_EV" --arg key "$CP_REPO_KEY" '.repository.repoKey == $key'
 assert_json "$CP_BUG_COMMIT_EV" --arg id "$CP_RUN_WR_ID" '(.runIds | index($id)) != null'
 assert_json "$CP_BUG_COMMIT_EV" --arg id "$CP_RUN_RO_ID" '(.runIds | index($id)) == null'
-for trace_id in "${CP_RUN_WR_TRACE_IDS[@]}"; do
-  assert_json "$CP_BUG_COMMIT_EV" --arg trace_id "$trace_id" '(.traceIds | index($trace_id)) != null'
-done
+assert_commit_trace_subset_for_run "$CP_BUG_COMMIT_EV" "$CP_RUN_WR"
 pass "GitHub Copilot [BUG] write run and bucketable commit attribution validated"
 
 CP_FEATURE_START_MS="$(now_ms)"

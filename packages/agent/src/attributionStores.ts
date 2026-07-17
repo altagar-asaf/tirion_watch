@@ -259,9 +259,28 @@ function normalizeEvidence(evidence: QueryWorkEvidence): QueryWorkEvidence {
     baselineReasons: uniqueStrings(evidence.baselineReasons),
     artifactKeys: uniqueStrings(evidence.artifactKeys),
     causalArtifactKeys: evidence.causalArtifactKeys ? uniqueStrings(evidence.causalArtifactKeys) : undefined,
+    causalWriteArtifacts: evidence.causalWriteArtifacts
+      ? uniqueCausalWriteArtifacts(evidence.causalWriteArtifacts)
+      : undefined,
+    nativeRejectedCausalWriteArtifacts: evidence.nativeRejectedCausalWriteArtifacts
+      ? uniqueCausalWriteArtifacts(evidence.nativeRejectedCausalWriteArtifacts)
+      : undefined,
     baselineArtifactStates: evidence.baselineArtifactStates?.map((item) => ({ ...item })),
     artifactStates: evidence.artifactStates?.map((item) => ({ ...item }))
   };
+}
+
+function uniqueCausalWriteArtifacts(
+  artifacts: NonNullable<QueryWorkEvidence["causalWriteArtifacts"]>
+): NonNullable<QueryWorkEvidence["causalWriteArtifacts"]> {
+  const byPair = new Map<string, NonNullable<QueryWorkEvidence["causalWriteArtifacts"]>[number]>();
+  for (const artifact of artifacts) {
+    byPair.set(`${artifact.artifactKey}:${artifact.executionNodeId}`, artifact);
+  }
+  return [...byPair.values()].sort((left, right) =>
+    left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
 }
 
 function normalizeEpisode(episode: AgenticWorkEpisode): AgenticWorkEpisode {

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,6 +52,247 @@ describe("agent runtime control and client gateway", () => {
     });
     const rejected = await call(agent.socketPath(), "POST", "/v1/ownership/transition", { target: "agent_usage_owner" }, agent.bootstrapCredential());
     expect(rejected).toMatchObject({ status: 409, body: { error: "unsupported_capability" } });
+  });
+
+  it("requires authority and converges a late runtime lane through a second webhook drain", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: 0,
+      initialOwnershipState: "agent_full_owner",
+      otlpAuthToken: false
+    });
+    agents.push(agent);
+    await agent.start();
+
+    expect(await call(agent.socketPath(), "POST", "/v1/runtime/quiesce", {
+      schemaVersion: 1,
+      timeoutMs: 1_000
+    })).toMatchObject({ status: 403, body: { error: "authorization_denied" } });
+    expect(await call(agent.socketPath(), "POST", "/v1/runtime/quiesce", {
+      schemaVersion: 1,
+      timeoutMs: 1
+    }, agent.bootstrapCredential())).toMatchObject({ status: 400, body: { error: "invalid_request" } });
+
+    const runtime = agent as any;
+    const dispatch = runtime.webhookDispatch;
+    const originalDrain = dispatch.drainForQuiesce.bind(dispatch);
+    const completed: string[] = [];
+    let drainCalls = 0;
+    let releaseFirstDrain!: () => void;
+    let firstDrainEntered!: () => void;
+    const firstDrainEnteredPromise = new Promise<void>((resolve) => {
+      firstDrainEntered = resolve;
+    });
+    dispatch.drainForQuiesce = async () => {
+      drainCalls += 1;
+      if (drainCalls === 1) {
+        runtime.runtimeWork.enqueue("quiesce_late_projection", async () => {
+          completed.push("late_projection");
+        });
+        firstDrainEntered();
+        await new Promise<void>((resolve) => {
+          releaseFirstDrain = resolve;
+        });
+      }
+      return await originalDrain();
+    };
+
+    const quiesce = call(agent.socketPath(), "POST", "/v1/runtime/quiesce", {
+      schemaVersion: 1,
+      timeoutMs: 5_000
+    }, agent.bootstrapCredential());
+    await firstDrainEnteredPromise;
+    expect(await call(agent.socketPath(), "POST", "/v1/webhook/test", undefined, agent.bootstrapCredential())).toMatchObject({
+      status: 409,
+      body: { error: "unsupported_capability" }
+    });
+    releaseFirstDrain();
+    const result = await quiesce;
+    expect(result).toMatchObject({
+      status: 200,
+      body: {
+        state: "drained",
+        telemetryIngressDrained: true,
+        runtimeWorkDrained: true,
+        webhookDrained: true
+      }
+    });
+    expect(completed).toEqual(["late_projection"]);
+    expect(drainCalls).toBeGreaterThanOrEqual(2);
+    expect(await callOtlp(agent.otlpAddress()!.port, "/v1/traces", { resourceSpans: [] })).toMatchObject({
+      status: 409,
+      body: { error: "ingress_sealed" }
+    });
+    expect(runtime.otlp.ingressSealStatus()).toEqual({ sealed: true, postSealRequestCount: 1 });
+    expect(await call(agent.socketPath(), "POST", "/v1/webhook/test", undefined, agent.bootstrapCredential())).toMatchObject({
+      status: 409,
+      body: { error: "unsupported_capability" }
+    });
+    expect(await call(agent.socketPath(), "POST", "/v1/webhook/retry", undefined, agent.bootstrapCredential())).toMatchObject({
+      status: 409,
+      body: { error: "unsupported_capability" }
+    });
+    expect(await call(agent.socketPath(), "GET", "/v1/webhook/status", undefined, agent.bootstrapCredential())).toMatchObject({
+      status: 200,
+      body: { queuedCount: 0, blockedCount: 0 }
+    });
+  });
+
+  it("waits a webhook mutation that entered before the pre-stop writer gate", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_full_owner"
+    });
+    agents.push(agent);
+    await agent.start();
+
+    const runtime = agent as any;
+    const dispatch = runtime.webhookDispatch;
+    let releaseTest!: () => void;
+    let testEntered!: () => void;
+    const testEnteredPromise = new Promise<void>((resolve) => {
+      testEntered = resolve;
+    });
+    dispatch.test = async () => {
+      testEntered();
+      await new Promise<void>((resolve) => {
+        releaseTest = resolve;
+      });
+      return { schemaVersion: 1, eventId: "evt_pre_stop_mutation", queued: false };
+    };
+
+    const webhookTest = call(agent.socketPath(), "POST", "/v1/webhook/test", undefined, agent.bootstrapCredential());
+    await testEnteredPromise;
+    let quiesceResolved = false;
+    const quiesce = call(agent.socketPath(), "POST", "/v1/runtime/quiesce", {
+      schemaVersion: 1,
+      timeoutMs: 5_000
+    }, agent.bootstrapCredential()).then((result) => {
+      quiesceResolved = true;
+      return result;
+    });
+    await wait(20);
+    expect(quiesceResolved).toBe(false);
+
+    releaseTest();
+    expect(await webhookTest).toMatchObject({ status: 200, body: { queued: false } });
+    expect(await quiesce).toMatchObject({
+      status: 200,
+      body: {
+        state: "drained",
+        telemetryIngressDrained: true,
+        runtimeWorkDrained: true,
+        webhookDrained: true
+      }
+    });
+  });
+
+  it("seals Copilot span DB admission before declaring the telemetry barrier drained", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_full_owner"
+    });
+    agents.push(agent);
+    await agent.start();
+
+    const runtime = agent as any;
+    let sealed = false;
+    let releaseSeal!: () => void;
+    let sealEntered!: () => void;
+    const sealEnteredPromise = new Promise<void>((resolve) => {
+      sealEntered = resolve;
+    });
+    runtime.copilotSpanDb = {
+      sealForQuiesce: async () => {
+        sealed = true;
+        sealEntered();
+        await new Promise<void>((resolve) => {
+          releaseSeal = resolve;
+        });
+        return true;
+      },
+      drainAcceptedWork: async () => true,
+      unsealAfterFailedQuiesce: () => {
+        sealed = false;
+      },
+      ingressSealStatus: () => ({ sealed }),
+      acceptedWorkGeneration: () => 0,
+      stop: async () => undefined
+    };
+
+    let quiesceResolved = false;
+    const quiesce = call(agent.socketPath(), "POST", "/v1/runtime/quiesce", {
+      schemaVersion: 1,
+      timeoutMs: 5_000
+    }, agent.bootstrapCredential()).then((result) => {
+      quiesceResolved = true;
+      return result;
+    });
+    await sealEnteredPromise;
+    await wait(20);
+    expect(quiesceResolved).toBe(false);
+    expect(await call(agent.socketPath(), "POST", "/v1/provider-sources/github-copilot/span-db", {
+      schemaVersion: 1,
+      enabled: false,
+      captureContent: false,
+      dbSpanExporter: false
+    }, agent.bootstrapCredential())).toMatchObject({
+      status: 409,
+      body: { error: "unsupported_capability" }
+    });
+
+    releaseSeal();
+    expect(await quiesce).toMatchObject({
+      status: 200,
+      body: {
+        state: "drained",
+        telemetryIngressDrained: true,
+        runtimeWorkDrained: true,
+        webhookDrained: true
+      }
+    });
+    expect(await call(agent.socketPath(), "POST", "/v1/provider-sources/github-copilot/span-db", {
+      schemaVersion: 1,
+      enabled: false,
+      captureContent: false,
+      dbSpanExporter: false
+    }, agent.bootstrapCredential())).toMatchObject({
+      status: 409,
+      body: { error: "unsupported_capability" }
+    });
+  });
+
+  it("does not let a drained usage owner start webhook dispatch through ownership transition", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_usage_owner"
+    });
+    agents.push(agent);
+    await agent.start();
+
+    const readiness = await call(agent.socketPath(), "GET", "/v1/ownership/readiness", undefined, agent.bootstrapCredential());
+    expect(readiness.body).toMatchObject({
+      transitions: expect.arrayContaining([
+        expect.objectContaining({ target: "agent_full_owner", ready: true })
+      ])
+    });
+    expect(await call(agent.socketPath(), "POST", "/v1/runtime/quiesce", {
+      schemaVersion: 1,
+      timeoutMs: 5_000
+    }, agent.bootstrapCredential())).toMatchObject({
+      status: 200,
+      body: { state: "drained" }
+    });
+    expect(await call(agent.socketPath(), "POST", "/v1/ownership/transition", {
+      target: "agent_full_owner"
+    }, agent.bootstrapCredential())).toMatchObject({
+      status: 409,
+      body: { error: "unsupported_capability" }
+    });
+    expect((agent as any).webhookDispatch).toBeUndefined();
   });
 
   it("moves to a clean agent-owned usage epoch only after the drain gate passes", async () => {
@@ -483,7 +724,7 @@ describe("agent runtime control and client gateway", () => {
 
   it("projects live webhook observations for every harness without waiting for workspace evidence", async () => {
     const originalObserveWorkspace = AgentVerifiedAttributionService.prototype.observeSafeObservation;
-    const originalObserveWebhook = ExternalWebhookDispatchService.prototype.observeSafeObservation;
+    const originalAdmitWebhook = ExternalWebhookDispatchService.prototype.admitSafeObservation;
     const webhookProviders: SupportedProvider[] = [];
     let workspaceStarted = false;
     let releaseWorkspace!: () => void;
@@ -495,7 +736,7 @@ describe("agent runtime control and client gateway", () => {
       workspaceStarted = true;
       await workspaceBlocked;
     };
-    ExternalWebhookDispatchService.prototype.observeSafeObservation = async function (observation) {
+    ExternalWebhookDispatchService.prototype.admitSafeObservation = async function (observation) {
       webhookProviders.push(observation.provider);
     };
     try {
@@ -541,18 +782,74 @@ describe("agent runtime control and client gateway", () => {
     } finally {
       releaseWorkspace?.();
       AgentVerifiedAttributionService.prototype.observeSafeObservation = originalObserveWorkspace;
-      ExternalWebhookDispatchService.prototype.observeSafeObservation = originalObserveWebhook;
+      ExternalWebhookDispatchService.prototype.admitSafeObservation = originalAdmitWebhook;
+    }
+  });
+
+  it("routes a decision-only native Claude rejection to durable attribution", async () => {
+    const originalObserveWorkspace = AgentVerifiedAttributionService.prototype.observeSafeObservation;
+    const observedIds: string[] = [];
+    AgentVerifiedAttributionService.prototype.observeSafeObservation = async function (observation) {
+      observedIds.push(observation.observationId);
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: 0,
+        initialOwnershipState: "agent_full_owner"
+      });
+      agents.push(agent);
+      await agent.start();
+      const schedule = (agent as unknown as {
+        scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+      }).scheduleLiveIngestProcessing.bind(agent);
+      const at = "2026-07-14T18:00:00.000Z";
+      schedule({
+        schemaVersion: 1,
+        observationId: "obs_decision_only_durable_attribution",
+        sourceId: "otlp_claude_code_logs",
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "logs",
+        profileVersion: "claude-code-otlp-logs-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: at,
+        executionNodes: [{
+          schemaVersion: 1,
+          nodeId: "node_decision_only_durable_attribution",
+          queryId: "qry_decision_only_durable_attribution",
+          sessionId: "ses_decision_only_durable_attribution",
+          requestId: "req_decision_only_durable_attribution",
+          invocationId: "invocation_decision_only_durable_attribution",
+          provider: "claude-code",
+          runtime: "claude-code",
+          signal: "logs",
+          nodeKind: "tool",
+          name: "Write",
+          toolName: "Write",
+          outcome: "rejected",
+          outcomeAuthority: "native_permission_decision",
+          startedAt: at
+        }],
+        usageAtoms: []
+      });
+
+      await waitUntil(() => observedIds.includes("obs_decision_only_durable_attribution"));
+      expect(observedIds).toEqual(["obs_decision_only_durable_attribution"]);
+    } finally {
+      AgentVerifiedAttributionService.prototype.observeSafeObservation = originalObserveWorkspace;
     }
   });
 
   it("prioritizes a newly queued lifecycle anchor ahead of older enrichment", async () => {
-    const originalObserveWebhook = ExternalWebhookDispatchService.prototype.observeSafeObservation;
+    const originalAdmitWebhook = ExternalWebhookDispatchService.prototype.admitSafeObservation;
     const projected: string[] = [];
     let releaseFirst!: () => void;
     const firstBlocked = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
-    ExternalWebhookDispatchService.prototype.observeSafeObservation = async function (observation) {
+    ExternalWebhookDispatchService.prototype.admitSafeObservation = async function (observation) {
       projected.push(observation.observationId);
       if (observation.observationId === "obs_enrichment_first") {
         await firstBlocked;
@@ -629,8 +926,495 @@ describe("agent runtime control and client gateway", () => {
       ]);
     } finally {
       releaseFirst?.();
-      ExternalWebhookDispatchService.prototype.observeSafeObservation = originalObserveWebhook;
+      ExternalWebhookDispatchService.prototype.admitSafeObservation = originalAdmitWebhook;
     }
+  });
+
+  it("projects an accepted Claude closed-root terminal while ordinary live projection is in flight", async () => {
+    const originalAdmitWebhook = ExternalWebhookDispatchService.prototype.admitSafeObservation;
+    const projected: string[] = [];
+    let ordinaryProjectionReleased = false;
+    let releaseOrdinaryProjection!: () => void;
+    const ordinaryProjectionBlocked = new Promise<void>((resolve) => {
+      releaseOrdinaryProjection = () => {
+        ordinaryProjectionReleased = true;
+        resolve();
+      };
+    });
+    let terminalProjectedWhileOrdinaryBlocked = false;
+    ExternalWebhookDispatchService.prototype.admitSafeObservation = async function (observation) {
+      projected.push(observation.observationId);
+      if (observation.observationId === "obs_ordinary_live_enrichment") {
+        await ordinaryProjectionBlocked;
+      }
+      if (observation.observationId === "obs_claude_closed_root_terminal") {
+        terminalProjectedWhileOrdinaryBlocked = !ordinaryProjectionReleased;
+      }
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: 0,
+        initialOwnershipState: "agent_full_owner",
+        usageProjectionQuietMs: 60_000
+      });
+      agents.push(agent);
+      await agent.start();
+      const schedule = (agent as unknown as {
+        scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+      }).scheduleLiveIngestProcessing.bind(agent);
+      const at = new Date().toISOString();
+      schedule({
+        schemaVersion: 1,
+        observationId: "obs_ordinary_live_enrichment",
+        sourceId: "otlp_codex_logs",
+        provider: "codex",
+        runtime: "codex",
+        signal: "logs",
+        profileVersion: "terminal-live-lane-test-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: at,
+        activityAtoms: [{
+          schemaVersion: 1,
+          activityId: "act_ordinary_live_enrichment",
+          queryId: "qry_ordinary_live_enrichment",
+          sessionId: "ses_ordinary_live_enrichment",
+          provider: "codex",
+          runtime: "codex",
+          kind: "tool",
+          name: "Bash",
+          outcome: "success",
+          startedAt: at
+        }],
+        usageAtoms: []
+      });
+      await waitUntil(() => projected.includes("obs_ordinary_live_enrichment"));
+
+      schedule({
+        schemaVersion: 1,
+        observationId: "obs_claude_closed_root_terminal",
+        sourceId: "otlp_claude_code_traces",
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "traces",
+        profileVersion: "terminal-live-lane-test-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: at,
+        queryOccurrences: [{
+          schemaVersion: 1,
+          queryId: "qry_claude_closed_root_terminal",
+          sessionId: "ses_claude_closed_root_terminal",
+          provider: "claude-code",
+          runtime: "claude-code",
+          startedAt: at,
+          completedAt: at,
+          completionEvidence: "closed_root_span",
+          promptState: "disabled",
+          evidence: "submission_hook"
+        }],
+        usageAtoms: []
+      });
+
+      await waitUntil(() => projected.includes("obs_claude_closed_root_terminal"));
+      expect(terminalProjectedWhileOrdinaryBlocked).toBe(true);
+    } finally {
+      releaseOrdinaryProjection?.();
+      ExternalWebhookDispatchService.prototype.admitSafeObservation = originalAdmitWebhook;
+    }
+  });
+
+  it("immediately projects a classified Claude closed-root terminal without waiting for the quiet fallback", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_full_owner",
+      usageProjectionQuietMs: 60_000
+    });
+    agents.push(agent);
+    await agent.start();
+    const runtime = agent as unknown as {
+      scheduleTerminalUsageProjection: (observation: SafeObservationV1) => void;
+      enqueueTerminalUsageProjection: (queryId: string) => void;
+    };
+    const projected: string[] = [];
+    runtime.enqueueTerminalUsageProjection = (queryId) => projected.push(queryId);
+    const at = new Date().toISOString();
+
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_closed_root_immediate_projection",
+      sourceId: "otlp_claude_code_traces",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "traces",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: at,
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId: "qry_claude_closed_root_immediate_projection",
+        sessionId: "ses_claude_closed_root_immediate_projection",
+        provider: "claude-code",
+        runtime: "claude-code",
+        startedAt: at,
+        completedAt: at,
+        completionEvidence: "closed_root_span",
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }],
+      usageAtoms: []
+    });
+
+    expect(projected).toEqual(["qry_claude_closed_root_immediate_projection"]);
+  });
+
+  it("immediately reprojects a recent Claude terminal for late eligible exact-query usage", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_full_owner",
+      usageProjectionQuietMs: 60_000
+    });
+    agents.push(agent);
+    await agent.start();
+    const runtime = agent as unknown as {
+      scheduleTerminalUsageProjection: (observation: SafeObservationV1) => void;
+      enqueueTerminalUsageProjection: (queryId: string) => void;
+    };
+    const projected: string[] = [];
+    runtime.enqueueTerminalUsageProjection = (queryId) => projected.push(queryId);
+    const queryId = "qry_claude_late_preboundary_usage";
+    const sessionId = "ses_claude_late_preboundary_usage";
+    const completedAt = new Date().toISOString();
+    const beforeCompletion = new Date(Date.parse(completedAt) - 1).toISOString();
+
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_late_preboundary_terminal",
+      sourceId: "otlp_claude_code_traces",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "traces",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: completedAt,
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId,
+        sessionId,
+        provider: "claude-code",
+        runtime: "claude-code",
+        startedAt: beforeCompletion,
+        completedAt,
+        completionEvidence: "closed_root_span",
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }],
+      usageAtoms: []
+    });
+    expect(projected).toEqual([queryId]);
+
+    projected.length = 0;
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_late_preboundary_usage",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date().toISOString(),
+      usageAtoms: [{
+        schemaVersion: 1,
+        atomId: "atom_claude_late_preboundary_usage",
+        correlationId: queryId,
+        queryId,
+        sessionId,
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        inputTokens: 1,
+        outputTokens: 1,
+        startedAt: beforeCompletion,
+        endedAt: completedAt
+      }]
+    });
+    expect(projected).toEqual([queryId]);
+
+    projected.length = 0;
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_late_preboundary_activity",
+      sourceId: "hook_claude_code_tools",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date().toISOString(),
+      activityAtoms: [{
+        schemaVersion: 1,
+        activityId: "act_claude_late_preboundary_activity",
+        queryId,
+        sessionId,
+        provider: "claude-code",
+        runtime: "claude-code",
+        kind: "tool",
+        name: "Bash",
+        outcome: "unknown",
+        startedAt: beforeCompletion,
+        endedAt: completedAt
+      }],
+      usageAtoms: []
+    });
+    expect(projected).toEqual([queryId]);
+
+    projected.length = 0;
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_late_preboundary_execution",
+      sourceId: "otlp_claude_code_traces",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "traces",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date().toISOString(),
+      executionNodes: [{
+        schemaVersion: 1,
+        nodeId: "node_claude_late_preboundary_execution",
+        queryId,
+        sessionId,
+        provider: "claude-code",
+        runtime: "claude-code",
+        nodeKind: "tool",
+        name: "Bash",
+        outcome: "unknown",
+        startedAt: beforeCompletion,
+        endedAt: completedAt
+      }],
+      usageAtoms: []
+    });
+    expect(projected).toEqual([queryId]);
+
+    projected.length = 0;
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_wrong_query_usage",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date().toISOString(),
+      usageAtoms: [{
+        schemaVersion: 1,
+        atomId: "atom_claude_wrong_query_usage",
+        correlationId: "qry_claude_other_query",
+        queryId: "qry_claude_other_query",
+        sessionId,
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        inputTokens: 1,
+        outputTokens: 1,
+        startedAt: beforeCompletion,
+        endedAt: completedAt
+      }]
+    });
+    expect(projected).toEqual([]);
+
+    const afterCompletion = new Date(Date.parse(completedAt) + 1).toISOString();
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_postboundary_usage",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date().toISOString(),
+      usageAtoms: [{
+        schemaVersion: 1,
+        atomId: "atom_claude_postboundary_usage",
+        correlationId: queryId,
+        queryId,
+        sessionId,
+        provider: "claude-code",
+        runtime: "claude-code",
+        authority: "request",
+        inputTokens: 1,
+        outputTokens: 1,
+        startedAt: afterCompletion,
+        endedAt: afterCompletion
+      }]
+    });
+    expect(projected).toEqual([]);
+  });
+
+  it("does not immediately project a Claude Stop-only terminal occurrence", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_full_owner",
+      usageProjectionQuietMs: 60_000
+    });
+    agents.push(agent);
+    await agent.start();
+    const runtime = agent as unknown as {
+      scheduleTerminalUsageProjection: (observation: SafeObservationV1) => void;
+      enqueueTerminalUsageProjection: (queryId: string) => void;
+    };
+    const projected: string[] = [];
+    runtime.enqueueTerminalUsageProjection = (queryId) => projected.push(queryId);
+    const at = new Date().toISOString();
+
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_stop_only_no_immediate_projection",
+      sourceId: "hook_claude_code_lifecycle",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: at,
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId: "qry_claude_stop_only_no_immediate_projection",
+        sessionId: "ses_claude_stop_only_no_immediate_projection",
+        provider: "claude-code",
+        runtime: "claude-code",
+        startedAt: at,
+        completedAt: at,
+        completionEvidence: "stop_hook",
+        promptState: "disabled",
+        evidence: "submission_hook"
+      }],
+      usageAtoms: []
+    });
+
+    expect(projected).toEqual([]);
+  });
+
+  it("keeps a Claude Stop-only occurrence off the terminal webhook admission lane", async () => {
+    const originalAdmitWebhook = ExternalWebhookDispatchService.prototype.admitSafeObservation;
+    const ordinary: string[] = [];
+    let terminalDrainCalls = 0;
+    ExternalWebhookDispatchService.prototype.admitSafeObservation = async function (observation) {
+      ordinary.push(observation.observationId);
+    };
+    try {
+      const agent = new AgentRuntime({
+        paths: testPaths(),
+        otlpPort: false,
+        initialOwnershipState: "agent_full_owner",
+        usageProjectionQuietMs: 60_000
+      });
+      agents.push(agent);
+      await agent.start();
+      const runtime = agent as unknown as {
+        drainTerminalLiveWebhookProjection: () => Promise<void>;
+      };
+      const originalTerminalDrain = runtime.drainTerminalLiveWebhookProjection.bind(runtime);
+      runtime.drainTerminalLiveWebhookProjection = async () => {
+        terminalDrainCalls += 1;
+        await originalTerminalDrain();
+      };
+      const schedule = (agent as unknown as {
+        scheduleLiveIngestProcessing: (observation: SafeObservationV1) => void;
+      }).scheduleLiveIngestProcessing.bind(agent);
+      const at = new Date().toISOString();
+      schedule({
+        schemaVersion: 1,
+        observationId: "obs_claude_stop_only_normal_lane",
+        sourceId: "hook_claude_code_lifecycle",
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "logs",
+        profileVersion: "terminal-live-lane-test-v1",
+        resourceCount: 1,
+        recordCount: 1,
+        observedAt: at,
+        queryOccurrences: [{
+          schemaVersion: 1,
+          queryId: "qry_claude_stop_only_normal_lane",
+          sessionId: "ses_claude_stop_only_normal_lane",
+          provider: "claude-code",
+          runtime: "claude-code",
+          startedAt: at,
+          completedAt: at,
+          completionEvidence: "stop_hook",
+          promptState: "disabled",
+          evidence: "submission_hook"
+        }],
+        usageAtoms: []
+      });
+
+      await waitUntil(() => ordinary.includes("obs_claude_stop_only_normal_lane"));
+      expect(terminalDrainCalls).toBe(0);
+    } finally {
+      ExternalWebhookDispatchService.prototype.admitSafeObservation = originalAdmitWebhook;
+    }
+  });
+
+  it("does not immediately project an unjoined Claude root span", async () => {
+    const agent = new AgentRuntime({
+      paths: testPaths(),
+      otlpPort: false,
+      initialOwnershipState: "agent_full_owner",
+      usageProjectionQuietMs: 60_000
+    });
+    agents.push(agent);
+    await agent.start();
+    const runtime = agent as unknown as {
+      scheduleTerminalUsageProjection: (observation: SafeObservationV1) => void;
+      enqueueTerminalUsageProjection: (queryId: string) => void;
+    };
+    const projected: string[] = [];
+    runtime.enqueueTerminalUsageProjection = (queryId) => projected.push(queryId);
+    const at = new Date().toISOString();
+
+    runtime.scheduleTerminalUsageProjection({
+      schemaVersion: 1,
+      observationId: "obs_claude_unjoined_root_no_immediate_projection",
+      sourceId: "otlp_claude_code_traces",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "traces",
+      profileVersion: "terminal-query-projection-test-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: at,
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId: "qry_claude_unjoined_root_no_immediate_projection",
+        sessionId: "ses_claude_unjoined_root_no_immediate_projection",
+        provider: "claude-code",
+        runtime: "claude-code",
+        startedAt: at,
+        completedAt: at,
+        completionEvidence: "closed_root_span",
+        promptState: "disabled",
+        evidence: "provider_root_span"
+      }],
+      usageAtoms: []
+    });
+
+    expect(projected).toEqual([]);
   });
 
   it("projects a fresh completed-run correction independently of in-flight historical replay", async () => {
@@ -983,13 +1767,13 @@ describe("agent runtime control and client gateway", () => {
 
   it("keeps empty accepted telemetry off live projection and repository observation lanes", async () => {
     const originalObserveWorkspace = AgentVerifiedAttributionService.prototype.observeSafeObservation;
-    const originalObserveWebhook = ExternalWebhookDispatchService.prototype.observeSafeObservation;
+    const originalAdmitWebhook = ExternalWebhookDispatchService.prototype.admitSafeObservation;
     let workspaceCalls = 0;
     let webhookCalls = 0;
     AgentVerifiedAttributionService.prototype.observeSafeObservation = async function () {
       workspaceCalls += 1;
     };
-    ExternalWebhookDispatchService.prototype.observeSafeObservation = async function () {
+    ExternalWebhookDispatchService.prototype.admitSafeObservation = async function () {
       webhookCalls += 1;
     };
     try {
@@ -1022,7 +1806,7 @@ describe("agent runtime control and client gateway", () => {
       expect(workspaceCalls).toBe(0);
     } finally {
       AgentVerifiedAttributionService.prototype.observeSafeObservation = originalObserveWorkspace;
-      ExternalWebhookDispatchService.prototype.observeSafeObservation = originalObserveWebhook;
+      ExternalWebhookDispatchService.prototype.admitSafeObservation = originalAdmitWebhook;
     }
   });
 
@@ -1670,7 +2454,15 @@ describe("agent runtime control and client gateway", () => {
   });
 
   it("returns bounded typed diagnostic logs without reading the raw log file", async () => {
-    const agent = await startAgent();
+    const paths = testPaths();
+    const agent = new AgentRuntime({
+      paths,
+      otlpPort: 0,
+      initialOwnershipState: "agent_shadow",
+      now: () => new Date("2026-06-08T00:00:01.000Z")
+    });
+    agents.push(agent);
+    await agent.start();
     const result = await call(agent.socketPath(), "GET", "/v1/logs?limit=1", undefined, agent.bootstrapCredential());
     expect(result).toMatchObject({
       status: 200,
@@ -1680,6 +2472,57 @@ describe("agent runtime control and client gateway", () => {
       }
     });
     expect(JSON.stringify(result.body)).not.toContain(agent.socketPath());
+
+    const bounded = encodeURIComponent("2026-06-08T00:00:01.000Z");
+    expect(await call(
+      agent.socketPath(),
+      "GET",
+      `/v1/logs?limit=1000&since=${bounded}&until=${bounded}`,
+      undefined,
+      agent.bootstrapCredential()
+    )).toMatchObject({
+      status: 200,
+      body: {
+        events: expect.arrayContaining([
+          expect.objectContaining({ code: "runtime_started", at: "2026-06-08T00:00:01.000Z" })
+        ])
+      }
+    });
+    expect(await call(
+      agent.socketPath(),
+      "GET",
+      "/v1/logs?since=2026-06-08T00%3A00%3A01",
+      undefined,
+      agent.bootstrapCredential()
+    )).toMatchObject({ status: 400, body: { error: "invalid_request" } });
+    expect(await call(
+      agent.socketPath(),
+      "GET",
+      "/v1/logs?since=2026-06-08T00%3A00%3A02Z&until=2026-06-08T00%3A00%3A01Z",
+      undefined,
+      agent.bootstrapCredential()
+    )).toMatchObject({ status: 400, body: { error: "invalid_request" } });
+    expect(await call(
+      agent.socketPath(),
+      "GET",
+      "/v1/logs?limit=1001",
+      undefined,
+      agent.bootstrapCredential()
+    )).toMatchObject({ status: 400, body: { error: "invalid_request" } });
+    expect(await call(
+      agent.socketPath(),
+      "GET",
+      "/v1/logs?limit=0",
+      undefined,
+      agent.bootstrapCredential()
+    )).toMatchObject({ status: 400, body: { error: "invalid_request" } });
+    expect(await call(
+      agent.socketPath(),
+      "GET",
+      "/v1/logs?offset=1",
+      undefined,
+      agent.bootstrapCredential()
+    )).toMatchObject({ status: 400, body: { error: "invalid_request" } });
   });
 
   it("streams bounded client-safe live events over the control socket", async () => {
@@ -1814,16 +2657,32 @@ describe("agent runtime control and client gateway", () => {
   });
 
   it("prefers Claude traces over overlapping logs while keeping provider-reported cost with prompt text disabled", async () => {
-    let now = new Date("2026-06-08T00:05:00.000Z");
+    let now = new Date("2026-06-08T00:00:00.000Z");
+    const paths = testPaths();
+    const claude = claudeTestConfiguration(paths, {
+      sessionId: "claude-session",
+      promptId: "claude-prompt",
+      timestamp: now.toISOString(),
+      content: "Keep Claude reasoning tied to this run"
+    });
     const agent = new AgentRuntime({
-      paths: testPaths(),
+      paths,
       otlpPort: 0,
       initialOwnershipState: "agent_full_owner",
       otlpAuthToken: false,
-      now: () => now
+      now: () => now,
+      sourceConfigurationPaths: claude.sourceConfigurationPaths
     });
     agents.push(agent);
     await agent.start();
+    expect((await callOtlp(agent.otlpAddress()!.port, "/v1/provider-hooks/claude-code", {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "claude-session",
+      prompt_id: "claude-prompt",
+      transcript_path: claude.transcript,
+      prompt: "Keep Claude reasoning tied to this run"
+    })).status).toBe(200);
+    now = new Date("2026-06-08T00:05:00.000Z");
     const log = (attributes: { key: string; value: Record<string, unknown> }[]) => ({
       resourceLogs: [{
         resource: { attributes: [{ key: "service.name", value: { stringValue: "claude-code" } }] },
@@ -1930,14 +2789,17 @@ describe("agent runtime control and client gateway", () => {
   });
 
   it("keeps in-flight spans out of production totals and attribution until completion", async () => {
+    let now = new Date("2026-06-08T00:00:00.000Z");
     const agent = new AgentRuntime({
       paths: testPaths(),
       otlpPort: 0,
       initialOwnershipState: "agent_full_owner",
-      otlpAuthToken: false
+      otlpAuthToken: false,
+      now: () => now
     });
     agents.push(agent);
     await agent.start();
+    now = new Date("2026-06-08T00:05:00.000Z");
     const span = {
       resourceSpans: [{
         resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
@@ -1975,14 +2837,17 @@ describe("agent runtime control and client gateway", () => {
   });
 
   it("keeps Codex run identity across exporter batches and sums distinct response slices", async () => {
+    let now = new Date("2026-06-08T00:00:00.000Z");
     const agent = new AgentRuntime({
       paths: testPaths(),
       otlpPort: 0,
       initialOwnershipState: "agent_full_owner",
-      otlpAuthToken: false
+      otlpAuthToken: false,
+      now: () => now
     });
     agents.push(agent);
     await agent.start();
+    now = new Date("2026-06-08T00:05:00.000Z");
     const log = (attributes: { key: string; value: Record<string, unknown> }[]) => ({
       resourceLogs: [{
         resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
@@ -2036,14 +2901,17 @@ describe("agent runtime control and client gateway", () => {
   });
 
   it("prefers Codex traces over fallback logs while preserving reasoning tokens with prompt text disabled", async () => {
+    let now = new Date("2026-06-08T00:00:00.000Z");
     const agent = new AgentRuntime({
       paths: testPaths(),
       otlpPort: 0,
       initialOwnershipState: "agent_full_owner",
-      otlpAuthToken: false
+      otlpAuthToken: false,
+      now: () => now
     });
     agents.push(agent);
     await agent.start();
+    now = new Date("2026-06-08T00:05:00.000Z");
     const log = (attributes: { key: string; value: Record<string, unknown> }[]) => ({
       resourceLogs: [{
         resource: { attributes: [{ key: "service.name", value: { stringValue: "codex" } }] },
@@ -2108,14 +2976,32 @@ describe("agent runtime control and client gateway", () => {
   });
 
   it("ingests Claude provider hook tool output into the execution tree alongside OTLP run identity", async () => {
+    let now = new Date("2026-06-08T00:00:00.000Z");
+    const paths = testPaths();
+    const claude = claudeTestConfiguration(paths, {
+      sessionId: "claude-hook-session",
+      promptId: "claude-hook-prompt",
+      timestamp: now.toISOString(),
+      content: "Inspect the README with Claude hooks"
+    });
     const agent = new AgentRuntime({
-      paths: testPaths(),
+      paths,
       otlpPort: 0,
       initialOwnershipState: "agent_usage_owner",
-      otlpAuthToken: false
+      otlpAuthToken: false,
+      now: () => now,
+      sourceConfigurationPaths: claude.sourceConfigurationPaths
     });
     agents.push(agent);
     await agent.start();
+    expect((await callOtlp(agent.otlpAddress()!.port, "/v1/provider-hooks/claude-code", {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "claude-hook-session",
+      prompt_id: "claude-hook-prompt",
+      transcript_path: claude.transcript,
+      prompt: "Inspect the README with Claude hooks"
+    })).status).toBe(200);
+    now = new Date("2026-06-08T00:05:00.000Z");
 
     expect((await callOtlp(agent.otlpAddress()!.port, "/v1/logs", {
       resourceLogs: [{
@@ -2171,9 +3057,33 @@ describe("agent runtime control and client gateway", () => {
       }]
     }, "claude-hook-trace")).status).toBe(200);
 
+    expect((await callOtlp(agent.otlpAddress()!.port, "/v1/provider-hooks/claude-code", {
+      hook_event_name: "Stop",
+      session_id: "claude-hook-session",
+      prompt_id: "claude-hook-prompt",
+      background_tasks: [],
+      session_crons: []
+    }, "claude-hook-stop")).status).toBe(200);
+    expect((await callOtlp(agent.otlpAddress()!.port, "/v1/traces", {
+      resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "claude-code" } }] },
+        scopeSpans: [{ spans: [{
+          traceId: "claude-hook-root-trace",
+          spanId: "claude-hook-root-span",
+          name: "claude_code.interaction",
+          startTimeUnixNano: "1780876800000000000",
+          endTimeUnixNano: "1780877101000000000",
+          attributes: [
+            { key: "prompt.id", value: { stringValue: "claude-hook-prompt" } },
+            { key: "session.id", value: { stringValue: "claude-hook-session" } }
+          ]
+        }] }]
+      }]
+    }, "claude-hook-root-close")).status).toBe(200);
+
     await waitUntil(async () => {
       const execution = await call(agent.socketPath(), "GET", "/v1/execution/runs", undefined, agent.bootstrapCredential());
-      return Array.isArray(execution.body.runs) && execution.body.runs.length === 1;
+      return Array.isArray(execution.body.runs) && execution.body.runs.length > 0;
     });
 
     const execution = await call(agent.socketPath(), "GET", "/v1/execution/runs", undefined, agent.bootstrapCredential());
@@ -2526,6 +3436,71 @@ describe("agent runtime control and client gateway", () => {
     ]));
   });
 
+  it("derives the trusted Claude transcript root from the configured Claude settings path", async () => {
+    const paths = testPaths();
+    const sourceRoot = mkdtempSync(join(tmpdir(), "tirion-agent-custom-claude-config-"));
+    roots.push(sourceRoot);
+    const claudeConfigRoot = join(sourceRoot, "custom-claude-home");
+    const transcript = join(claudeConfigRoot, "projects", "private-project", "session.jsonl");
+    mkdirSync(join(claudeConfigRoot, "projects", "private-project"), { recursive: true });
+    writeFileSync(transcript, `${JSON.stringify({
+      type: "user",
+      sessionId: "custom-claude-session",
+      uuid: "custom-claude-prompt",
+      timestamp: "2026-07-12T23:00:00.000Z",
+      origin: { kind: "human" },
+      promptSource: "typed",
+      message: { role: "user", content: "PRIVATE_CUSTOM_CLAUDE_PROMPT_CANARY" }
+    })}\n`);
+    const agent = new AgentRuntime({
+      paths,
+      otlpPort: 0,
+      initialOwnershipState: "agent_shadow",
+      otlpAuthToken: false,
+      now: () => new Date("2026-07-12T23:00:00.000Z"),
+      sourceConfigurationPaths: {
+        claudeSettingsPath: join(claudeConfigRoot, "settings.json"),
+        codexConfigPath: join(sourceRoot, "codex", "config.toml"),
+        restoreStatePath: join(paths.stateDir, "source-configuration-restore.json"),
+        codexHookRelayPath: join(paths.stateDir, "codex-hook-relay.cjs"),
+        cursorHooksPath: join(sourceRoot, "cursor", "hooks.json"),
+        cursorHookRelayPath: join(paths.stateDir, "cursor-hook-relay.cjs")
+      }
+    });
+    agents.push(agent);
+    await agent.start();
+
+    expect((await callOtlp(agent.otlpAddress()!.port, "/v1/provider-hooks/claude-code", {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "custom-claude-session",
+      prompt_id: "custom-claude-prompt",
+      transcript_path: transcript,
+      prompt: "PRIVATE_CUSTOM_CLAUDE_PROMPT_CANARY"
+    })).status).toBe(200);
+
+    const diagnostics = await call(
+      agent.socketPath(),
+      "GET",
+      "/v1/diagnostics",
+      undefined,
+      agent.bootstrapCredential()
+    );
+    expect(diagnostics.body.constructStates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        construct: "TelemetryIngress",
+        state: "observing",
+        details: expect.objectContaining({
+          acceptedReceiptCount: 1,
+          lastAcceptedProvider: "claude-code",
+          lastAcceptedSourceId: "hook_claude_code_lifecycle"
+        })
+      })
+    ]));
+    expect(JSON.stringify(diagnostics.body)).not.toContain("PRIVATE_CUSTOM_CLAUDE_PROMPT_CANARY");
+    expect(JSON.stringify(diagnostics.body)).not.toContain("PRIVATE_RAW_CUSTOM_CLAUDE_PROMPT_CANARY");
+    expect(JSON.stringify(diagnostics.body)).not.toContain(claudeConfigRoot);
+  });
+
   it("fails closed for oversized, unknown, and disabled OTLP inputs", async () => {
     const agent = new AgentRuntime({
       paths: testPaths(),
@@ -2692,6 +3667,46 @@ function testPaths(): AgentPaths {
     attributionHmacKeyPath: join(root, "attribution-hmac.key"),
     logPath: join(root, "agent.log.jsonl"),
     socketPath: join(root, "agent.sock")
+  };
+}
+
+function claudeTestConfiguration(
+  paths: AgentPaths,
+  input: { sessionId: string; promptId: string; timestamp: string; content: string }
+): {
+  transcript: string;
+  sourceConfigurationPaths: {
+    claudeSettingsPath: string;
+    codexConfigPath: string;
+    restoreStatePath: string;
+    codexHookRelayPath: string;
+    cursorHooksPath: string;
+    cursorHookRelayPath: string;
+  };
+} {
+  const root = join(paths.stateDir, "test-source-config");
+  const claudeConfigRoot = join(root, "claude");
+  const transcript = join(claudeConfigRoot, "projects", "private-project", "session.jsonl");
+  mkdirSync(join(claudeConfigRoot, "projects", "private-project"), { recursive: true });
+  writeFileSync(transcript, `${JSON.stringify({
+    type: "user",
+    sessionId: input.sessionId,
+    uuid: input.promptId,
+    timestamp: input.timestamp,
+    origin: { kind: "human" },
+    promptSource: "typed",
+    message: { role: "user", content: input.content }
+  })}\n`);
+  return {
+    transcript,
+    sourceConfigurationPaths: {
+      claudeSettingsPath: join(claudeConfigRoot, "settings.json"),
+      codexConfigPath: join(root, "codex", "config.toml"),
+      restoreStatePath: join(paths.stateDir, "source-configuration-restore.json"),
+      codexHookRelayPath: join(paths.stateDir, "codex-hook-relay.cjs"),
+      cursorHooksPath: join(root, "cursor", "hooks.json"),
+      cursorHookRelayPath: join(paths.stateDir, "cursor-hook-relay.cjs")
+    }
   };
 }
 

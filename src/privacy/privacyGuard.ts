@@ -1,12 +1,9 @@
 import * as path from "node:path";
 import {
   AgenticQueryRun,
-  AgenticWorkEpisode,
   CanonicalOtelRecord,
-  CommitAttributionSummary,
   PrivacyGuard,
-  PrivacyValidationResult,
-  QueryCostAttribution
+  PrivacyValidationResult
 } from "../types";
 
 export const INITIAL_USER_QUERY_ATTRIBUTE = "tirion.initial_user_query";
@@ -41,6 +38,14 @@ const ATTRIBUTION_FORBIDDEN_KEY_PATTERNS = [
   /code_snippet/i
 ];
 
+// Causal-write pairs are retained in workspace evidence so a later terminal
+// correction can prove an individual artifact came from an exact successful
+// semantic-write node. They are identifiers, never telemetry payloads or
+// workspace locators.
+const MAX_CAUSAL_WRITE_ARTIFACTS = 100;
+const MAX_OPAQUE_CAUSAL_WRITE_IDENTIFIER_LENGTH = 200;
+const OPAQUE_CAUSAL_WRITE_IDENTIFIER = /^[A-Za-z0-9_-]+$/;
+
 const PUBLICATION_INTENT_KEYS = new Set([
   "schemaVersion",
   "owner",
@@ -71,6 +76,7 @@ const RUN_ENDED_WEBHOOK_KEYS = new Set([
   "evidence",
   "coverage",
   "version",
+  "outcome",
   "endedAt",
   "inputTokens",
   "outputTokens",
@@ -178,8 +184,11 @@ export class DefaultPrivacyGuard implements PrivacyGuard {
     };
   }
 
-  validateAttribution(record: QueryCostAttribution | CommitAttributionSummary | AgenticWorkEpisode): PrivacyValidationResult {
-    const violations = collectAttributionKeyViolations(record);
+  validateAttribution(record: unknown): PrivacyValidationResult {
+    const violations = [
+      ...collectAttributionKeyViolations(record),
+      ...collectCausalWriteArtifactViolations(record)
+    ];
 
     return {
       ok: violations.length === 0,
@@ -392,6 +401,147 @@ function collectAttributionKeyViolations(value: unknown, path = ""): string[] {
   return violations;
 }
 
+function collectCausalWriteArtifactViolations(value: unknown, path = ""): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => collectCausalWriteArtifactViolations(item, `${path}[${index}]`));
+  }
+
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  const violations: string[] = [];
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = path ? `${path}.${key}` : key;
+    if (key === "causalWriteArtifacts" || key === "nativeRejectedCausalWriteArtifacts") {
+      violations.push(...validateCausalWriteArtifacts(child, childPath));
+      continue;
+    }
+    if (key === "matchedCausalWriteArtifacts") {
+      violations.push(...validateMatchedCausalWriteArtifacts(child, childPath));
+      continue;
+    }
+    violations.push(...collectCausalWriteArtifactViolations(child, childPath));
+  }
+  return violations;
+}
+
+function validateCausalWriteArtifacts(value: unknown, path: string): string[] {
+  // Normalizers preserve optional record shape with an explicit `undefined`;
+  // treat that exactly like the absent legacy field rather than rejecting an
+  // otherwise privacy-safe record.
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return [path];
+  }
+  if (value.length > MAX_CAUSAL_WRITE_ARTIFACTS) {
+    return [`${path}.length`];
+  }
+
+  const violations: string[] = [];
+  const pairs = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    const itemPath = `${path}[${index}]`;
+    if (!isRecord(item)) {
+      violations.push(itemPath);
+      continue;
+    }
+    const keys = Object.keys(item);
+    if (
+      keys.length !== 2
+      || !keys.includes("artifactKey")
+      || !keys.includes("executionNodeId")
+    ) {
+      violations.push(itemPath);
+      continue;
+    }
+    const artifactKey = item.artifactKey;
+    const executionNodeId = item.executionNodeId;
+    if (!isOpaqueCausalWriteIdentifier(artifactKey)) {
+      violations.push(`${itemPath}.artifactKey`);
+    }
+    if (!isOpaqueCausalWriteIdentifier(executionNodeId)) {
+      violations.push(`${itemPath}.executionNodeId`);
+    }
+    if (
+      isOpaqueCausalWriteIdentifier(artifactKey)
+      && isOpaqueCausalWriteIdentifier(executionNodeId)
+    ) {
+      const pair = `${artifactKey}:${executionNodeId}`;
+      if (pairs.has(pair)) {
+        violations.push(itemPath);
+      }
+      pairs.add(pair);
+    }
+  }
+  return violations;
+}
+
+function validateMatchedCausalWriteArtifacts(value: unknown, path: string): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return [path];
+  }
+  if (value.length > MAX_CAUSAL_WRITE_ARTIFACTS) {
+    return [`${path}.length`];
+  }
+
+  const violations: string[] = [];
+  const pairs = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    const itemPath = `${path}[${index}]`;
+    if (!isRecord(item)) {
+      violations.push(itemPath);
+      continue;
+    }
+    const keys = Object.keys(item);
+    if (
+      keys.length !== 3
+      || !keys.includes("queryId")
+      || !keys.includes("artifactKey")
+      || !keys.includes("executionNodeId")
+    ) {
+      violations.push(itemPath);
+      continue;
+    }
+    const queryId = item.queryId;
+    const artifactKey = item.artifactKey;
+    const executionNodeId = item.executionNodeId;
+    if (!isOpaqueCausalWriteIdentifier(queryId)) {
+      violations.push(`${itemPath}.queryId`);
+    }
+    if (!isOpaqueCausalWriteIdentifier(artifactKey)) {
+      violations.push(`${itemPath}.artifactKey`);
+    }
+    if (!isOpaqueCausalWriteIdentifier(executionNodeId)) {
+      violations.push(`${itemPath}.executionNodeId`);
+    }
+    if (
+      isOpaqueCausalWriteIdentifier(queryId)
+      && isOpaqueCausalWriteIdentifier(artifactKey)
+      && isOpaqueCausalWriteIdentifier(executionNodeId)
+    ) {
+      const pair = `${queryId}:${artifactKey}:${executionNodeId}`;
+      if (pairs.has(pair)) {
+        violations.push(itemPath);
+      }
+      pairs.add(pair);
+    }
+  }
+  return violations;
+}
+
+function isOpaqueCausalWriteIdentifier(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_OPAQUE_CAUSAL_WRITE_IDENTIFIER_LENGTH
+    && OPAQUE_CAUSAL_WRITE_IDENTIFIER.test(value);
+}
+
 function isAttributionForbiddenKey(key: string): boolean {
   return ATTRIBUTION_FORBIDDEN_KEY_PATTERNS.some((pattern) => pattern.test(key));
 }
@@ -506,6 +656,10 @@ function isStrictRunEndedWebhookEvent(value: unknown): boolean {
     && isWebhookEvidence(value.evidence)
     && isWebhookCoverage(value.coverage)
     && (value.version == null || isPositiveSafeInteger(value.version))
+    && (value.outcome == null
+      || value.outcome === "success"
+      || value.outcome === "failure"
+      || value.outcome === "unknown")
     && isTimestamp(value.endedAt)
     && value.endedAt >= value.startedAt
     && isNonNegativeSafeInteger(value.inputTokens)
@@ -527,7 +681,7 @@ function isStrictRunEndedWebhookEvent(value: unknown): boolean {
     && value.coverage.costCoverage === value.costCoverage
     // An explicit harness completion is safe to publish promptly with clearly
     // provisional usage. A later versioned terminal event still supplies final usage.
-    && isPermittedTerminalUsageCoverage(value.coverage.usageCoverage, value.evidence)
+    && isPermittedTerminalUsageCoverage(value.coverage.usageCoverage, value.evidence, value.outcome, value)
     && (value.context == null || isWebhookContextFootprint(value.context, webhookUsageCoverage(value.coverage)))
     && (value.activity == null || (
       isWebhookActivityArray(value.activity)
@@ -609,17 +763,57 @@ function isWebhookEvidenceBasis(value: unknown): boolean {
     || value === "inactivity";
 }
 
-function isPermittedTerminalUsageCoverage(usageCoverage: unknown, evidence: unknown): boolean {
+function isPermittedTerminalUsageCoverage(
+  usageCoverage: unknown,
+  evidence: unknown,
+  outcome: unknown,
+  terminal: unknown
+): boolean {
   if (usageCoverage === "final") {
     return true;
   }
-  return (usageCoverage === "none" || usageCoverage === "partial" || usageCoverage === "complete_so_far")
-    && isExplicitTerminalWebhookEvidence(evidence);
+  if (
+    (usageCoverage === "none" || usageCoverage === "partial" || usageCoverage === "complete_so_far")
+    && isExplicitTerminalWebhookEvidence(evidence)
+  ) {
+    return true;
+  }
+  return usageCoverage === "none"
+    && isRunCompletionOutcome(outcome)
+    && isDelayedOutcomeTerminalWebhookEvidence(evidence)
+    && isZeroUsageTerminal(terminal);
+}
+
+function isZeroUsageTerminal(value: unknown): boolean {
+  return isRecord(value)
+    && value.inputTokens === 0
+    && value.outputTokens === 0
+    && value.cacheReadInputTokens === 0
+    && value.cacheCreationInputTokens === 0
+    && value.reasoningOutputTokens === 0
+    && value.totalTokens === 0
+    && Array.isArray(value.llmModels)
+    && value.llmModels.length === 0;
+}
+
+function isRunCompletionOutcome(value: unknown): boolean {
+  return value === "success" || value === "failure" || value === "unknown";
 }
 
 function isExplicitTerminalWebhookEvidence(value: unknown): boolean {
   return isRecord(value)
     && value.delayed === false
+    && value.identityConfidence === "high"
+    && value.timingConfidence === "high"
+    && (value.basis === "stop_hook"
+      || value.basis === "session_hook"
+      || value.basis === "root_span"
+      || value.basis === "otel_event");
+}
+
+function isDelayedOutcomeTerminalWebhookEvidence(value: unknown): boolean {
+  return isRecord(value)
+    && value.delayed === true
     && value.identityConfidence === "high"
     && value.timingConfidence === "high"
     && (value.basis === "stop_hook"
@@ -698,6 +892,7 @@ function isWebhookActivity(value: unknown): boolean {
       "outcome",
       "count",
       "failureCount",
+      "rejectedCount",
       "unknownCount",
       "startedAt",
       "endedAt",
@@ -724,6 +919,11 @@ function isWebhookActivity(value: unknown): boolean {
       isNonNegativeSafeInteger(value.failureCount)
       && isPositiveSafeInteger(value.count)
       && value.failureCount <= value.count
+    ))
+    && (value.rejectedCount == null || (
+      isNonNegativeSafeInteger(value.rejectedCount)
+      && isPositiveSafeInteger(value.count)
+      && value.rejectedCount <= Number(value.failureCount ?? 0)
     ))
     && (value.unknownCount == null || (
       isNonNegativeSafeInteger(value.unknownCount)

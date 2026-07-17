@@ -4,7 +4,8 @@ import type {
   ProductionTotalsV1,
   ProductionUsageEpochV1,
   QueryOccurrenceV1,
-  SafeActivityAtomV1
+  SafeActivityAtomV1,
+  SafeUsageAtomV1
 } from "@tirion/agent-contract";
 import { AgentStorageClient } from "@tirion/agent-storage";
 import { DefaultProductionUsagePipeline } from "@tirion/engine";
@@ -38,10 +39,22 @@ export class ProductionUsageService {
     const epoch = await this.storage.productionUsageEpoch();
     const existingRuns = await this.storage.listProductionRuns();
     const projectionStartedAt = this.projectionStartedAt(epoch!.startedAt, existingRuns);
-    const projected = this.pipeline.project(
+    const allOccurrences = await this.storage.listQueryOccurrences();
+    const atoms = productionAtomsAfterEpoch(
       await this.storage.listSafeUsageAtomsSince(projectionStartedAt),
+      allOccurrences,
+      epoch!.startedAt
+    );
+    const occurrences = occurrencesForProjection(
+      allOccurrences,
+      atoms,
+      projectionStartedAt,
+      epoch!.startedAt
+    );
+    const projected = this.pipeline.project(
+      atoms,
       this.now(),
-      await this.storage.listQueryOccurrences(),
+      occurrences,
       await this.storage.listSafeActivityAtomsSince(projectionStartedAt)
     )
       .filter(isCompletedRun);
@@ -147,10 +160,16 @@ export class ProductionUsageService {
     await this.requireReady(owner);
     const epoch = await this.storage.productionUsageEpoch();
     const projectionStartedAt = this.projectionStartedAt(epoch!.startedAt, await this.storage.listProductionRuns());
-    const runs = this.pipeline.project(
+    const allOccurrences = await this.storage.listQueryOccurrences();
+    const atoms = productionAtomsAfterEpoch(
       await this.storage.listSafeUsageAtomsSince(projectionStartedAt),
+      allOccurrences,
+      epoch!.startedAt
+    );
+    const runs = this.pipeline.project(
+      atoms,
       this.now(),
-      await this.storage.listQueryOccurrences(),
+      occurrencesForProjection(allOccurrences, atoms, projectionStartedAt, epoch!.startedAt),
       await this.storage.listSafeActivityAtomsSince(projectionStartedAt)
     )
       .filter((run) => !isCompletedRun(run));
@@ -168,9 +187,16 @@ export class ProductionUsageService {
       return await this.storage.listProductionRuns();
     }
     const cutoff = now.getTime() - retentionDays * 24 * 60 * 60 * 1000;
+    const cutoffAt = new Date(cutoff).toISOString();
     const retained = (await this.storage.listProductionRuns())
       .filter((run) => Date.parse(run.endedAt ?? run.startedAt) >= cutoff);
-    await this.storage.replaceProductionRuns(retained);
+    const epoch = await this.storage.productionUsageEpoch();
+    const retainedEpochStartedAt = epoch && epoch.startedAt > cutoffAt
+      ? epoch.startedAt
+      : cutoffAt;
+    // Retention advances the production epoch so durable outcome-only
+    // occurrences below the cutoff cannot be reprojected on the next rebuild.
+    await this.storage.applyProductionRunRetention(retained, retainedEpochStartedAt);
     return retained;
   }
 
@@ -207,6 +233,41 @@ export class ProductionUsageService {
 
 function isCompletedRun(run: ProductionRunV1): boolean {
   return Boolean(run.endedAt && run.endedAt >= run.startedAt);
+}
+
+function occurrencesForProjection(
+  occurrences: QueryOccurrenceV1[],
+  atoms: SafeUsageAtomV1[],
+  projectionStartedAt: string,
+  epochStartedAt: string
+): QueryOccurrenceV1[] {
+  const atomQueryIds = new Set(atoms.map((atom) => atom.queryId ?? atom.correlationId));
+  return occurrences.filter((occurrence) =>
+    occurrence.startedAt >= projectionStartedAt
+    || atomQueryIds.has(occurrence.queryId)
+    || (
+      occurrence.startedAt >= epochStartedAt
+      && occurrence.lifecycleVisibility !== "internal"
+      && occurrence.completedAt != null
+      && occurrence.completedAt >= projectionStartedAt
+      && occurrence.completionEvidence != null
+      && occurrence.completionEvidence !== "inactivity"
+      && occurrence.completionOutcome != null
+    ));
+}
+
+function productionAtomsAfterEpoch(
+  atoms: SafeUsageAtomV1[],
+  occurrences: QueryOccurrenceV1[],
+  epochStartedAt: string
+): SafeUsageAtomV1[] {
+  const occurrenceByQuery = new Map(occurrences.map((occurrence) => [occurrence.queryId, occurrence]));
+  return atoms.filter((atom) => {
+    const queryId = atom.queryId ?? atom.correlationId;
+    const occurrence = occurrenceByQuery.get(queryId);
+    const terminalAt = occurrence?.completedAt ?? atom.endedAt ?? atom.startedAt;
+    return terminalAt >= epochStartedAt;
+  });
 }
 
 function queryOccurrenceFamily(

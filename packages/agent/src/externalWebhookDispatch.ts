@@ -3,12 +3,18 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { basename, isAbsolute } from "node:path";
+import {
+  hasExactNativePermissionRejectionForExecutionNode,
+  isNativePermissionRejectionExecutionNode,
+  sameExactSafeActivityIdentity
+} from "@tirion/agent-contract";
 import type {
   AgentWebhookConfigurationV1,
   AgentWebhookDeliveryItemV1,
   AgentWebhookStatusV1,
   CommitAttributedWebhookEventV1,
   CostEstimateBasis,
+  ExecutionNodeAtomV1,
   ProductionRunV1,
   QueryOccurrenceV1,
   RunBreakdownV1,
@@ -20,6 +26,7 @@ import type {
   SafeActivityAtomV1,
   SafeObservationV1,
   SafeUsageAtomV1,
+  ShadowRunV1,
   WebhookCoverageV1,
   WebhookEvidenceV1,
   WebhookBearerTokenConfigurationV1,
@@ -35,6 +42,7 @@ import type {
 import type { AgentStorageClient } from "@tirion/agent-storage";
 import {
   DefaultProductionUsagePipeline,
+  DefaultShadowUsagePipeline,
   isClosedAuthoritativeRunBoundaryAtom,
   preferredSafeActivities
 } from "@tirion/engine";
@@ -62,7 +70,26 @@ const TERMINAL_ACTIVITY_CORRECTION_COALESCE_MS = 250;
 // the runIds are fully populated from all contributing runs before the event fires.
 const COMMIT_ATTRIBUTED_GRACE_MS = 4_000;
 const LIVE_USAGE_CORROBORATION_MS = 250;
-const LIVE_UPDATE_USAGE_PIPELINE = new DefaultProductionUsagePipeline();
+const MAX_LIVE_AUXILIARY_SESSION_TITLE_REQUEST_IDS = 4_096;
+const LIVE_UPDATE_USAGE_PIPELINE = new DefaultShadowUsagePipeline();
+const RUN_UPDATE_SUPERSEDED_CODE = "run_update_superseded_by_high_water";
+const WORKSPACE_MUTATION_TOOL_NAMES = new Set([
+  "applypatch",
+  "createfile",
+  "deletefile",
+  "edit",
+  "fileedit",
+  "insertedit",
+  "movefile",
+  "multiedit",
+  "notebookedit",
+  "patch",
+  "renamefile",
+  "replaceinfile",
+  "strreplace",
+  "write",
+  "writefile"
+]);
 
 type StoredWebhookConfiguration = {
   schemaVersion: 1;
@@ -114,6 +141,35 @@ type RunLifecycleProjection = {
   updated: RunUpdatedWebhookEventV1;
   ended: RunEndedWebhookEventV1;
   allowFilesChangedAfterReadOnly: boolean;
+  /** Exact previously-published paths invalidated by native source evidence. */
+  sourcePrunedFilesChanged?: string[];
+  /** Exact generic activity rows superseded by a native decision. */
+  sourcePrunedActivityIds?: string[];
+};
+
+/**
+ * A persisted workspace-artifact claim is only publishable when the exact
+ * execution-node record that produced it is still present and independently
+ * verifies as a successful semantic write.  The artifact identity itself is
+ * deliberately opaque; this context exists solely to bind it to the source
+ * node and its query/repository scope.
+ */
+type CausalWriteArtifactProof = {
+  queryId: string;
+  repoKey: string;
+  artifactKey: string;
+  executionNodeId: string;
+};
+
+type VerifiedWriteArtifactProjection = {
+  /** Claims still supported by a readable, exact successful source node. */
+  artifactKeys: string[];
+  /** Claims whose exact source was contradicted by a native Claude decision. */
+  invalidatedArtifactKeys: string[];
+  /** True only when every supplied proof was natively invalidated. */
+  allProofsNativeRejected: boolean;
+  /** True when no supplied proof remains publishable (native or unreadable). */
+  allProofsInvalidated: boolean;
 };
 
 type LiveLifecycleSubject = {
@@ -131,18 +187,58 @@ type LiveRunSources = {
   usageAtoms: Map<string, SafeUsageAtomV1>;
   activityAtoms: Map<string, SafeActivityAtomV1>;
   executionNodes: Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>;
+  auxiliarySessionTitleRequestIds: Set<string>;
 };
 
 type LiveTerminalAnchor = {
   queryId: string;
   completedAt: string;
+  /**
+   * The earliest valid explicit completion retained for correction authority.
+   * A later duplicate/replayed terminal can refine public terminal meaning,
+   * but must never expand the source-time interval in which it may revoke a
+   * previously published file or commit proof.
+   */
+  correctionBoundaryAt: string;
   completionEvidence: NonNullable<QueryOccurrenceV1["completionEvidence"]>;
+  completionOutcome?: QueryOccurrenceV1["completionOutcome"];
   profileVersion: string;
 };
 
 type LiveTerminalProjection = {
   subject: LiveLifecycleSubject;
   anchor: LiveTerminalAnchor;
+};
+
+/**
+ * The small identity-critical portion of a live route. It is assembled while
+ * admission is serialized, then queued after release so outbox contention or
+ * delivery cannot block unrelated live observations.
+ */
+type LiveRepositoryBoundAdmission = {
+  observation: SafeObservationV1;
+  startedEvents: RunStartedWebhookEventV1[];
+  updatedEvents: RunUpdatedWebhookEventV1[];
+  terminalEvents: PlannedLiveTerminalEvent[];
+  reservedTerminalSubjectIds: Set<string>;
+};
+
+type PlannedLiveTerminalEvent = {
+  subjectRunId: string;
+  ticket: LiveTerminalAdmissionTicket;
+  terminal: {
+    event: RunEndedWebhookEventDraft;
+    allowFilesChangedAfterReadOnly: boolean;
+    sourcePrunedFilesChanged?: string[];
+    sourcePrunedActivityIds?: string[];
+  };
+};
+
+/** Preserves terminal-admission order without retaining the global live lock. */
+type LiveTerminalAdmissionTicket = {
+  previous: Promise<void>;
+  tail: Promise<void>;
+  release: () => void;
 };
 
 type LiveObservationRoute = {
@@ -172,6 +268,35 @@ type RunEndedWebhookEventDraft = Omit<RunEndedWebhookEventV1, "eventId" | "versi
 
 type QueueEventOptions = {
   allowFilesChangedAfterReadOnly?: boolean;
+  /**
+   * An explicit, source-scoped exception to terminal file monotonicity. These
+   * paths are derived only from an exact artifact whose native Claude decision
+   * later contradicted its successful semantic-write node.
+   */
+  sourcePrunedFilesChanged?: string[];
+  /** See RunLifecycleProjection.sourcePrunedActivityIds. */
+  sourcePrunedActivityIds?: string[];
+};
+
+type QueueRunEndedAdmissionResult = {
+  queued: boolean;
+  /** True only when terminal persistence bypassed an in-flight same-run update. */
+  bypassedInFlightUpdate: boolean;
+};
+
+type RunUpdateQueueReconciliation = {
+  event?: RunUpdatedWebhookEventV1;
+  superseded: WebhookOutboxEntry[];
+  blocked?: boolean;
+};
+
+type RunUpdateReconciliationOptions = {
+  /**
+   * A delivery claim that was already attempted (or explicitly blocked/retried)
+   * is a stale public snapshot. Preserve every delivered context high-water
+   * while folding any novel facts from that claim into its successor.
+   */
+  preservePublishedContextHighWater?: boolean;
 };
 
 type WebhookDispatchTimingOptions = {
@@ -200,9 +325,14 @@ export class ExternalWebhookDispatchService {
   private retryTimer?: NodeJS.Timeout;
   private retryTimerDueAt?: number;
   private running = false;
+  private stopping = false;
   private deliveryRunning = false;
+  private lifecycleBypassRunning = false;
   private deliveryRerunRequested = false;
   private deliveryRerunForce = false;
+  private readonly inFlightDeliveryKeys = new Set<string>();
+  private readonly inFlightLifecycleSubjects = new Set<string>();
+  private readonly backgroundOperations = new Set<Promise<void>>();
   private readonly liveRunStarts = new Map<string, string>();
   private readonly liveRunRepositories = new Map<string, WebhookRepositoryV1>();
   private readonly liveRunSources = new Map<string, LiveRunSources>();
@@ -214,14 +344,40 @@ export class ExternalWebhookDispatchService {
   private durableRepositoryHintsLoaded = false;
   private durableRepositoryHintsLoading?: Promise<void>;
   private readonly liveTerminalAnchors = new Map<string, LiveTerminalAnchor>();
+  // Retained only through the bounded terminal-correction window. It lets a
+  // late native rejection remove exactly the file paths that its former
+  // artifact proof introduced, without touching independently proven paths.
+  private readonly liveTerminalArtifactPaths = new Map<string, Map<string, string[]>>();
+  // A live terminal is selected before its asynchronous projection reaches the
+  // durable outbox. Keep a tiny in-memory admission sentinel during that gap so
+  // a concurrent late parent link cannot reparent the subject after its
+  // terminal route has been chosen but before `run.ended` exists durably.
+  // Counts, rather than a boolean, make overlapping terminal corrections for
+  // the same subject safe to release independently.
+  private readonly pendingLiveTerminalSubjects = new Map<string, number>();
+  private readonly liveTerminalAdmissionTails = new Map<string, Promise<void>>();
+  // This lock covers only live admission/routing, identity mutation, and
+  // immutable lifecycle-draft selection. It deliberately excludes every
+  // outbox write and delivery so a slow webhook response for one run cannot
+  // hold later live admissions.
+  private liveObservationAdmissionTail?: Promise<void>;
   private readonly liveSubjectReleaseTimers = new Map<string, NodeJS.Timeout>();
   private readonly runEndedQueueTails = new Map<string, Promise<void>>();
+  // Running snapshots may bypass the broad lifecycle lock while a same-run
+  // update is on the wire. This short tail still serializes every update
+  // reconciliation/write, including callers that cross that bypass boundary.
+  private readonly runUpdateQueueTails = new Map<string, Promise<void>>();
+  // Terminal persistence needs a separate short critical section only while an
+  // update response holds the broader lifecycle lock. It still serializes every
+  // terminal revision with every other terminal revision for this subject.
+  private readonly runEndedTerminalQueueTails = new Map<string, Promise<void>>();
+  private readonly inFlightRunEndedSubjectDeliveryTypes = new Map<string, "run.update" | "run.ended">();
   private readonly runEndedGraceMs: number;
   private readonly requestTimeoutMs: number;
   private readonly terminalActivityCorrectionCoalesceMs: number;
 
   constructor(
-    storage: AgentStorageClient,
+    private readonly storage: AgentStorageClient,
     paths: WebhookConfigPaths,
     private readonly attribution: AgentVerifiedAttributionService,
     private readonly repositories: AgentRepositoryObservationService,
@@ -245,14 +401,18 @@ export class ExternalWebhookDispatchService {
     if (this.running) {
       return;
     }
+    this.stopping = false;
     this.running = true;
     this.scheduleRetry();
-    void this.resumePendingDeliveries().catch(() => undefined);
-    void this.reconcileCommitEvents().catch(() => undefined);
+    this.trackBackgroundOperation(this.resumePendingDeliveries());
+    this.trackBackgroundOperation(this.reconcileCommitEvents());
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     this.running = false;
+    this.deliveryRerunRequested = false;
+    this.deliveryRerunForce = false;
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = undefined;
@@ -262,7 +422,7 @@ export class ExternalWebhookDispatchService {
       clearTimeout(timer);
     }
     this.liveSubjectReleaseTimers.clear();
-    while (this.deliveryRunning) {
+    while (this.deliveryRunning || this.lifecycleBypassRunning) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   }
@@ -343,6 +503,36 @@ export class ExternalWebhookDispatchService {
     return await this.status();
   }
 
+  /**
+   * Force one bounded delivery pass for a caller that has already sealed its
+   * upstream producer.  Unlike stop(), this preserves the outbox and reports
+   * a non-empty queue as failure so a shutdown protocol cannot silently drop
+   * a lifecycle correction.
+   */
+  async drainForQuiesce(): Promise<boolean> {
+    if (!this.running || this.stopping) {
+      return false;
+    }
+    await Promise.allSettled([...this.backgroundOperations]);
+    await this.processDueEntries(true);
+    while (this.deliveryRunning || this.lifecycleBypassRunning) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    const status = await this.status();
+    return this.inFlightDeliveryKeys.size === 0
+      && this.inFlightLifecycleSubjects.size === 0
+      && this.inFlightRunEndedSubjectDeliveryTypes.size === 0
+      && status.queuedCount === 0
+      && status.blockedCount === 0;
+  }
+
+  private trackBackgroundOperation(operation: Promise<void>): void {
+    this.backgroundOperations.add(operation);
+    void operation
+      .catch(() => undefined)
+      .finally(() => this.backgroundOperations.delete(operation));
+  }
+
   async test(): Promise<{ schemaVersion: 1; eventId: string; queued: boolean }> {
     const at = new Date(this.now()).toISOString();
     const runId = `run_test_${randomUUID().replace(/-/g, "")}`;
@@ -413,30 +603,120 @@ export class ExternalWebhookDispatchService {
       await this.queueEvent(events.started, `run.start:${events.subjectRunId}`);
       await this.queueEvent(events.updated, `run.update:${events.subjectRunId}`);
       await this.queueRunEndedEvent(events.ended, `run.ended:${events.subjectRunId}`, {
-        allowFilesChangedAfterReadOnly: events.allowFilesChangedAfterReadOnly
+        allowFilesChangedAfterReadOnly: events.allowFilesChangedAfterReadOnly,
+        sourcePrunedFilesChanged: events.sourcePrunedFilesChanged,
+        sourcePrunedActivityIds: events.sourcePrunedActivityIds
       });
     }
     await this.processDueEntries();
   }
 
   async observeSafeObservation(observation: SafeObservationV1): Promise<void> {
-    const visibleObservation = await this.customerVisibleObservation(observation);
-    const routes = await this.routeLiveObservation(visibleObservation);
-    for (const route of routes) {
-      await this.observeRepositoryBoundSafeObservation(route.observation, route.repository);
+    await this.queueSafeObservation(observation, async () => {
+      await this.processDueEntries();
+    });
+  }
+
+  /**
+   * Durably admit privacy-safe live evidence and ask the delivery loop to run,
+   * without allowing an outbound response to hold the admission caller.
+   *
+   * Explicit terminal intake uses this path: its first delivery still observes
+   * the normal lifecycle ordering and deadline rules, but a slow unrelated
+   * webhook cannot leave a later accepted terminal only in runtime memory.
+   */
+  async admitSafeObservation(observation: SafeObservationV1): Promise<void> {
+    const queued = await this.queueSafeObservation(observation);
+    if (queued) {
+      void this.processDueEntries().catch(() => undefined);
     }
   }
 
-  private async observeRepositoryBoundSafeObservation(
+  private async queueSafeObservation(
+    observation: SafeObservationV1,
+    afterRouteQueued?: () => Promise<void>
+  ): Promise<boolean> {
+    const visibleObservation = await this.customerVisibleObservation(observation);
+    const admissions = await this.withLiveObservationAdmissionLock(async () => {
+      const routes = await this.routeLiveObservation(visibleObservation);
+      const planned: LiveRepositoryBoundAdmission[] = [];
+      try {
+        for (const route of routes) {
+          planned.push(await this.admitRepositoryBoundSafeObservation(
+            route.observation,
+            route.repository
+          ));
+        }
+        return planned;
+      } catch (error) {
+        for (const admission of planned) {
+          this.cancelLiveRepositoryBoundAdmission(admission);
+        }
+        throw error;
+      }
+    });
+    let queued = false;
+    for (let index = 0; index < admissions.length; index += 1) {
+      const admission = admissions[index];
+      try {
+        const routeQueued = await this.queueAdmittedRepositoryBoundSafeObservation(admission);
+        if (routeQueued && afterRouteQueued) {
+          // Admission is released before every outbox write; delivery remains
+          // entirely outside it.
+          await afterRouteQueued();
+        }
+        queued = routeQueued || queued;
+      } catch (error) {
+        for (const pendingAdmission of admissions.slice(index + 1)) {
+          this.cancelLiveRepositoryBoundAdmission(pendingAdmission);
+        }
+        throw error;
+      }
+    }
+    return queued;
+  }
+
+  private cancelLiveRepositoryBoundAdmission(admission: LiveRepositoryBoundAdmission): void {
+    for (const subjectRunId of admission.reservedTerminalSubjectIds) {
+      this.releasePendingLiveTerminalSubject(subjectRunId);
+    }
+    admission.reservedTerminalSubjectIds.clear();
+    for (const { ticket } of admission.terminalEvents) {
+      ticket.release();
+    }
+  }
+
+  private async withLiveObservationAdmissionLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.liveObservationAdmissionTail ?? Promise.resolve();
+    const queued = previous.then(operation);
+    const tail = queued.then(() => undefined, () => undefined);
+    this.liveObservationAdmissionTail = tail;
+    try {
+      return await queued;
+    } finally {
+      if (this.liveObservationAdmissionTail === tail) {
+        this.liveObservationAdmissionTail = undefined;
+      }
+    }
+  }
+
+  private async admitRepositoryBoundSafeObservation(
     observation: SafeObservationV1,
     repository: WebhookRepositoryV1
-  ): Promise<void> {
+  ): Promise<LiveRepositoryBoundAdmission> {
     this.rememberObservationRepositoryHints(observation, repository.repoKey);
     const sender = this.webhookSender();
-    let queued = false;
     await this.rememberLiveOccurrences(observation, repository);
-    const startedEvents = projectLiveRunStartedEvents(observation, repository, sender);
-    for (const projection of startedEvents) {
+    const auxiliaryCorrectionSubjects = await this.rememberLiveAuxiliarySessionTitleRequests(
+      observation,
+      repository
+    );
+    observation = withoutAuxiliarySessionTitleLiveSources(
+      observation,
+      this.knownLiveAuxiliarySessionTitleRequestIds(observation)
+    );
+    const startedEvents: RunStartedWebhookEventV1[] = [];
+    for (const projection of projectLiveRunStartedEvents(observation, repository, sender)) {
       const subject = await this.liveSubjectForQuery(observation, projection.queryId, repository);
       if (!subject) {
         continue;
@@ -444,135 +724,276 @@ export class ExternalWebhookDispatchService {
       const event = canonicalizeLiveStartedEvent(projection.event, projection.queryId, subject);
       this.liveRunStarts.set(event.runId, event.startedAt);
       this.liveRunRepositories.set(event.runId, event.repository);
-      queued = (await this.queueEvent(event, `run.start:${event.runId}`)) || queued;
+      startedEvents.push(event);
     }
     const terminalSubjects = new Map<string, LiveTerminalProjection>();
-    for (const occurrence of (observation.queryOccurrences ?? []).filter(isExplicitLiveTerminalOccurrence)) {
-      const subject = await this.liveSubjectForQuery(observation, occurrence.queryId, repository);
-      if (
-        !subject
-        || runIdForQuery(occurrence.queryId) !== subject.subjectRunId
-        || await this.deliveredRunEndedForSubject(subject.subjectRunId)
-      ) {
-        continue;
+    const reservedTerminalSubjectIds = new Set<string>();
+    const plannedTerminalTickets: LiveTerminalAdmissionTicket[] = [];
+    // Reserve the subject synchronously while identity admission is held. A
+    // later parent-link admission will see this sentinel even though terminal
+    // projection and durable queueing happen after the lock is released.
+    const reserveTerminalSubject = (projection: LiveTerminalProjection): void => {
+      if (!terminalSubjects.has(projection.subject.subjectRunId)) {
+        this.reservePendingLiveTerminalSubject(projection.subject.subjectRunId);
+        reservedTerminalSubjectIds.add(projection.subject.subjectRunId);
       }
-      const anchor = this.rememberLiveTerminalAnchor(subject, occurrence, observation);
-      terminalSubjects.set(subject.subjectRunId, { subject, anchor });
-    }
-    const updateSubjects = new Map<string, LiveLifecycleSubject>();
-    for (const projection of projectLiveRunUpdatedEvents(observation, repository, sender)) {
-      const subject = await this.liveSubjectForQuery(observation, projection.queryId, repository);
-      if (!subject) {
-        this.recordQueueLifecycle(
-          projection.event,
-          `run.update:${projection.event.runId}`,
-          "blocked",
-          "run_update_waiting_for_start",
-          {
-            provider: observation.provider,
-            sourceId: observation.sourceId
+      terminalSubjects.set(projection.subject.subjectRunId, projection);
+    };
+    let admitted = false;
+    try {
+      for (const occurrence of (observation.queryOccurrences ?? []).filter(isExplicitLiveTerminalOccurrence)) {
+        const subject = await this.liveSubjectForQuery(observation, occurrence.queryId, repository);
+        if (!subject || runIdForQuery(occurrence.queryId) !== subject.subjectRunId) {
+          continue;
+        }
+        if (await this.deliveredRunEndedForSubject(subject.subjectRunId)) {
+          // A later-arriving earlier completion cannot rewrite the published
+          // terminal lifecycle, but it can only *narrow* the retained
+          // correction fence. Ignoring it would let the prior later boundary
+          // authorize a native-decision retraction that the provider's earlier
+          // completion already ruled out.
+          this.narrowLiveTerminalCorrectionBoundary(subject, occurrence);
+          continue;
+        }
+        const anchor = this.rememberLiveTerminalAnchor(subject, occurrence, observation);
+        reserveTerminalSubject({ subject, anchor });
+      }
+      const updateSubjects = new Map<string, LiveLifecycleSubject>();
+      for (const projection of projectLiveRunUpdatedEvents(observation, repository, sender)) {
+        const subject = await this.liveSubjectForQuery(observation, projection.queryId, repository);
+        if (!subject) {
+          this.recordQueueLifecycle(
+            projection.event,
+            `run.update:${projection.event.runId}`,
+            "blocked",
+            "run_update_waiting_for_start",
+            {
+              provider: observation.provider,
+              sourceId: observation.sourceId
+            }
+          );
+          continue;
+        }
+        const deliveredTerminal = await this.deliveredRunEndedForSubject(subject.subjectRunId);
+        const isAuthoritativeRootCorrection = deliveredTerminal
+          && observation.usageAtoms.some((atom) => {
+            const queryId = atom.queryId ?? atom.correlationId;
+            return queryId === projection.queryId
+              && runIdForQuery(queryId) === subject.subjectRunId
+              && isClosedAuthoritativeRunBoundaryAtom(atom);
+          });
+        const isNativePermissionCorrection = deliveredTerminal
+          && this.hasLateNativePermissionDecisionCorrection(observation, projection.queryId, subject);
+        if (deliveredTerminal && !isAuthoritativeRootCorrection && !isNativePermissionCorrection) {
+          this.recordQueueLifecycle(
+            canonicalizeLiveUpdatedEvent(projection.event, projection.queryId, subject),
+            `run.update:${subject.subjectRunId}`,
+            "suppressed",
+            "run_update_after_run_ended_suppressed"
+          );
+          continue;
+        }
+        this.accumulateLiveRunSources(subject, projection.queryId, observation);
+        if (deliveredTerminal) {
+          if (isNativePermissionCorrection) {
+            const terminalAnchor = this.liveTerminalAnchors.get(subject.subjectRunId);
+            if (terminalAnchor) {
+              reserveTerminalSubject({ subject, anchor: terminalAnchor });
+            }
           }
-        );
-        continue;
+          continue;
+        }
+        updateSubjects.set(subject.subjectRunId, subject);
+        const terminalAnchor = this.liveTerminalAnchors.get(subject.subjectRunId);
+        if (terminalAnchor) {
+          reserveTerminalSubject({ subject, anchor: terminalAnchor });
+        }
       }
-      const deliveredTerminal = await this.deliveredRunEndedForSubject(subject.subjectRunId);
-      const isAuthoritativeRootCorrection = deliveredTerminal
-        && observation.usageAtoms.some((atom) => {
-          const queryId = atom.queryId ?? atom.correlationId;
-          return queryId === projection.queryId
-            && runIdForQuery(queryId) === subject.subjectRunId
-            && isClosedAuthoritativeRunBoundaryAtom(atom);
+      for (const subject of auxiliaryCorrectionSubjects) {
+        const deliveredTerminal = await this.deliveredRunEndedForSubject(subject.subjectRunId);
+        if (!deliveredTerminal) {
+          updateSubjects.set(subject.subjectRunId, subject);
+        }
+        const terminalAnchor = this.liveTerminalAnchors.get(subject.subjectRunId);
+        if (terminalAnchor) {
+          reserveTerminalSubject({ subject, anchor: terminalAnchor });
+        }
+      }
+      for (const atom of observation.usageAtoms.filter(isClosedAuthoritativeRunBoundaryAtom)) {
+        const queryId = atom.queryId ?? atom.correlationId;
+        const subject = await this.liveSubjectForQuery(observation, queryId, repository);
+        if (
+          !subject
+          || runIdForQuery(queryId) !== subject.subjectRunId
+        ) {
+          continue;
+        }
+        const anchor = this.rememberLiveTerminalAnchor(subject, {
+          schemaVersion: 1,
+          queryId,
+          sessionId: subject.sessionId,
+          provider: observation.provider,
+          runtime: observation.runtime,
+          startedAt: subject.startedAt,
+          completedAt: atom.endedAt,
+          completionEvidence: "closed_root_span",
+          promptState: "disabled",
+          evidence: "provider_root_span"
+        }, observation);
+        reserveTerminalSubject({ subject, anchor });
+      }
+      // Snapshot live source maps and terminal artifact retention while the
+      // identity admission lock is still held. Queueing these immutable drafts
+      // happens after release, so outbox contention cannot block admission.
+      const updatedEvents = [...updateSubjects.values()]
+        .map((subject) => projectLiveSubjectRunUpdatedEvent(
+          this.accumulatedLiveObservation(
+            subject,
+            observation,
+            this.liveTerminalAnchors.get(subject.subjectRunId)?.correctionBoundaryAt
+          ),
+          repository,
+          sender,
+          subject
+        ))
+        .filter((event): event is RunUpdatedWebhookEventV1 => Boolean(event));
+      const terminalEvents: PlannedLiveTerminalEvent[] = [];
+      for (const { subject, anchor } of terminalSubjects.values()) {
+        const terminal = await this.projectLiveRunEndedEvent(subject, anchor, observation, sender);
+        if (!terminal) {
+          if (reservedTerminalSubjectIds.delete(subject.subjectRunId)) {
+            this.releasePendingLiveTerminalSubject(subject.subjectRunId);
+          }
+          continue;
+        }
+        const ticket = this.reserveLiveTerminalAdmission(subject.subjectRunId);
+        plannedTerminalTickets.push(ticket);
+        terminalEvents.push({
+          subjectRunId: subject.subjectRunId,
+          ticket,
+          terminal: {
+            event: { ...terminal.event },
+            allowFilesChangedAfterReadOnly: terminal.allowFilesChangedAfterReadOnly,
+            ...(terminal.sourcePrunedFilesChanged ? {
+              sourcePrunedFilesChanged: [...terminal.sourcePrunedFilesChanged]
+            } : {}),
+            ...(terminal.sourcePrunedActivityIds ? {
+              sourcePrunedActivityIds: [...terminal.sourcePrunedActivityIds]
+            } : {})
+          }
         });
-      if (deliveredTerminal && !isAuthoritativeRootCorrection) {
-        this.recordQueueLifecycle(
-          canonicalizeLiveUpdatedEvent(projection.event, projection.queryId, subject),
-          `run.update:${subject.subjectRunId}`,
-          "suppressed",
-          "run_update_after_run_ended_suppressed"
-        );
-        continue;
       }
-      this.accumulateLiveRunSources(subject, projection.queryId, observation);
-      if (deliveredTerminal) {
-        continue;
-      }
-      updateSubjects.set(subject.subjectRunId, subject);
-      const terminalAnchor = this.liveTerminalAnchors.get(subject.subjectRunId);
-      if (terminalAnchor) {
-        terminalSubjects.set(subject.subjectRunId, { subject, anchor: terminalAnchor });
+      admitted = true;
+      return {
+        observation,
+        startedEvents,
+        updatedEvents: updatedEvents.map((event) => ({ ...event })),
+        terminalEvents,
+        reservedTerminalSubjectIds
+      };
+    } finally {
+      if (!admitted) {
+        for (const subjectRunId of reservedTerminalSubjectIds) {
+          this.releasePendingLiveTerminalSubject(subjectRunId);
+        }
+        for (const ticket of plannedTerminalTickets) {
+          ticket.release();
+        }
       }
     }
-    for (const atom of observation.usageAtoms.filter(isClosedAuthoritativeRunBoundaryAtom)) {
-      const queryId = atom.queryId ?? atom.correlationId;
-      const subject = await this.liveSubjectForQuery(observation, queryId, repository);
-      if (
-        !subject
-        || runIdForQuery(queryId) !== subject.subjectRunId
-      ) {
-        continue;
+  }
+
+  private async queueAdmittedRepositoryBoundSafeObservation(
+    admission: LiveRepositoryBoundAdmission
+  ): Promise<boolean> {
+    const {
+      observation,
+      startedEvents,
+      updatedEvents,
+      terminalEvents,
+      reservedTerminalSubjectIds
+    } = admission;
+    let queued = false;
+    const terminalSupersededUpdateSubjects = new Set<string>();
+    try {
+      for (const event of startedEvents) {
+        queued = (await this.queueEvent(event, `run.start:${event.runId}`)) || queued;
       }
-      const anchor = this.rememberLiveTerminalAnchor(subject, {
-        schemaVersion: 1,
-        queryId,
-        sessionId: subject.sessionId,
-        provider: observation.provider,
-        runtime: observation.runtime,
-        startedAt: subject.startedAt,
-        completedAt: atom.endedAt,
-        completionEvidence: "closed_root_span",
-        promptState: "disabled",
-        evidence: "provider_root_span"
-      }, observation);
-      terminalSubjects.set(subject.subjectRunId, { subject, anchor });
-    }
-    for (const subject of updateSubjects.values()) {
-      const accumulatedObservation = this.accumulatedLiveObservation(subject, observation);
-      let event = projectLiveSubjectRunUpdatedEvent(accumulatedObservation, repository, sender, subject);
-      if (!event) {
-        continue;
-      }
-      const startedAt = await this.publicLiveStartedAt(event.runId);
-      if (!startedAt) {
-        this.recordQueueLifecycle(
-          event,
-          `run.update:${event.runId}`,
-          "blocked",
-          "run_update_waiting_for_start",
-          {
-            provider: observation.provider,
-            sourceId: observation.sourceId
+      // Terminal admission precedes same-subject updates so
+      // `queueRunEndedEvent` can use its narrow bypass when one is already in
+      // flight. Fresh updates remain queued below; delivery ordering preserves
+      // the normal start → update → terminal lifecycle.
+      for (const { subjectRunId, ticket, terminal } of terminalEvents) {
+        try {
+          await ticket.previous;
+          if (!await this.publicLiveStartedAt(subjectRunId)) {
+            this.recordQueueLifecycle(
+              terminal.event as RunEndedWebhookEventV1,
+              `run.ended:${subjectRunId}`,
+              "blocked",
+              "run_ended_waiting_for_start",
+              {
+                provider: observation.provider,
+                sourceId: observation.sourceId
+              }
+            );
+            continue;
           }
-        );
-        continue;
-      }
-      event.startedAt = startedAt;
-      event.eventId = liveRunUpdateEventId(event);
-      queued = (await this.queueEvent(event, `run.update:${event.runId}`)) || queued;
-    }
-    for (const { subject, anchor } of terminalSubjects.values()) {
-      const terminal = await this.projectLiveRunEndedEvent(subject, anchor, observation, sender);
-      if (!terminal) {
-        continue;
-      }
-      if (!await this.publicLiveStartedAt(subject.subjectRunId)) {
-        this.recordQueueLifecycle(
-          terminal.event as RunEndedWebhookEventV1,
-          `run.ended:${subject.subjectRunId}`,
-          "blocked",
-          "run_ended_waiting_for_start",
-          {
-            provider: observation.provider,
-            sourceId: observation.sourceId
+          const terminalAdmission = await this.queueRunEndedEventAdmission(terminal.event, `run.ended:${subjectRunId}`, {
+            allowFilesChangedAfterReadOnly: terminal.allowFilesChangedAfterReadOnly,
+            sourcePrunedFilesChanged: terminal.sourcePrunedFilesChanged,
+            sourcePrunedActivityIds: terminal.sourcePrunedActivityIds
+          });
+          queued = terminalAdmission.queued || queued;
+          if (terminalAdmission.bypassedInFlightUpdate) {
+            terminalSupersededUpdateSubjects.add(subjectRunId);
           }
-        );
-        continue;
+        } finally {
+          // A durable terminal row now owns the permanent reparent boundary.
+          // If queueing failed, release so a later observation can retry.
+          if (reservedTerminalSubjectIds.delete(subjectRunId)) {
+            this.releasePendingLiveTerminalSubject(subjectRunId);
+          }
+          ticket.release();
+        }
       }
-      queued = (await this.queueRunEndedEvent(terminal.event, `run.ended:${subject.subjectRunId}`, {
-        allowFilesChangedAfterReadOnly: terminal.allowFilesChangedAfterReadOnly
-      })) || queued;
-    }
-    if (queued) {
-      await this.processDueEntries();
+      for (const plannedEvent of updatedEvents) {
+        const event = { ...plannedEvent };
+        if (terminalSupersededUpdateSubjects.has(event.runId)) {
+          // This terminal used the narrow in-flight-update bypass and already
+          // subsumes the same-subject snapshot. Do not wait behind or later
+          // leak that redundant update.
+          this.recordQueueLifecycle(
+            event,
+            `run.update:${event.runId}`,
+            "suppressed",
+            "run_update_superseded_by_terminal_admission"
+          );
+          continue;
+        }
+        const startedAt = await this.publicLiveStartedAt(event.runId);
+        if (!startedAt) {
+          this.recordQueueLifecycle(
+            event,
+            `run.update:${event.runId}`,
+            "blocked",
+            "run_update_waiting_for_start",
+            {
+              provider: observation.provider,
+              sourceId: observation.sourceId
+            }
+          );
+          continue;
+        }
+        event.startedAt = startedAt;
+        event.eventId = liveRunUpdateEventId(event);
+        queued = (await this.queueEvent(event, `run.update:${event.runId}`)) || queued;
+      }
+      return queued;
+    } finally {
+      // Projection failures before an individual terminal attempt must not
+      // strand an in-memory sentinel indefinitely.
+      this.cancelLiveRepositoryBoundAdmission(admission);
     }
   }
 
@@ -599,10 +1020,25 @@ export class ExternalWebhookDispatchService {
       const linkedParentSubject = linkedParentSubjectId
         ? this.liveRunSubjects.get(linkedParentSubjectId)
         : undefined;
+      const existingTerminal = await this.runEndedForSubject(existingSubject.subjectRunId);
+      const parentTerminal = linkedParentSubject
+        ? await this.runEndedForSubject(linkedParentSubject.subjectRunId)
+        : undefined;
+      const childTerminalPending = this.hasPendingLiveTerminalSubject(existingSubject.subjectRunId);
+      const parentTerminalPending = linkedParentSubject
+        ? this.hasPendingLiveTerminalSubject(linkedParentSubject.subjectRunId)
+        : false;
       if (
         linkedParentSubject
         && linkedParentSubject.subjectRunId !== existingSubject.subjectRunId
-        && !(await this.deliveredRunEndedForSubject(linkedParentSubject.subjectRunId))
+        // A queued or delivered terminal has a bounded correction route tied
+        // to its original public subject. Do not reparent either side after a
+        // terminal exists: a late parent link must not strand that route or
+        // leave a queued child V1 without its correction state.
+        && !existingTerminal
+        && !parentTerminal
+        && !childTerminalPending
+        && !parentTerminalPending
       ) {
         return this.reparentLiveSubject(existingSubject, linkedParentSubject, observation, occurrence);
       }
@@ -634,6 +1070,53 @@ export class ExternalWebhookDispatchService {
       ? runIdForQuery(occurrence.queryId)
       : activeSubject.subjectRunId;
     return this.upsertLiveSubject(subjectRunId, observation, occurrence, repository);
+  }
+
+  private reservePendingLiveTerminalSubject(subjectRunId: string): void {
+    this.pendingLiveTerminalSubjects.set(
+      subjectRunId,
+      (this.pendingLiveTerminalSubjects.get(subjectRunId) ?? 0) + 1
+    );
+  }
+
+  private releasePendingLiveTerminalSubject(subjectRunId: string): void {
+    const count = this.pendingLiveTerminalSubjects.get(subjectRunId) ?? 0;
+    if (count <= 1) {
+      this.pendingLiveTerminalSubjects.delete(subjectRunId);
+      return;
+    }
+    this.pendingLiveTerminalSubjects.set(subjectRunId, count - 1);
+  }
+
+  private hasPendingLiveTerminalSubject(subjectRunId: string): boolean {
+    return (this.pendingLiveTerminalSubjects.get(subjectRunId) ?? 0) > 0;
+  }
+
+  private reserveLiveTerminalAdmission(subjectRunId: string): LiveTerminalAdmissionTicket {
+    const previous = this.liveTerminalAdmissionTails.get(subjectRunId) ?? Promise.resolve();
+    let released = false;
+    let releaseGate: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const tail = previous.then(() => gate);
+    this.liveTerminalAdmissionTails.set(subjectRunId, tail);
+    return {
+      previous,
+      tail,
+      release: () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        releaseGate();
+        void tail.then(() => {
+          if (this.liveTerminalAdmissionTails.get(subjectRunId) === tail) {
+            this.liveTerminalAdmissionTails.delete(subjectRunId);
+          }
+        });
+      }
+    };
   }
 
   private async liveSubjectForQuery(
@@ -734,7 +1217,8 @@ export class ExternalWebhookDispatchService {
       const mergedSources: LiveRunSources = parentSources ?? {
         usageAtoms: new Map<string, SafeUsageAtomV1>(),
         activityAtoms: new Map<string, SafeActivityAtomV1>(),
-        executionNodes: new Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>()
+        executionNodes: new Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>(),
+        auxiliarySessionTitleRequestIds: new Set<string>()
       };
       for (const [atomId, atom] of childSources?.usageAtoms ?? []) {
         mergedSources.usageAtoms.set(atomId, atom);
@@ -745,9 +1229,40 @@ export class ExternalWebhookDispatchService {
       for (const [nodeId, node] of childSources?.executionNodes ?? []) {
         mergedSources.executionNodes.set(nodeId, node);
       }
+      for (const requestId of childSources?.auxiliarySessionTitleRequestIds ?? []) {
+        addBoundedLiveAuxiliaryRequestId(mergedSources.auxiliarySessionTitleRequestIds, requestId);
+      }
+      for (const [atomId, atom] of mergedSources.usageAtoms) {
+        if (
+          atom.requestId != null
+          && mergedSources.auxiliarySessionTitleRequestIds.has(atom.requestId)
+        ) {
+          mergedSources.usageAtoms.delete(atomId);
+        }
+      }
+      for (const [nodeId, node] of mergedSources.executionNodes) {
+        if (
+          node.requestId != null
+          && mergedSources.auxiliarySessionTitleRequestIds.has(node.requestId)
+        ) {
+          mergedSources.executionNodes.delete(nodeId);
+        }
+      }
       this.liveRunSources.set(parent.subjectRunId, mergedSources);
     }
     this.liveRunSources.delete(child.subjectRunId);
+    const childArtifactPaths = this.liveTerminalArtifactPaths.get(child.subjectRunId);
+    if (childArtifactPaths) {
+      const parentArtifactPaths = this.liveTerminalArtifactPaths.get(parent.subjectRunId) ?? new Map<string, string[]>();
+      for (const [artifactKey, childPaths] of childArtifactPaths) {
+        parentArtifactPaths.set(artifactKey, safeRepoRelativePaths([
+          ...(parentArtifactPaths.get(artifactKey) ?? []),
+          ...childPaths
+        ]));
+      }
+      this.liveTerminalArtifactPaths.set(parent.subjectRunId, parentArtifactPaths);
+      this.liveTerminalArtifactPaths.delete(child.subjectRunId);
+    }
     this.liveRunSubjects.delete(child.subjectRunId);
     this.liveRunStarts.delete(child.subjectRunId);
     this.liveRunRepositories.delete(child.subjectRunId);
@@ -798,6 +1313,79 @@ export class ExternalWebhookDispatchService {
     return undefined;
   }
 
+  private async rememberLiveAuxiliarySessionTitleRequests(
+    observation: SafeObservationV1,
+    repository: WebhookRepositoryV1
+  ): Promise<LiveLifecycleSubject[]> {
+    const requestIdsByQuery = new Map<string, Set<string>>();
+    for (const atom of observation.usageAtoms) {
+      if (atom.usagePurpose !== "auxiliary_session_title" || atom.requestId == null) {
+        continue;
+      }
+      const queryId = atom.queryId ?? atom.correlationId;
+      const requestIds = requestIdsByQuery.get(queryId) ?? new Set<string>();
+      requestIds.add(atom.requestId);
+      requestIdsByQuery.set(queryId, requestIds);
+    }
+    for (const node of observation.executionNodes ?? []) {
+      if (node.usagePurpose !== "auxiliary_session_title" || node.requestId == null) {
+        continue;
+      }
+      const requestIds = requestIdsByQuery.get(node.queryId) ?? new Set<string>();
+      requestIds.add(node.requestId);
+      requestIdsByQuery.set(node.queryId, requestIds);
+    }
+
+    const affected = new Map<string, LiveLifecycleSubject>();
+    for (const [queryId, requestIds] of requestIdsByQuery) {
+      const subject = await this.liveSubjectForQuery(observation, queryId, repository);
+      if (!subject) {
+        continue;
+      }
+      const sources = this.liveRunSources.get(subject.subjectRunId) ?? {
+        usageAtoms: new Map<string, SafeUsageAtomV1>(),
+        activityAtoms: new Map<string, SafeActivityAtomV1>(),
+        executionNodes: new Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>(),
+        auxiliarySessionTitleRequestIds: new Set<string>()
+      };
+      let changed = false;
+      for (const requestId of requestIds) {
+        if (addBoundedLiveAuxiliaryRequestId(sources.auxiliarySessionTitleRequestIds, requestId)) {
+          changed = true;
+        }
+      }
+      for (const [atomId, atom] of sources.usageAtoms) {
+        if (atom.requestId != null && requestIds.has(atom.requestId)) {
+          sources.usageAtoms.delete(atomId);
+          changed = true;
+        }
+      }
+      for (const [nodeId, node] of sources.executionNodes) {
+        if (node.requestId != null && requestIds.has(node.requestId)) {
+          sources.executionNodes.delete(nodeId);
+          changed = true;
+        }
+      }
+      this.liveRunSources.set(subject.subjectRunId, sources);
+      if (changed) {
+        affected.set(subject.subjectRunId, subject);
+      }
+    }
+    return [...affected.values()];
+  }
+
+  private knownLiveAuxiliarySessionTitleRequestIds(observation: SafeObservationV1): Set<string> {
+    const requestIds = auxiliarySessionTitleRequestIdsForLiveSources(observation);
+    for (const queryId of observationQueryIds(observation)) {
+      const subjectRunId = this.liveQuerySubjects.get(queryId);
+      const sources = subjectRunId ? this.liveRunSources.get(subjectRunId) : undefined;
+      for (const requestId of sources?.auxiliarySessionTitleRequestIds ?? []) {
+        requestIds.add(requestId);
+      }
+    }
+    return requestIds;
+  }
+
   private accumulateLiveRunSources(
     subject: LiveLifecycleSubject,
     sourceQueryId: string,
@@ -806,19 +1394,21 @@ export class ExternalWebhookDispatchService {
     const sources = this.liveRunSources.get(subject.subjectRunId) ?? {
       usageAtoms: new Map<string, SafeUsageAtomV1>(),
       activityAtoms: new Map<string, SafeActivityAtomV1>(),
-      executionNodes: new Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>()
+      executionNodes: new Map<string, NonNullable<SafeObservationV1["executionNodes"]>[number]>(),
+      auxiliarySessionTitleRequestIds: new Set<string>()
     };
     for (const atom of observation.usageAtoms) {
       if (
         (atom.queryId ?? atom.correlationId) === sourceQueryId
         && liveSourceOverlapsSubject(atom, subject)
+        && (atom.requestId == null || !sources.auxiliarySessionTitleRequestIds.has(atom.requestId))
       ) {
         sources.usageAtoms.set(atom.atomId, canonicalLiveUsageAtom(atom, subject));
       }
     }
     for (const atom of observation.activityAtoms ?? []) {
       if (atom.queryId === sourceQueryId && liveSourceOverlapsSubject(atom, subject)) {
-        sources.activityAtoms.set(atom.activityId, canonicalLiveActivityAtom(atom, subject));
+        sources.activityAtoms.set(liveActivityEvidenceKey(atom), canonicalLiveActivityAtom(atom, subject));
         if (atom.kind === "subagent" && atom.childSessionId) {
           this.liveSessionSubjects.set(atom.childSessionId, subject.subjectRunId);
         }
@@ -829,11 +1419,57 @@ export class ExternalWebhookDispatchService {
         node.queryId === sourceQueryId
         && node.nodeKind !== "prompt"
         && liveSourceOverlapsSubject(node, subject)
+        && (node.requestId == null || !sources.auxiliarySessionTitleRequestIds.has(node.requestId))
       ) {
         sources.executionNodes.set(node.nodeId, canonicalLiveExecutionNode(node, subject));
       }
     }
     this.liveRunSources.set(subject.subjectRunId, sources);
+  }
+
+  /**
+   * A terminal has already published, so admit no ordinary late update. The
+   * sole exception is an exact native Claude decision that can correct an
+   * already-retained generic tool result or successful write proof.
+   */
+  private hasLateNativePermissionDecisionCorrection(
+    observation: SafeObservationV1,
+    sourceQueryId: string,
+    subject: LiveLifecycleSubject
+  ): boolean {
+    const terminalAnchor = this.liveTerminalAnchors.get(subject.subjectRunId);
+    if (!terminalAnchor) {
+      return false;
+    }
+    const sources = this.liveRunSources.get(subject.subjectRunId);
+    const incomingNodes = (observation.executionNodes ?? [])
+      .filter((node) => node.queryId === sourceQueryId && liveSourceOverlapsSubject(node, subject));
+    const allNodes = [
+      ...(sources?.executionNodes.values() ?? []),
+      ...incomingNodes
+    ];
+    const nodeConflict = incomingNodes.some((decision) =>
+      isNativePermissionRejectionExecutionNode(decision)
+      && liveSourceBeganOnOrBeforeTerminalBoundary(decision, terminalAnchor.correctionBoundaryAt)
+      && allNodes.some((candidate) =>
+        isSuccessfulSemanticWriteNode(candidate)
+        && hasExactNativePermissionRejectionForExecutionNode(candidate, [decision])));
+    if (nodeConflict) {
+      return true;
+    }
+    const incomingActivities = (observation.activityAtoms ?? [])
+      .filter((activity) => activity.queryId === sourceQueryId && liveSourceOverlapsSubject(activity, subject));
+    const allActivities = [
+      ...(sources?.activityAtoms.values() ?? []),
+      ...incomingActivities
+    ];
+    return incomingActivities.some((decision) =>
+      isNativePermissionDecisionActivity(decision)
+      && liveSourceBeganOnOrBeforeTerminalBoundary(decision, terminalAnchor.correctionBoundaryAt)
+      && allActivities.some((candidate) =>
+        candidate.activityId !== decision.activityId
+        && !isNativePermissionDecisionActivity(candidate)
+        && sameExactSafeActivityIdentity(candidate, decision)));
   }
 
   private rememberLiveTerminalAnchor(
@@ -844,15 +1480,59 @@ export class ExternalWebhookDispatchService {
     const anchor: LiveTerminalAnchor = {
       queryId: occurrence.queryId,
       completedAt: occurrence.completedAt!,
+      correctionBoundaryAt: occurrence.completedAt!,
       completionEvidence: occurrence.completionEvidence!,
+      ...(occurrence.completionOutcome ? { completionOutcome: occurrence.completionOutcome } : {}),
       profileVersion: observation.profileVersion
     };
     const existing = this.liveTerminalAnchors.get(subject.subjectRunId);
-    if (!existing || anchor.completedAt >= existing.completedAt) {
+    if (!existing) {
       this.liveTerminalAnchors.set(subject.subjectRunId, anchor);
       return anchor;
     }
-    return existing;
+    const completionOutcome = preferredTerminalOutcome(existing.completionOutcome, anchor.completionOutcome);
+    const outcomeSource = preferredLiveTerminalOutcomeSource(existing, anchor);
+    const timingSource = completionOutcome
+      ? outcomeSource
+      : anchor.completedAt >= existing.completedAt ? anchor : existing;
+    const retained: LiveTerminalAnchor = {
+      ...timingSource,
+      correctionBoundaryAt: earliestLiveTerminalCorrectionBoundary(
+        subject.startedAt,
+        existing.correctionBoundaryAt,
+        anchor.correctionBoundaryAt
+      ),
+      ...(completionOutcome ? {
+        queryId: outcomeSource.queryId,
+        completionEvidence: outcomeSource.completionEvidence,
+        completionOutcome,
+        profileVersion: outcomeSource.profileVersion
+      } : {})
+    };
+    this.liveTerminalAnchors.set(subject.subjectRunId, retained);
+    return retained;
+  }
+
+  private narrowLiveTerminalCorrectionBoundary(
+    subject: LiveLifecycleSubject,
+    occurrence: QueryOccurrenceV1 & { completedAt: string }
+  ): void {
+    const existing = this.liveTerminalAnchors.get(subject.subjectRunId);
+    if (!existing) {
+      return;
+    }
+    const correctionBoundaryAt = earliestLiveTerminalCorrectionBoundary(
+      subject.startedAt,
+      existing.correctionBoundaryAt,
+      occurrence.completedAt
+    );
+    if (correctionBoundaryAt === existing.correctionBoundaryAt) {
+      return;
+    }
+    this.liveTerminalAnchors.set(subject.subjectRunId, {
+      ...existing,
+      correctionBoundaryAt
+    });
   }
 
   private async projectLiveRunEndedEvent(
@@ -860,19 +1540,49 @@ export class ExternalWebhookDispatchService {
     anchor: LiveTerminalAnchor,
     latestObservation: SafeObservationV1,
     sender: WebhookSenderV1
-  ): Promise<{ event: RunEndedWebhookEventDraft; allowFilesChangedAfterReadOnly: boolean } | undefined> {
-    if (Date.parse(anchor.completedAt) < Date.parse(subject.startedAt)) {
+  ): Promise<{
+    event: RunEndedWebhookEventDraft;
+    allowFilesChangedAfterReadOnly: boolean;
+    sourcePrunedFilesChanged?: string[];
+    sourcePrunedActivityIds?: string[];
+  } | undefined> {
+    if (
+      !isValidLiveTerminalBoundary(anchor.completedAt, subject.startedAt)
+      || !isValidLiveTerminalBoundary(anchor.correctionBoundaryAt, subject.startedAt)
+    ) {
       return undefined;
     }
     const queryId = queryIdForRunId(subject.subjectRunId);
-    const observation = this.accumulatedLiveObservation(subject, latestObservation);
-    const update = projectLiveSubjectRunUpdatedEvent(observation, subject.repository, sender, subject);
     const sources = this.liveRunSources.get(subject.subjectRunId);
-    const artifactKeys = uniqueStrings([
-      ...(sources?.executionNodes.values() ?? [])
-    ].flatMap((node) => node.artifactKeys ?? []));
-    const filesChanged = await this.filesChangedFor(subject.repository.repoKey, artifactKeys);
+    const terminalExecutionNodes = liveSourcesAtOrBeforeTerminalBoundary(
+      sources?.executionNodes.values() ?? [],
+      anchor.correctionBoundaryAt
+    );
+    const terminalActivities = liveSourcesAtOrBeforeTerminalBoundary(
+      sources?.activityAtoms.values() ?? [],
+      anchor.correctionBoundaryAt
+    );
+    const observation = this.accumulatedLiveObservation(
+      subject,
+      latestObservation,
+      anchor.correctionBoundaryAt
+    );
+    const update = projectLiveSubjectRunUpdatedEvent(observation, subject.repository, sender, subject);
+    const artifactProjection = successfulWriteArtifactProjectionForExecutionNodes(
+      terminalExecutionNodes
+    );
+    const artifactKeys = artifactProjection.artifactKeys;
     const activity = update?.activity ?? [];
+    const sourcePrunedActivityIds = nativePermissionSupersededLiveActivityIds(
+      terminalActivities
+    );
+    const hasSuccessfulWriteArtifactEvidence = artifactKeys.length > 0;
+    const terminalArtifacts = await this.liveTerminalArtifactPathsForProjection(
+      subject,
+      artifactKeys,
+      artifactProjection.invalidatedArtifactKeys
+    );
+    const filesChanged = terminalArtifacts.filesChanged;
     const cost = update
       ? {
           estimatedNanoUsd: update.estimatedNanoUsd,
@@ -910,6 +1620,7 @@ export class ExternalWebhookDispatchService {
           activity.length > 0 ? "partial" : "none",
           cost.costCoverage
         ),
+        ...(anchor.completionOutcome ? { outcome: anchor.completionOutcome } : {}),
         endedAt: anchor.completedAt,
         inputTokens: update?.inputTokens ?? 0,
         outputTokens: update?.outputTokens ?? 0,
@@ -924,18 +1635,56 @@ export class ExternalWebhookDispatchService {
         activity,
         state: "completed"
       },
-      allowFilesChangedAfterReadOnly: artifactKeys.length > 0 || hasWriteCapableActivity(activity)
+      allowFilesChangedAfterReadOnly: hasSuccessfulWriteArtifactEvidence,
+      ...(terminalArtifacts.sourcePrunedFilesChanged.length > 0
+        ? { sourcePrunedFilesChanged: terminalArtifacts.sourcePrunedFilesChanged }
+        : {}),
+      ...(sourcePrunedActivityIds.length > 0 ? { sourcePrunedActivityIds } : {})
+    };
+  }
+
+  /**
+   * Project each artifact independently while the live terminal is retained.
+   * That small map is the proof-to-public-path bridge needed to retract only
+   * a late-rejected invocation's prior file claims.
+   */
+  private async liveTerminalArtifactPathsForProjection(
+    subject: LiveLifecycleSubject,
+    artifactKeys: string[],
+    invalidatedArtifactKeys: string[]
+  ): Promise<{ filesChanged: string[]; sourcePrunedFilesChanged: string[] }> {
+    const previous = this.liveTerminalArtifactPaths.get(subject.subjectRunId) ?? new Map<string, string[]>();
+    const next = new Map<string, string[]>();
+    for (const artifactKey of artifactKeys) {
+      const paths = safeRepoRelativePaths(await this.filesChangedFor(subject.repository.repoKey, [artifactKey]));
+      if (paths.length > 0) {
+        next.set(artifactKey, paths);
+      }
+    }
+    const sourcePrunedFilesChanged = new Set<string>();
+    for (const artifactKey of invalidatedArtifactKeys) {
+      const priorPaths = previous.get(artifactKey)
+        ?? safeRepoRelativePaths(await this.filesChangedFor(subject.repository.repoKey, [artifactKey]));
+      for (const path of priorPaths) {
+        sourcePrunedFilesChanged.add(path);
+      }
+    }
+    this.liveTerminalArtifactPaths.set(subject.subjectRunId, next);
+    return {
+      filesChanged: safeRepoRelativePaths([...next.values()].flat()),
+      sourcePrunedFilesChanged: safeRepoRelativePaths([...sourcePrunedFilesChanged])
     };
   }
 
   private accumulatedLiveObservation(
     subject: LiveLifecycleSubject,
-    latest: SafeObservationV1
+    latest: SafeObservationV1,
+    completedAt?: string
   ): SafeObservationV1 {
     const sources = this.liveRunSources.get(subject.subjectRunId);
-    const usageAtoms = [...(sources?.usageAtoms.values() ?? [])];
-    const activityAtoms = [...(sources?.activityAtoms.values() ?? [])];
-    const executionNodes = [...(sources?.executionNodes.values() ?? [])];
+    const usageAtoms = liveSourcesAtOrBeforeTerminalBoundary(sources?.usageAtoms.values() ?? [], completedAt);
+    const activityAtoms = liveSourcesAtOrBeforeTerminalBoundary(sources?.activityAtoms.values() ?? [], completedAt);
+    const executionNodes = liveSourcesAtOrBeforeTerminalBoundary(sources?.executionNodes.values() ?? [], completedAt);
     const observedAt = latestIso([
       subject.startedAt,
       ...usageAtoms.flatMap((atom) => [atom.endedAt, atom.startedAt]).filter((value): value is string => Boolean(value)),
@@ -953,7 +1702,10 @@ export class ExternalWebhookDispatchService {
     };
   }
 
-  async reconcileCommitEvents(commitHash?: string): Promise<void> {
+  async reconcileCommitEvents(
+    commitHash?: string,
+    options: { processDueEntries?: boolean } = {}
+  ): Promise<void> {
     const [summaries, snapshots, workEpisodes] = await Promise.all([
       this.attribution.listCommitAttributions(commitHash ? { commitHash } : {}),
       this.attribution.listCommitPublicationSnapshots(commitHash ? { commitHash } : {}),
@@ -973,29 +1725,56 @@ export class ExternalWebhookDispatchService {
       const candidateRuns = candidateRunIds
         .map((runId) => runsById.get(runId))
         .filter((run): run is ProductionRunV1 => Boolean(run));
+      const completionBoundaries = completionBoundariesByQuery(candidateRuns);
       const atomsByQuery = groupAtomsByQuery(await this.safeUsageAtomsForQueryIds(candidateRuns.map((run) =>
         run.queryId ?? run.correlationId
       )));
+      // Native-rejection markers are a correction-only path. They are never
+      // projected as ordinary writes; they exist solely to supersede a prior
+      // commit event after the internal attribution ledger has revoked it.
+      const nativeRejectedProofs = uniqueCausalWriteArtifactProofs(candidateRuns.flatMap((run) =>
+        nativeRejectedCausalWriteArtifactProofsForCommitRun(workEpisodes, summary, run)
+      ));
+      const nativeRejectedMarkerCensusComplete = candidateRuns.length > 0
+        && candidateRuns.every((run) => nativeRejectedCausalWriteArtifactCensusForCommitRun(
+          workEpisodes,
+          summary,
+          run
+        ));
+      const nativeRejectedVerification = await this.verifiedSuccessfulWriteArtifactKeys(
+        nativeRejectedProofs,
+        completionBoundaries
+      );
       const writingSubjectByProductionRunId = new Map<string, string>();
+      let hasCurrentVerifiedWriterProof = false;
       for (const run of candidateRuns) {
         const queryId = run.queryId ?? run.correlationId;
-        const artifactKeys = artifactKeysForCommitRun(workEpisodes, summary, run);
+        const artifactProofs = successfulWriteArtifactProofsForCommitRun(workEpisodes, summary, run);
+        const artifactVerification = await this.verifiedSuccessfulWriteArtifactKeys(
+          artifactProofs,
+          completionBoundaries
+        );
+        hasCurrentVerifiedWriterProof ||= artifactVerification.artifactKeys.length > 0;
         const deliveredTerminal = await this.subjects.read(`run.ended:${run.runId}`);
         if (
           summary.inheritedQueryIds.includes(queryId)
           && deliveredTerminal
           && (deliveredTerminal.filesChangedCount ?? 0) === 0
+          && artifactVerification.invalidatedArtifactKeys.length === 0
         ) {
           continue;
         }
-        if (artifactKeys.length === 0) {
+        if (
+          artifactVerification.artifactKeys.length === 0
+          && artifactVerification.invalidatedArtifactKeys.length === 0
+        ) {
           continue;
         }
         const events = await this.projectRunLifecycleEventsFromBinding(
           run,
           {
             repository,
-            artifactKeys,
+            artifactProofs,
             artifactScope: "explicit"
           },
           workEpisodes
@@ -1006,7 +1785,9 @@ export class ExternalWebhookDispatchService {
         await this.queueEvent(events.started, `run.start:${events.subjectRunId}`);
         await this.queueEvent(events.updated, `run.update:${events.subjectRunId}`);
         const queuedEnded = await this.queueRunEndedEvent(events.ended, `run.ended:${events.subjectRunId}`, {
-          allowFilesChangedAfterReadOnly: events.allowFilesChangedAfterReadOnly
+          allowFilesChangedAfterReadOnly: events.allowFilesChangedAfterReadOnly,
+          sourcePrunedFilesChanged: events.sourcePrunedFilesChanged,
+          sourcePrunedActivityIds: events.sourcePrunedActivityIds
         });
         if (
           (events.ended.filesChanged?.length ?? 0) > 0
@@ -1015,13 +1796,30 @@ export class ExternalWebhookDispatchService {
           writingSubjectByProductionRunId.set(run.runId, events.subjectRunId);
         }
       }
-      if (writingSubjectByProductionRunId.size > 0) {
+      if (writingSubjectByProductionRunId.size > 0 && options.processDueEntries !== false) {
         await this.processDueEntries();
       }
       const filteredRunPairs = candidateRuns
         .map((run) => ({ run, subjectRunId: writingSubjectByProductionRunId.get(run.runId) }))
         .filter((item): item is { run: ProductionRunV1; subjectRunId: string } => Boolean(item.subjectRunId));
       if (filteredRunPairs.length === 0) {
+        const allMarkedProofsNativelyRejected = nativeRejectedProofs.length > 0
+          && nativeRejectedVerification.allProofsNativeRejected;
+        const hasExactNativeCausalRetraction = summary.evidenceReasons
+          .includes("native_causal_write_retracted");
+        if (
+          snapshot.state === "superseded"
+          && hasExactNativeCausalRetraction
+          && nativeRejectedMarkerCensusComplete
+          && allMarkedProofsNativelyRejected
+          && !hasCurrentVerifiedWriterProof
+        ) {
+          // Do not infer native revocation from a generic ledger transition.
+          // This bounded path requires both the ledger's superseded snapshot
+          // carrying its exact retraction reason, a complete marker census,
+          // and every exact rejected pair revalidating natively.
+          await this.queueInvalidatedCommitSupersession(summary, snapshot, repository, subjectId);
+        }
         if (candidateRunIds.length > 0) {
           this.recordEvent({
             kind: "constructLifecycle",
@@ -1059,7 +1857,7 @@ export class ExternalWebhookDispatchService {
         continue;
       }
       const traceIds = uniqueStrings(filteredRuns.flatMap((run) => traceIdsByRunId.get(run.runId) ?? []));
-      const cost = attributedCommitCost(summary, snapshot);
+      const cost = attributedCommitCost(summary, snapshot, candidateRuns, filteredRuns);
       const next = await this.queueCommitEvent(
         { ...summary, runIds: webhookRunIds },
         snapshot,
@@ -1075,7 +1873,9 @@ export class ExternalWebhookDispatchService {
         continue;
       }
     }
-    await this.processDueEntries();
+    if (options.processDueEntries !== false) {
+      await this.processDueEntries();
+    }
   }
 
   async clear(): Promise<void> {
@@ -1148,15 +1948,78 @@ export class ExternalWebhookDispatchService {
     return await this.queueEvent(event, subjectId);
   }
 
+  /**
+   * A commit can have been queued from an earlier successful-write proof. If
+   * every actual writer proof is later invalidated (natively rejected or no
+   * longer readable), replace that pending payload before delivery or issue a
+   * higher superseding version for an already-delivered active attribution.
+   * Never create a standalone supersession when no active commit event was
+   * ever admitted.
+   */
+  private async queueInvalidatedCommitSupersession(
+    summary: CommitAttributionSummary,
+    snapshot: CommitPublicationSnapshot,
+    repository: WebhookRepositoryV1,
+    subjectId: string
+  ): Promise<boolean> {
+    const state = await this.subjects.read(subjectId);
+    const current = state?.eventId ? await this.outbox.read(state.eventId) : undefined;
+    if (
+      !current
+      || current.event.eventType !== "commit.attributed"
+      || current.event.state === "superseded"
+    ) {
+      return false;
+    }
+    return await this.queueCommitEvent(
+      { ...summary, runIds: [] },
+      {
+        ...snapshot,
+        state: "superseded",
+        updatedAt: new Date(this.now()).toISOString()
+      },
+      repository,
+      [],
+      subjectId,
+      {
+        estimatedNanoUsd: 0,
+        costCoverage: "unavailable"
+      }
+    );
+  }
+
   private async queueRunEndedEvent(
     baseEvent: RunEndedWebhookEventDraft,
     subjectId: string,
     options: QueueEventOptions = {}
   ): Promise<boolean> {
-    return await this.withRunEndedSubjectLock(
+    return (await this.queueRunEndedEventAdmission(baseEvent, subjectId, options)).queued;
+  }
+
+  private async queueRunEndedEventAdmission(
+    baseEvent: RunEndedWebhookEventDraft,
+    subjectId: string,
+    options: QueueEventOptions = {}
+  ): Promise<QueueRunEndedAdmissionResult> {
+    const queueTerminal = async (): Promise<boolean> => await this.withRunEndedTerminalQueueLock(
       subjectId,
       () => this.queueRunEndedEventUnlocked(baseEvent, subjectId, options)
     );
+    // A terminal must be durably queued while a same-run update HTTP response is
+    // in flight; waiting on that response can consume the full terminal deadline.
+    // Never apply this bypass to an in-flight terminal, so terminal delivery and
+    // terminal-to-terminal replacement remain serialized by the lifecycle lock.
+    const bypassedInFlightUpdate = this.inFlightRunEndedSubjectDeliveryTypes.get(subjectId) === "run.update";
+    if (bypassedInFlightUpdate) {
+      return {
+        queued: await queueTerminal(),
+        bypassedInFlightUpdate
+      };
+    }
+    return {
+      queued: await this.withRunEndedSubjectLock(subjectId, queueTerminal),
+      bypassedInFlightUpdate
+    };
   }
 
   private async withRunEndedSubjectLock<T>(subjectId: string, operation: () => Promise<T>): Promise<T> {
@@ -1169,6 +2032,34 @@ export class ExternalWebhookDispatchService {
     } finally {
       if (this.runEndedQueueTails.get(subjectId) === tail) {
         this.runEndedQueueTails.delete(subjectId);
+      }
+    }
+  }
+
+  private async withRunUpdateQueueLock<T>(subjectId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.runUpdateQueueTails.get(subjectId) ?? Promise.resolve();
+    const queued = previous.then(operation);
+    const tail = queued.then(() => undefined, () => undefined);
+    this.runUpdateQueueTails.set(subjectId, tail);
+    try {
+      return await queued;
+    } finally {
+      if (this.runUpdateQueueTails.get(subjectId) === tail) {
+        this.runUpdateQueueTails.delete(subjectId);
+      }
+    }
+  }
+
+  private async withRunEndedTerminalQueueLock<T>(subjectId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.runEndedTerminalQueueTails.get(subjectId) ?? Promise.resolve();
+    const queued = previous.then(operation);
+    const tail = queued.then(() => undefined, () => undefined);
+    this.runEndedTerminalQueueTails.set(subjectId, tail);
+    try {
+      return await queued;
+    } finally {
+      if (this.runEndedTerminalQueueTails.get(subjectId) === tail) {
+        this.runEndedTerminalQueueTails.delete(subjectId);
       }
     }
   }
@@ -1198,7 +2089,12 @@ export class ExternalWebhookDispatchService {
       return false;
     }
     const monotonicBaseEvent = previousEvent
-      ? monotonicRunEndedRevision(previousEvent, normalizedBaseEvent)
+      ? monotonicRunEndedRevision(
+          previousEvent,
+          normalizedBaseEvent,
+          options.sourcePrunedFilesChanged,
+          options.sourcePrunedActivityIds
+        )
       : normalizedBaseEvent;
     const meaningHash = runEndedMeaningHash(monotonicBaseEvent);
     if (subjectState?.payloadHash === meaningHash) {
@@ -1242,6 +2138,37 @@ export class ExternalWebhookDispatchService {
     subjectId: string,
     options: QueueEventOptions = {}
   ): Promise<boolean> {
+    if (event.eventType === "run.update") {
+      const lifecycleSubjectId = lifecycleLockSubjectId(event.runId);
+      const queueUpdate = async (): Promise<boolean> => await this.withRunUpdateQueueLock(
+        lifecycleSubjectId,
+        () => this.queueEventUnlocked(event, subjectId, options)
+      );
+      // A fresh running snapshot must become durable while the receiver is
+      // still answering the prior same-run update. Reconciliation below keeps
+      // only the latest queued successor, while delivery's lifecycle claim
+      // preserves wire order. Settling snapshots retain the lock because they
+      // participate in the terminal boundary.
+      if (
+        event.state === "running"
+        && this.inFlightRunEndedSubjectDeliveryTypes.get(lifecycleSubjectId) === "run.update"
+      ) {
+        return await queueUpdate();
+      }
+      return await this.withRunEndedSubjectLock(
+        lifecycleSubjectId,
+        queueUpdate
+      );
+    }
+    return await this.queueEventUnlocked(event, subjectId, options);
+  }
+
+  private async queueEventUnlocked(
+    inputEvent: WebhookEventV1,
+    subjectId: string,
+    options: QueueEventOptions = {}
+  ): Promise<boolean> {
+    let event = inputEvent;
     const configuration = this.configuration.readStored();
     if (isRunWebhookEventType(event.eventType) && configuration.runEndedEnabled === false) {
       this.recordQueueLifecycle(event, subjectId, "blocked", "webhook_run_events_disabled");
@@ -1258,6 +2185,38 @@ export class ExternalWebhookDispatchService {
       );
       return false;
     }
+    if (event.eventType === "run.update" && await this.runEndedDeliveredForLifecycleSubject(event.eventType, subjectId)) {
+      this.recordQueueLifecycle(event, subjectId, "suppressed", "run_update_after_run_ended_suppressed");
+      return false;
+    }
+    let runUpdateReconciliation: RunUpdateQueueReconciliation | undefined;
+    if (event.eventType === "run.update") {
+      runUpdateReconciliation = await this.reconcileRunUpdateForQueue(event, subjectId);
+      if (!runUpdateReconciliation.event) {
+        await this.suppressSupersededRunUpdates(runUpdateReconciliation.superseded);
+        if (!runUpdateReconciliation.blocked) {
+          this.recordQueueLifecycle(
+            event,
+            subjectId,
+            "suppressed",
+            "run_update_dominated_by_published_high_water"
+          );
+        }
+        return false;
+      }
+      event = runUpdateReconciliation.event;
+      const reconciledPrivacy = this.privacy.validatePublication(event);
+      if (!reconciledPrivacy.ok) {
+        this.recordQueueLifecycle(
+          event,
+          subjectId,
+          "blocked",
+          "webhook_privacy_validation_failed",
+          webhookValidationFailureDetails(event, reconciledPrivacy.violations)
+        );
+        return false;
+      }
+    }
     const now = new Date(this.now()).toISOString();
     const payloadHash = contentHash(event);
     const subjectState = event.eventType === "run.ended"
@@ -1265,14 +2224,11 @@ export class ExternalWebhookDispatchService {
       : undefined;
     const existing = await this.outbox.read(event.eventId);
     if (existing?.payloadHash === payloadHash) {
+      await this.suppressSupersededRunUpdates(runUpdateReconciliation?.superseded ?? []);
       return false;
     }
     if (event.eventType === "run.start" && await this.runEndedDeliveredForLifecycleSubject(event.eventType, subjectId)) {
       this.recordQueueLifecycle(event, subjectId, "suppressed", "run_start_after_run_ended_suppressed");
-      return false;
-    }
-    if (event.eventType === "run.update" && await this.runEndedDeliveredForLifecycleSubject(event.eventType, subjectId)) {
-      this.recordQueueLifecycle(event, subjectId, "suppressed", "run_update_after_run_ended_suppressed");
       return false;
     }
     if (existing?.deliveredAt && event.eventType === "run.start") {
@@ -1347,6 +2303,7 @@ export class ExternalWebhookDispatchService {
       updatedAt: now
     };
     await this.outbox.upsert(entry);
+    await this.suppressSupersededRunUpdates(runUpdateReconciliation?.superseded ?? []);
     this.scheduleRetry(nextAttemptAt);
     this.recordQueueLifecycle(
       event,
@@ -1355,6 +2312,107 @@ export class ExternalWebhookDispatchService {
       entry.deliveryState === "blocked" ? "webhook_event_blocked_missing_url" : "webhook_event_queued"
     );
     return true;
+  }
+
+  private async reconcileRunUpdateForQueue(
+    candidate: RunUpdatedWebhookEventV1,
+    subjectId: string,
+    options: RunUpdateReconciliationOptions = {}
+  ): Promise<RunUpdateQueueReconciliation> {
+    const lifecycle = await this.outbox.lifecycle({ runId: candidate.runId });
+    const updates = lifecycle.filter((entry): entry is WebhookOutboxEntry & { event: RunUpdatedWebhookEventV1 } =>
+      entry.event.eventType === "run.update"
+    );
+    const repositoryConflict = updates.find((entry) =>
+      entry.event.repository.repoKey !== candidate.repository.repoKey
+    );
+    if (repositoryConflict) {
+      this.recordQueueLifecycle(
+        candidate,
+        subjectId,
+        "blocked",
+        "run_update_repository_identity_changed",
+        {
+          previousRepoKey: repositoryConflict.event.repository.repoKey,
+          nextRepoKey: candidate.repository.repoKey
+        }
+      );
+      return { superseded: [], blocked: true };
+    }
+    // Unpublished projections are replaceable snapshots, so an authoritative
+    // correction may legitimately reduce them before any customer sees it.
+    // Delivered projections are different: they establish the public state/token
+    // floor that later concurrent or replayed snapshots must not regress.
+    const published = updates
+      .filter((entry) => entry.deliveryState === "delivered" && entry.lastErrorCode !== RUN_UPDATE_SUPERSEDED_CODE)
+      .sort((left, right) =>
+        (left.deliveredAt ?? left.updatedAt).localeCompare(right.deliveredAt ?? right.updatedAt)
+        || left.key.localeCompare(right.key)
+      )
+      .reduce<RunUpdatedWebhookEventV1 | undefined>((highWater, entry) =>
+        highWater ? mergeRunUpdatedWebhookEvents(highWater, entry.event, options) : entry.event, undefined);
+    const active = updates.filter((entry) => entry.deliveryState !== "delivered");
+    const unpublished = [...active.map((entry) => entry.event), candidate]
+      .reduce<RunUpdatedWebhookEventV1 | undefined>((preferred, event) =>
+        preferred ? preferredUnpublishedRunUpdate(preferred, event) : event, undefined)!;
+    const reconciled = published
+      ? mergeRunUpdatedWebhookEvents(published, unpublished, options)
+      : unpublished;
+    if (published && runUpdatedMeaningHash(reconciled) === runUpdatedMeaningHash(published)) {
+      return { superseded: active };
+    }
+    // `updatedAt` is the receiver's public replacement-snapshot ordering key.
+    // One provider envelope can add several distinct safe facts with the same
+    // source timestamp, so preserve that source time in `evidence.observedAt`
+    // while advancing the public ordering key beyond the durable delivered
+    // high-water. The per-run queue lock makes this logical millisecond stable
+    // under concurrency and the outbox makes it survive restart.
+    const ordered = published && reconciled.updatedAt <= published.updatedAt
+      ? { ...reconciled, updatedAt: nextIsoMillisecond(published.updatedAt) }
+      : reconciled;
+    const event = ordered.state === "running"
+      ? { ...ordered, eventId: liveRunUpdateEventId(ordered) }
+      : ordered;
+    return {
+      event,
+      superseded: active.filter((entry) => entry.event.eventId !== event.eventId)
+    };
+  }
+
+  private async suppressSupersededRunUpdates(
+    entries: WebhookOutboxEntry[],
+    options: { preDeliveryClaimKey?: string } = {}
+  ): Promise<void> {
+    for (const entry of entries) {
+      // The receiver has already observed this event ID. Let the active HTTP
+      // attempt record its real outcome; only queued successors are replaceable.
+      // Delivery-boundary reconciliation is the one exception: that exact claim
+      // has not started HTTP yet, so replacing it is still receiver-invisible.
+      if (
+        this.inFlightDeliveryKeys.has(entry.key)
+        && options.preDeliveryClaimKey !== entry.key
+      ) {
+        continue;
+      }
+      const current = await this.outbox.read(entry.key);
+      if (!current || current.deliveryState === "delivered") {
+        continue;
+      }
+      const suppressedAt = new Date(this.now()).toISOString();
+      await this.outbox.upsert({
+        ...current,
+        deliveryState: "delivered",
+        deliveredAt: current.deliveredAt ?? suppressedAt,
+        nextAttemptAt: undefined,
+        lastErrorCode: RUN_UPDATE_SUPERSEDED_CODE,
+        updatedAt: suppressedAt
+      });
+      this.recordDeliveryLifecycle(
+        current,
+        "suppressed",
+        "run_update_superseded_by_high_water"
+      );
+    }
   }
 
   private async projectRunLifecycleEvents(run: ProductionRunV1): Promise<RunLifecycleProjection | undefined> {
@@ -1380,7 +2438,7 @@ export class ExternalWebhookDispatchService {
     run: ProductionRunV1,
     binding: {
       repository: WebhookRepositoryV1;
-      artifactKeys: string[];
+      artifactProofs: CausalWriteArtifactProof[];
       artifactScope?: "explicit";
     },
     episodes: AgenticWorkEpisode[]
@@ -1392,10 +2450,79 @@ export class ExternalWebhookDispatchService {
       ? episodes.find((ep) => ep.runIds.includes(run.runId))
       : undefined;
     const webhookRunId = await this.lifecycleSubjectRunIdFor(run, episode);
-    const aggregateEpisode = Boolean(episode && this.shouldAggregateEpisodeLifecycle(episode, webhookRunId));
+    const aggregateEpisode = Boolean(episode && await this.shouldAggregateEpisodeLifecycle(episode, webhookRunId));
     const episodeRuns = aggregateEpisode && episode
       ? await this.runsForLifecycleSubject(episode, run, webhookRunId)
       : [run];
+    const publicRootQueryId = queryIdForRunId(webhookRunId);
+    const triggeringQueryId = run.queryId ?? run.correlationId;
+    const isCanonicalPublicRootSubject = runIdForQuery(publicRootQueryId) === webhookRunId;
+    const publicRootStartedAt = isCanonicalPublicRootSubject
+      ? await this.publicLiveStartedAt(webhookRunId)
+      : undefined;
+    const publicRootTerminal = publicRootStartedAt
+      ? await this.runEndedForSubject(webhookRunId)
+      : undefined;
+    const isLinkedCodexChildCompletion = run.provider === "codex"
+      && isCanonicalPublicRootSubject
+      && triggeringQueryId !== publicRootQueryId
+      && run.runId !== webhookRunId;
+    if (
+      isLinkedCodexChildCompletion
+      && publicRootStartedAt
+      && !publicRootTerminal
+      && !episodeRuns.some((candidate) =>
+        candidate.endedAt != null
+        && (
+          candidate.runId === webhookRunId
+          || (candidate.queryId ?? candidate.correlationId) === publicRootQueryId
+        ))
+    ) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "suppressed",
+        reason: "codex_child_completion_waiting_for_root",
+        runId: run.runId,
+        queryId: triggeringQueryId,
+        sessionId: run.sessionId,
+        ...(episode ? { episodeId: episode.episodeId } : {}),
+        details: { subjectRunId: webhookRunId }
+      });
+      return undefined;
+    }
+    const isPublicRootCompletion = run.provider === "codex"
+      && isCanonicalPublicRootSubject
+      && (
+        triggeringQueryId === publicRootQueryId
+        || run.runId === webhookRunId
+      );
+    const missingDurableChildRunCount = isPublicRootCompletion && publicRootStartedAt && !publicRootTerminal
+      ? await this.completedDurableChildRunCountOutsideProjection(
+          webhookRunId,
+          publicRootQueryId,
+          episodeRuns
+        )
+      : 0;
+    if (missingDurableChildRunCount > 0) {
+      this.recordEvent({
+        kind: "constructLifecycle",
+        construct: "ExternalWebhookDispatch",
+        operation: "projection",
+        state: "suppressed",
+        reason: "codex_root_completion_waiting_for_attribution",
+        runId: run.runId,
+        queryId: triggeringQueryId,
+        sessionId: run.sessionId,
+        ...(episode ? { episodeId: episode.episodeId } : {}),
+        details: {
+          subjectRunId: webhookRunId,
+          missingDurableChildRunCount
+        }
+      });
+      return undefined;
+    }
     const projectedRun = aggregateEpisode ? aggregateWebhookRun(run, episodeRuns, webhookRunId) : run;
     const atomsByQuery = groupAtomsByQuery(await this.safeUsageAtomsForQueryIds(episodeRuns.map((candidate) =>
       candidate.queryId ?? candidate.correlationId
@@ -1404,17 +2531,21 @@ export class ExternalWebhookDispatchService {
     const llmModels = uniqueStrings(projectedRun.models ?? (projectedRun.model ? [projectedRun.model] : []));
     const sessionId = episode?.chatSessionId ?? sessionIdForRun(projectedRun);
     const endedAt = projectedRun.endedAt ?? run.endedAt;
-    const artifactKeys = binding.artifactScope === "explicit"
-      ? binding.artifactKeys
-      : await this.artifactKeysForLifecycleSubject(
+    const artifactProofs = binding.artifactScope === "explicit"
+      ? binding.artifactProofs
+      : await this.artifactProofsForLifecycleSubject(
           episode,
           binding.repository.repoKey,
           run,
           webhookRunId,
           aggregateEpisode,
-          binding.artifactKeys
+          binding.artifactProofs
         );
-    const filesChanged = await this.filesChangedFor(binding.repository.repoKey, artifactKeys);
+    const artifactVerification = await this.verifiedSuccessfulWriteArtifactKeys(
+      artifactProofs,
+      completionBoundariesByQuery(episodeRuns)
+    );
+    const artifactKeys = artifactVerification.artifactKeys;
     const evidence = evidenceForRun(projectedRun, "usage_projection");
     const traceIdsForWebhook = traceIds.length > 0 ? traceIds : [`trace_${webhookRunId}`];
     const sender = this.webhookSender();
@@ -1423,7 +2554,25 @@ export class ExternalWebhookDispatchService {
     const activity = activityForRun(projectedRun, endedAt, evidence).map((item) =>
       normalizeTerminalActivityBounds(item, startedAt, updatedAt)
     );
+    const hasSuccessfulWriteArtifactEvidence = artifactKeys.length > 0;
+    const filesChanged = hasSuccessfulWriteArtifactEvidence
+      ? await this.filesChangedFor(binding.repository.repoKey, artifactKeys)
+      : [];
+    const sourcePrunedFilesChanged = artifactVerification.invalidatedArtifactKeys.length > 0
+      ? safeRepoRelativePaths(await this.filesChangedFor(
+          binding.repository.repoKey,
+          artifactVerification.invalidatedArtifactKeys
+        ))
+      : [];
     const activityCoverage = activityCoverageForRun(projectedRun, activity);
+    const terminalEvidence = evidenceForRun(
+      projectedRun,
+      completionEvidenceBasisForRun(projectedRun) ?? "usage_projection"
+    );
+    const terminalUsageCoverage = projectedRun.authority === "event"
+      && projectedRun.warnings.includes("no_usage_atoms")
+      ? "none"
+      : "final";
     const started: RunStartedWebhookEventV1 = {
       schemaVersion: 1,
       eventType: "run.start",
@@ -1490,8 +2639,9 @@ export class ExternalWebhookDispatchService {
       codingHarness: projectedRun.provider,
       runtime: projectedRun.runtime,
       startedAt,
-      evidence: evidenceForRun(projectedRun, "usage_projection"),
-      coverage: webhookCoverage("final", activityCoverage, projectedRun.costCoverage),
+      evidence: terminalEvidence,
+      coverage: webhookCoverage(terminalUsageCoverage, activityCoverage, projectedRun.costCoverage),
+      ...(projectedRun.completionOutcome ? { outcome: projectedRun.completionOutcome } : {}),
       endedAt,
       inputTokens: projectedRun.inputTokens,
       outputTokens: projectedRun.outputTokens,
@@ -1525,31 +2675,125 @@ export class ExternalWebhookDispatchService {
       started,
       updated,
       ended,
-      allowFilesChangedAfterReadOnly: hasWriteCapableActivity(activity)
+      allowFilesChangedAfterReadOnly: hasSuccessfulWriteArtifactEvidence,
+      ...(sourcePrunedFilesChanged.length > 0 ? { sourcePrunedFilesChanged } : {})
     };
   }
 
-  private shouldAggregateEpisodeLifecycle(episode: AgenticWorkEpisode, webhookRunId: string): boolean {
+  private async shouldAggregateEpisodeLifecycle(
+    episode: AgenticWorkEpisode,
+    webhookRunId: string
+  ): Promise<boolean> {
     return webhookRunId === episode.episodeId
-      || episode.queryIds.some((queryId) => this.liveQuerySubjects.get(queryId) === webhookRunId);
+      || episode.queryIds.some((queryId) => this.liveQuerySubjects.get(queryId) === webhookRunId)
+      || (await this.lifecycleSubjectTraceQueryIds(episode, webhookRunId)).length > 0;
   }
 
-  private async artifactKeysForLifecycleSubject(
+  private async artifactProofsForLifecycleSubject(
     episode: AgenticWorkEpisode | undefined,
     repoKey: string,
     run: ProductionRunV1,
     webhookRunId: string,
     aggregateEpisode: boolean,
-    fallbackArtifactKeys: string[]
-  ): Promise<string[]> {
+    fallbackArtifactProofs: CausalWriteArtifactProof[]
+  ): Promise<CausalWriteArtifactProof[]> {
     if (!episode) {
-      return fallbackArtifactKeys;
+      return fallbackArtifactProofs;
     }
     if (!aggregateEpisode) {
-      return artifactKeysForRun([episode], repoKey, run);
+      return successfulWriteArtifactProofsForRun([episode], repoKey, run);
     }
     const scope = await this.lifecycleEvidenceScope(episode, run, webhookRunId);
-    return artifactKeysForEvidenceScope(episode, repoKey, scope.queryIds, scope.runIds);
+    return successfulWriteArtifactProofsForEvidenceScope(episode, repoKey, scope.queryIds, scope.runIds);
+  }
+
+  /**
+   * Fail closed unless the durable source node still proves this exact
+   * query/repository-scoped artifact claim. `causalWriteArtifacts` is a
+   * compact cross-construct pointer, not authority on its own: the node must
+   * carry that exact artifact key with allowlisted write evidence. Old,
+   * malformed, expired, or cross-query records cannot produce a file claim.
+   */
+  private async verifiedSuccessfulWriteArtifactKeys(
+    proofs: Iterable<CausalWriteArtifactProof>,
+    completionBoundaries: ReadonlyMap<string, string> = new Map()
+  ): Promise<VerifiedWriteArtifactProjection> {
+    const uniqueProofs = uniqueCausalWriteArtifactProofs(proofs);
+    const executionNodesByQuery = new Map<string, ExecutionNodeAtomV1[] | undefined>(await Promise.all(
+      uniqueStrings(uniqueProofs.map((proof) => proof.queryId)).map(async (queryId) => {
+        try {
+          const documents = await this.storage.listExecutionNodeDocumentsForQuery<ExecutionNodeAtomV1>(queryId);
+          return [queryId, documents
+            .map((document) => document.value)
+            .filter((node) => executionNodeBeginsAtOrBeforeCompletedBoundary(
+              node,
+              completionBoundaries.get(queryId)
+            ))] as const;
+        } catch {
+          // A proof must not remain publishable when its exact query-scoped
+          // source evidence cannot be read to check a native decision conflict.
+          return [queryId, undefined] as const;
+        }
+      })
+    ));
+    const verified = await Promise.all(uniqueProofs.map(async (proof) => {
+      try {
+        const document = await this.storage.readAgentDocument<ExecutionNodeAtomV1>(
+          "execution_node_atom",
+          proof.executionNodeId
+        );
+        const node = document?.value;
+        if (
+          !document
+          || document.key !== proof.executionNodeId
+          || !node
+          || node.nodeId !== proof.executionNodeId
+          || node.queryId !== proof.queryId
+          || node.repositoryKey !== proof.repoKey
+          || !executionNodeBeginsAtOrBeforeCompletedBoundary(
+            node,
+            completionBoundaries.get(proof.queryId)
+          )
+          || !isSuccessfulSemanticWriteNode(node)
+          || !node.artifactKeys?.includes(proof.artifactKey)
+          || (node.artifactEvidence !== "provider_write_hook" && node.artifactEvidence !== "provider_tool_event")
+          || !executionNodesByQuery.get(proof.queryId)
+        ) {
+          return { artifactKey: proof.artifactKey, state: "unverified" as const };
+        }
+        if (hasExactNativePermissionRejectionForExecutionNode(
+          node,
+          executionNodesByQuery.get(proof.queryId)!
+        )) {
+          return { artifactKey: proof.artifactKey, state: "native_rejected" as const };
+        }
+        return { artifactKey: proof.artifactKey, state: "verified" as const };
+      } catch {
+        // A missing, expired, malformed, or unreadable source record can never
+        // become authority for a published workspace-file claim.
+        return { artifactKey: proof.artifactKey, state: "unverified" as const };
+      }
+    }));
+    const artifactKeys = new Set(verified
+      .filter((result) => result.state === "verified")
+      .map((result) => result.artifactKey));
+    const invalidatedArtifactKeys = new Set(verified
+      .filter((result) => result.state === "native_rejected")
+      .map((result) => result.artifactKey));
+    // Separate valid evidence wins for a shared artifact identity. This avoids
+    // erasing a distinct successful write merely because another invocation
+    // was rejected.
+    for (const artifactKey of artifactKeys) {
+      invalidatedArtifactKeys.delete(artifactKey);
+    }
+    return {
+      artifactKeys: [...artifactKeys].sort(),
+      invalidatedArtifactKeys: [...invalidatedArtifactKeys].sort(),
+      allProofsNativeRejected: verified.length > 0
+        && verified.every((result) => result.state === "native_rejected"),
+      allProofsInvalidated: verified.length > 0
+        && verified.every((result) => result.state !== "verified")
+    };
   }
 
   private async lifecycleEvidenceScope(
@@ -1584,7 +2828,12 @@ export class ExternalWebhookDispatchService {
 
   private async lifecycleSubjectTraceQueryIds(episode: AgenticWorkEpisode, webhookRunId: string): Promise<string[]> {
     const episodeQueryIds = new Set(episode.queryIds);
-    const queryIds = new Set<string>();
+    return (await this.lifecycleSubjectTraceIds(webhookRunId))
+      .filter((traceId) => episodeQueryIds.has(traceId));
+  }
+
+  private async lifecycleSubjectTraceIds(webhookRunId: string): Promise<string[]> {
+    const traceIds = new Set<string>();
     for (const entry of await this.outbox.lifecycle({ runId: webhookRunId })) {
       const lifecycle = lifecycleSortKey(entry);
       if (!lifecycle || lifecycle.runSubject !== webhookRunId) {
@@ -1595,12 +2844,35 @@ export class ExternalWebhookDispatchService {
         continue;
       }
       for (const traceId of event.traceIds) {
-        if (episodeQueryIds.has(traceId)) {
-          queryIds.add(traceId);
-        }
+        traceIds.add(traceId);
       }
     }
-    return [...queryIds].sort();
+    return [...traceIds].sort();
+  }
+
+  private async completedDurableChildRunCountOutsideProjection(
+    webhookRunId: string,
+    publicRootQueryId: string,
+    episodeRuns: ProductionRunV1[]
+  ): Promise<number> {
+    const durableTraceIds = new Set(await this.lifecycleSubjectTraceIds(webhookRunId));
+    const projectedRunIds = new Set(episodeRuns.map((candidate) => candidate.runId));
+    const projectedQueryIds = new Set(episodeRuns.map((candidate) =>
+      candidate.queryId ?? candidate.correlationId
+    ));
+    const missingQueryIds = new Set((await this.productionRuns())
+      .filter((candidate) => {
+        const candidateQueryId = candidate.queryId ?? candidate.correlationId;
+        return candidate.provider === "codex"
+          && candidate.endedAt != null
+          && candidate.runId !== webhookRunId
+          && candidateQueryId !== publicRootQueryId
+          && durableTraceIds.has(candidateQueryId)
+          && !projectedRunIds.has(candidate.runId)
+          && !projectedQueryIds.has(candidateQueryId);
+      })
+      .map((candidate) => candidate.queryId ?? candidate.correlationId));
+    return missingQueryIds.size;
   }
 
   private async lifecycleSubjectRunIdFor(
@@ -1823,7 +3095,7 @@ export class ExternalWebhookDispatchService {
 
   private async bindRunToRepository(run: ProductionRunV1, episodes: AgenticWorkEpisode[]): Promise<{
     repository: WebhookRepositoryV1;
-    artifactKeys: string[];
+    artifactProofs: CausalWriteArtifactProof[];
   } | undefined> {
     const queryId = run.queryId ?? run.correlationId;
     const episode = episodes.find((candidate) =>
@@ -1846,7 +3118,7 @@ export class ExternalWebhookDispatchService {
       }
       return {
         repository: await this.describeRepository(repository.repoKey, repository.root),
-        artifactKeys: episode ? artifactKeysForRun([episode], repository.repoKey, run) : []
+        artifactProofs: episode ? successfulWriteArtifactProofsForRun([episode], repository.repoKey, run) : []
       };
     }
     if (!episode) {
@@ -1898,13 +3170,13 @@ export class ExternalWebhookDispatchService {
     }
     return {
       repository: await this.describeRepository(repoKeys[0]),
-      artifactKeys: artifactKeysForRun([episode], repoKeys[0], run)
+      artifactProofs: successfulWriteArtifactProofsForRun([episode], repoKeys[0], run)
     };
   }
 
   private bindCompletedRunToLiveRepository(run: ProductionRunV1): {
     repository: WebhookRepositoryV1;
-    artifactKeys: string[];
+    artifactProofs: CausalWriteArtifactProof[];
   } | undefined {
     const queryId = run.queryId ?? run.correlationId;
     const subjectRunId = this.liveQuerySubjects.get(queryId) ?? run.runId;
@@ -1924,7 +3196,7 @@ export class ExternalWebhookDispatchService {
     });
     return {
       repository,
-      artifactKeys: []
+      artifactProofs: []
     };
   }
 
@@ -2299,9 +3571,15 @@ export class ExternalWebhookDispatchService {
   }
 
   private async processDueEntries(force = false): Promise<void> {
+    if (this.stopping) {
+      return;
+    }
     if (this.deliveryRunning) {
       this.deliveryRerunRequested = true;
       this.deliveryRerunForce = this.deliveryRerunForce || force;
+      if (!force) {
+        await this.processDueLifecycleAnchor();
+      }
       return;
     }
     this.deliveryRunning = true;
@@ -2315,11 +3593,20 @@ export class ExternalWebhookDispatchService {
         // Re-read priority after each ordinary delivery so a newly accepted start
         // cannot sit behind a stale snapshot of update traffic. A forced operator
         // retry still attempts its original snapshot once per row.
-        const batch = currentForce ? entries : entries.slice(0, 1);
+        const claimable = entries.filter((entry) => this.deliveryClaimAvailable(entry));
+        const batch = currentForce ? claimable : claimable.slice(0, 1);
         for (const entry of batch) {
-          await this.deliver(entry, currentForce);
+          if (this.stopping) {
+            break;
+          }
+          await this.deliverClaimed(entry, currentForce);
         }
-        if (!currentForce && entries.length > batch.length) {
+        if (this.stopping) {
+          this.deliveryRerunRequested = false;
+          this.deliveryRerunForce = false;
+          break;
+        }
+        if (!currentForce && batch.length > 0 && entries.length > batch.length) {
           this.deliveryRerunRequested = true;
         }
         currentForce = false;
@@ -2329,23 +3616,175 @@ export class ExternalWebhookDispatchService {
     }
   }
 
-  private async deliver(entry: WebhookOutboxEntry, force = false): Promise<void> {
-    if (entry.event.eventType === "run.ended") {
-      await this.withRunEndedSubjectLock(entry.subjectId, async () => {
-        // The outbox row may have been replaced while processDueEntries was waiting
-        // for the subject lock. Deliver the current projection, never the stale copy.
-        const current = await this.outbox.read(entry.event.eventId);
-        if (!current || !outboxEntryDue(current, this.now(), force)) {
-          return;
+  private async processDueLifecycleAnchor(): Promise<void> {
+    if (this.stopping || this.lifecycleBypassRunning) {
+      return;
+    }
+    this.lifecycleBypassRunning = true;
+    let delivered = false;
+    try {
+      const entries = await this.outbox.due(new Date(this.now()).toISOString(), false);
+      const entry = entries.find((candidate) =>
+        isLifecycleAnchorDelivery(candidate)
+        && this.deliveryClaimAvailable(candidate)
+      );
+      if (entry && !this.stopping) {
+        delivered = await this.deliverClaimed(entry, false);
+      }
+    } finally {
+      this.lifecycleBypassRunning = false;
+      if (delivered && !this.stopping) {
+        if (this.deliveryRunning) {
+          this.deliveryRerunRequested = true;
+        } else {
+          void this.processDueEntries().catch(() => undefined);
         }
-        await this.deliverUnlocked(current);
-      });
+      }
+    }
+  }
+
+  private deliveryClaimAvailable(entry: WebhookOutboxEntry): boolean {
+    if (this.inFlightDeliveryKeys.has(entry.key)) {
+      return false;
+    }
+    const runSubject = lifecycleDeliveryRunSubject(entry);
+    return !runSubject || !this.inFlightLifecycleSubjects.has(runSubject);
+  }
+
+  private async deliverClaimed(entry: WebhookOutboxEntry, force: boolean): Promise<boolean> {
+    if (this.stopping || !this.deliveryClaimAvailable(entry)) {
+      return false;
+    }
+    const runSubject = lifecycleDeliveryRunSubject(entry);
+    this.inFlightDeliveryKeys.add(entry.key);
+    if (runSubject) {
+      this.inFlightLifecycleSubjects.add(runSubject);
+    }
+    try {
+      await this.deliver(entry, force);
+      return true;
+    } finally {
+      this.inFlightDeliveryKeys.delete(entry.key);
+      if (runSubject) {
+        this.inFlightLifecycleSubjects.delete(runSubject);
+      }
+    }
+  }
+
+  private async deliver(entry: WebhookOutboxEntry, force = false): Promise<void> {
+    if (entry.event.eventType === "run.update" || entry.event.eventType === "run.ended") {
+      const subjectId = lifecycleLockSubjectId(entry.event.runId);
+      // Publish the immutable delivery kind before entering any awaited lock or
+      // outbox read. A terminal accepted during an update's admission-to-send
+      // gap must persist immediately rather than inherit that update's HTTP
+      // latency. A terminal kind still keeps later terminal revisions behind
+      // the lifecycle lock.
+      const deliveryType = entry.event.eventType;
+      this.inFlightRunEndedSubjectDeliveryTypes.set(subjectId, deliveryType);
+      try {
+        await this.withRunEndedSubjectLock(subjectId, async () => {
+          // The outbox row may have been replaced while processDueEntries was waiting
+          // for the subject lock. Deliver the current projection, never the stale copy.
+          const current = await this.outbox.read(entry.event.eventId);
+          if (!current || !outboxEntryDue(current, this.now(), force)) {
+            return;
+          }
+          if (current.event.eventType !== "run.update" && current.event.eventType !== "run.ended") {
+            return;
+          }
+          if (current.event.eventType === "run.update") {
+            const reconciled = await this.reconcileRunUpdateAtDeliveryBoundary(current, force);
+            if (!reconciled) {
+              return;
+            }
+            await this.deliverUnlocked(reconciled);
+            return;
+          }
+          await this.deliverUnlocked(current);
+        });
+      } finally {
+        if (this.inFlightRunEndedSubjectDeliveryTypes.get(subjectId) === deliveryType) {
+          this.inFlightRunEndedSubjectDeliveryTypes.delete(subjectId);
+        }
+      }
+      return;
+    }
+    if (entry.event.eventType === "commit.attributed") {
+      // A commit sits behind a grace period specifically so causal evidence can
+      // settle. Re-read that evidence at the delivery boundary as well: a
+      // native rejection can replace this row with a supersession after it was
+      // queued but before its first HTTP attempt.
+      await this.reconcileCommitEvents(entry.event.commitSha, { processDueEntries: false });
+      const current = await this.outbox.read(entry.event.eventId);
+      if (!current || !outboxEntryDue(current, this.now(), force)) {
+        return;
+      }
+      await this.deliverUnlocked(current);
       return;
     }
     await this.deliverUnlocked(entry);
   }
 
+  private async reconcileRunUpdateAtDeliveryBoundary(
+    entry: WebhookOutboxEntry,
+    force: boolean
+  ): Promise<WebhookOutboxEntry | undefined> {
+    if (entry.event.eventType !== "run.update") {
+      return undefined;
+    }
+    const subjectId = lifecycleLockSubjectId(entry.event.runId);
+    return await this.withRunUpdateQueueLock(subjectId, async () => {
+      const current = await this.outbox.read(entry.key);
+      if (
+        !current
+        || current.event.eventType !== "run.update"
+        || !outboxEntryDue(current, this.now(), force)
+      ) {
+        return undefined;
+      }
+      const reconciliation = await this.reconcileRunUpdateForQueue(current.event, current.subjectId, {
+        // A crash can leave an attempted claim in `pending`; firstAttemptAt is
+        // therefore the durable stale-claim proof, in addition to the explicit
+        // retry/blocked states. Fresh pending rows must retain normal live
+        // equal-total authority (for example a Codex turn replacing requests).
+        preservePublishedContextHighWater: current.firstAttemptAt != null
+          || current.deliveryState === "retry"
+          || current.deliveryState === "blocked"
+      });
+      const replacement = reconciliation.event;
+      const replacementKeyChanged = Boolean(
+        replacement && replacement.eventId !== current.event.eventId
+      );
+      const replacementMeaningChanged = Boolean(
+        replacement
+        && runUpdatedMeaningHash(replacement) !== runUpdatedMeaningHash(current.event)
+      );
+      if (replacement && (replacementKeyChanged || replacementMeaningChanged)) {
+        // Persist the merged projection through the complete queue path before
+        // retiring this claim. A content-derived replacement ID must receive a
+        // fresh delivery claim; never send it under the stale row's key.
+        await this.queueEventUnlocked(replacement, current.subjectId);
+      }
+      await this.suppressSupersededRunUpdates(reconciliation.superseded, {
+        preDeliveryClaimKey: current.key
+      });
+      if (replacementKeyChanged) {
+        this.deliveryRerunRequested = true;
+        return undefined;
+      }
+      const reconciled = await this.outbox.read(current.key);
+      return reconciled
+        && reconciled.event.eventType === "run.update"
+        && outboxEntryDue(reconciled, this.now(), force)
+        ? reconciled
+        : undefined;
+    });
+  }
+
   private async deliverUnlocked(entry: WebhookOutboxEntry): Promise<void> {
+    if (this.stopping) {
+      return;
+    }
     const configuration = this.configuration.readStored();
     if (
       (entry.eventType === "run.start" || entry.eventType === "run.update")
@@ -2411,6 +3850,9 @@ export class ExternalWebhookDispatchService {
       updatedAt: attemptAt
     };
     await this.outbox.upsert(attempting);
+    if (this.stopping) {
+      return;
+    }
     this.recordDeliveryLifecycle(entry, "attempt_started", "webhook_delivery_attempt_started");
     try {
       const result = await postWebhook(configuration, entry.event, attemptAt, this.requestTimeoutMs);
@@ -2487,10 +3929,16 @@ export class ExternalWebhookDispatchService {
     const deliveredVersion = event.version ?? 1;
     const existingVersion = existing?.version ?? 0;
     if (existing && existingVersion > deliveredVersion) {
+      const latest = existing.eventId ? await this.outbox.read(existing.eventId) : undefined;
       await this.subjects.write({
         ...existing,
         deliveredAt: existing.deliveredAt ?? deliveredAt,
-        filesChangedCount: Math.max(existing.filesChangedCount ?? 0, (event.filesChanged ?? []).length),
+        // The subject already points at a higher queued correction. Preserve
+        // that projection's count rather than reintroducing a stale file
+        // high-water when the older terminal delivery completes afterward.
+        filesChangedCount: latest?.event.eventType === "run.ended"
+          ? (latest.event.filesChanged ?? []).length
+          : existing.filesChangedCount ?? (event.filesChanged ?? []).length,
         updatedAt: deliveredAt
       });
       this.finalizeLiveSubjectAfterDelivery(event);
@@ -2511,7 +3959,14 @@ export class ExternalWebhookDispatchService {
   }
 
   private finalizeLiveSubjectAfterDelivery(event: RunEndedWebhookEventV1): void {
-    if (event.coverage.usageCoverage === "final") {
+    // Final token accounting does not make a Claude tool decision immutable.
+    // Retain the bounded source/path state whenever it contains a semantic
+    // write or native decision candidate, so an exact late decision can still
+    // issue a source-scoped terminal correction.
+    if (
+      event.coverage.usageCoverage === "final"
+      && !this.hasRetainedNativePermissionCorrectionCandidate(event.runId)
+    ) {
       this.releaseLiveSubject(event.runId);
       return;
     }
@@ -2538,6 +3993,7 @@ export class ExternalWebhookDispatchService {
     this.liveRunSources.delete(subjectRunId);
     this.liveRunSubjects.delete(subjectRunId);
     this.liveTerminalAnchors.delete(subjectRunId);
+    this.liveTerminalArtifactPaths.delete(subjectRunId);
     for (const [queryId, mappedSubjectRunId] of this.liveQuerySubjects) {
       if (mappedSubjectRunId === subjectRunId) {
         this.liveQuerySubjects.delete(queryId);
@@ -2548,6 +4004,23 @@ export class ExternalWebhookDispatchService {
         this.liveSessionSubjects.delete(sessionId);
       }
     }
+  }
+
+  private hasRetainedNativePermissionCorrectionCandidate(subjectRunId: string): boolean {
+    const sources = this.liveRunSources.get(subjectRunId);
+    if (!sources) {
+      return false;
+    }
+    for (const node of sources.executionNodes.values()) {
+      if (node.provider !== "claude-code" || node.nodeKind !== "tool") {
+        continue;
+      }
+      if (isSuccessfulSemanticWriteNode(node) || isNativePermissionRejectionExecutionNode(node)) {
+        return true;
+      }
+    }
+    return [...sources.activityAtoms.values()].some((activity) =>
+      activity.provider === "claude-code" && activity.kind === "tool");
   }
 
   private async runEndedDeliveredForLifecycleSubject(
@@ -2996,7 +4469,13 @@ function compareWebhookOutboxEntries(left: WebhookOutboxEntry, right: WebhookOut
   const leftLifecycle = lifecycleSortKey(left);
   const rightLifecycle = lifecycleSortKey(right);
   if (leftLifecycle && rightLifecycle && leftLifecycle.runSubject === rightLifecycle.runSubject) {
-    return leftLifecycle.order - rightLifecycle.order
+    // A Claude closed-root terminal has a fixed customer-visible deadline. If
+    // its replaceable settling snapshot becomes due at that same deadline,
+    // deliver the terminal first; a successful terminal already suppresses the
+    // pending update, while a failed terminal leaves that snapshot available.
+    const terminalPreemption = sameRunTerminalPreemptionOrder(left, right);
+    return terminalPreemption
+      || leftLifecycle.order - rightLifecycle.order
       || left.updatedAt.localeCompare(right.updatedAt)
       || left.key.localeCompare(right.key);
   }
@@ -3019,9 +4498,13 @@ function webhookDeliveryPriority(entry: WebhookOutboxEntry): number {
   if (lifecycle) {
     const eventPriority = entry.eventType === "run.start"
       ? 0
-      : entry.eventType === "run.update"
+      : isClaudeClosedRootTerminal(entry)
+        ? 0.5
+      : entry.eventType === "run.update" && entry.event.state === "settling"
         ? 1
-        : 2;
+        : entry.eventType === "run.ended"
+          ? 2
+          : 3;
     const statePriority = entry.deliveryState === "pending" && entry.attempts === 0
       ? 0
       : entry.deliveryState === "pending"
@@ -3039,12 +4522,51 @@ function lifecycleSortKey(entry: WebhookOutboxEntry): { runSubject: string; orde
     return { runSubject: entry.subjectId.slice("run.start:".length), order: 1 };
   }
   if (entry.eventType === "run.update") {
-    return { runSubject: entry.subjectId.slice("run.update:".length), order: 2 };
+    return {
+      runSubject: entry.subjectId.slice("run.update:".length),
+      order: entry.event.state === "settling" ? 2 : 4
+    };
   }
   if (entry.eventType === "run.ended") {
     return { runSubject: entry.subjectId.slice("run.ended:".length), order: 3 };
   }
   return undefined;
+}
+
+function sameRunTerminalPreemptionOrder(left: WebhookOutboxEntry, right: WebhookOutboxEntry): number {
+  if (isClaudeClosedRootTerminal(left) && isSettlingRunUpdate(right)) {
+    return -1;
+  }
+  if (isSettlingRunUpdate(left) && isClaudeClosedRootTerminal(right)) {
+    return 1;
+  }
+  return 0;
+}
+
+function isClaudeClosedRootTerminal(entry: WebhookOutboxEntry): boolean {
+  return entry.event.eventType === "run.ended"
+    && entry.event.codingHarness === "claude-code"
+    && entry.event.runtime === "claude-code"
+    && entry.event.evidence.basis === "root_span"
+    && !entry.event.evidence.delayed;
+}
+
+function isSettlingRunUpdate(entry: WebhookOutboxEntry): boolean {
+  return entry.event.eventType === "run.update" && entry.event.state === "settling";
+}
+
+function lifecycleDeliveryRunSubject(entry: WebhookOutboxEntry): string | undefined {
+  return entry.event.eventType === "commit.attributed" ? undefined : entry.event.runId;
+}
+
+function isLifecycleAnchorDelivery(entry: WebhookOutboxEntry): boolean {
+  return entry.event.eventType === "run.start"
+    || entry.event.eventType === "run.ended"
+    || (entry.event.eventType === "run.update" && entry.event.state === "settling");
+}
+
+function lifecycleLockSubjectId(runId: string): string {
+  return `run.ended:${runId}`;
 }
 
 function runSubjectFromLifecycleSubject(
@@ -3126,15 +4648,37 @@ function webhookEvidence(
 }
 
 function evidenceForRun(run: ProductionRunV1, basis: WebhookEvidenceV1["basis"]): WebhookEvidenceV1 {
-  const observedAt = basis === "stop_hook" || basis === "usage_projection"
-    ? (run.endedAt ?? run.startedAt)
-    : run.startedAt;
+  const observedAt = run.endedAt ?? run.startedAt;
+  const retainedProviderTerminalTime = run.completionOutcome != null && basis !== "usage_projection";
   return webhookEvidence(
     basis,
     run.queryId ?? run.correlationId ?? run.runId,
     observedAt,
-    basis === "usage_projection"
+    true,
+    "tirion-run-lifecycle-v1",
+    retainedProviderTerminalTime
+      ? { identityConfidence: "high", timingConfidence: "high" }
+      : undefined
   );
+}
+
+function completionEvidenceBasisForRun(run: ProductionRunV1): WebhookEvidenceV1["basis"] | undefined {
+  if (!run.completionOutcome) {
+    return undefined;
+  }
+  switch (run.completionEvidence) {
+    case "stop_hook":
+      return "stop_hook";
+    case "session_hook":
+      return "session_hook";
+    case "closed_root_span":
+      return "root_span";
+    case "provider_completed_event":
+      return "otel_event";
+    case "inactivity":
+    case undefined:
+      return undefined;
+  }
 }
 
 function webhookCoverage(
@@ -3277,6 +4821,7 @@ function activityFromBreakdown(
     outcome: webhookActivityOutcome(breakdown),
     count: breakdown.count,
     failureCount: breakdown.failureCount,
+    ...(breakdown.rejectedCount != null ? { rejectedCount: breakdown.rejectedCount } : {}),
     ...(breakdown.unknownCount != null ? { unknownCount: breakdown.unknownCount } : {}),
     startedAt: run.startedAt,
     endedAt: activityEndedAt,
@@ -3307,10 +4852,14 @@ function webhookActivityOutcome(breakdown: RunBreakdownV1): RunLifecycleActivity
     return "unknown";
   }
   const unknownCount = breakdown.unknownCount ?? 0;
+  const rejectedCount = breakdown.rejectedCount ?? 0;
   if (breakdown.failureCount === 0 && unknownCount === 0) {
     return "success";
   }
-  return breakdown.failureCount >= breakdown.count && unknownCount === 0 ? "failure" : "unknown";
+  if (breakdown.failureCount >= breakdown.count && unknownCount === 0) {
+    return rejectedCount >= breakdown.count ? "rejected" : "failure";
+  }
+  return "unknown";
 }
 
 function breakdownTokenTotals(breakdown: RunBreakdownV1): RunTokenTotals & { present: boolean; valid: boolean } {
@@ -3342,7 +4891,10 @@ function breakdownTokenTotals(breakdown: RunBreakdownV1): RunTokenTotals & { pre
   };
 }
 
-function tokenTotalsForRun(run: ProductionRunV1): RunTokenTotals {
+function tokenTotalsForRun(run: Pick<
+  ProductionRunV1,
+  "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens" | "reasoningOutputTokens"
+>): RunTokenTotals {
   return {
     inputTokens: nonNegativeToken(run.inputTokens),
     outputTokens: nonNegativeToken(run.outputTokens),
@@ -3448,7 +5000,7 @@ function isLiveLifecycleAnchorOccurrence(
   if (occurrence.lifecycleVisibility === "internal") {
     return false;
   }
-  if (provider === "codex") {
+  if (provider === "codex" || provider === "claude-code") {
     return occurrence.evidence === "submission_hook";
   }
   if (provider === "github-copilot") {
@@ -3466,7 +5018,8 @@ function isExplicitLiveTerminalOccurrence(
   return typeof occurrence.completedAt === "string"
     && occurrence.completedAt.trim() !== ""
     && occurrence.completionEvidence != null
-    && occurrence.completionEvidence !== "inactivity";
+    && occurrence.completionEvidence !== "inactivity"
+    && isValidLiveTerminalBoundary(occurrence.completedAt, occurrence.startedAt);
 }
 
 function liveTerminalEvidenceBasis(
@@ -3551,7 +5104,12 @@ function projectLiveRunUpdatedEvents(
   const queryIds = liveUpdateQueryIds(observation);
   return queryIds.flatMap((queryId) => {
     const usageAtoms = observation.usageAtoms.filter((atom) => (atom.queryId ?? atom.correlationId) === queryId);
-    const activityAtoms = (observation.activityAtoms ?? []).filter((atom) => atom.queryId === queryId);
+    // Live observations are emitted before the completed-run projector runs.
+    // Apply the same exact native-decision canonicalization here, rather than
+    // waiting for shadow usage, so a generic tool result cannot briefly
+    // publish alongside (or outrank) its provider-native rejection.
+    const activityAtoms = preferredSafeActivities((observation.activityAtoms ?? [])
+      .filter((atom) => atom.queryId === queryId));
     const executionNodes = (observation.executionNodes ?? []).filter((node) =>
       node.queryId === queryId && node.nodeKind !== "prompt"
     );
@@ -3692,16 +5250,29 @@ function suppressCorroboratingLiveUsageDuplicates(observation: SafeObservationV1
   if (requestEvidence.length === 0) {
     return observation;
   }
-  const duplicateAtomIds = new Set<string>();
-  for (const atom of observation.usageAtoms) {
-    if (atom.authority !== "event") {
-      continue;
+  const eventEvidence = observation.usageAtoms.filter((atom) => atom.authority === "event");
+  const requestsByEventAtomId = new Map<string, SafeUsageAtomV1[]>();
+  const eventsByRequestAtomId = new Map<string, SafeUsageAtomV1[]>();
+  for (const event of eventEvidence) {
+    const candidates = requestEvidence.filter((request) => corroboratesLiveUsageAtom(event, request));
+    requestsByEventAtomId.set(event.atomId, candidates);
+    for (const request of candidates) {
+      eventsByRequestAtomId.set(request.atomId, [
+        ...(eventsByRequestAtomId.get(request.atomId) ?? []),
+        event
+      ]);
     }
-    const candidates = requestEvidence.filter((candidate) =>
-      corroboratesLiveUsageAtom(atom, candidate)
-    );
-    if (candidates.length === 1) {
-      duplicateAtomIds.add(atom.atomId);
+  }
+  const duplicateAtomIds = new Set<string>();
+  for (const event of eventEvidence) {
+    const candidates = requestsByEventAtomId.get(event.atomId) ?? [];
+    const request = candidates[0];
+    if (
+      candidates.length === 1
+      && request
+      && eventsByRequestAtomId.get(request.atomId)?.length === 1
+    ) {
+      duplicateAtomIds.add(event.atomId);
     }
   }
   if (duplicateAtomIds.size === 0) {
@@ -3784,22 +5355,49 @@ function observationQueryIds(observation: SafeObservationV1): string[] {
 
 function mergeRunUpdatedWebhookEvents(
   previous: RunUpdatedWebhookEventV1,
-  next: RunUpdatedWebhookEventV1
+  next: RunUpdatedWebhookEventV1,
+  options: RunUpdateReconciliationOptions = {}
 ): RunUpdatedWebhookEventV1 {
-  const activity = mergeLifecycleActivity(previous.activity, next.activity);
-  const tokenTotals = tokenTotalsFromLifecycleActivity(activity);
-  const context = mergeRunUpdateContextFootprint(previous.context, next.context, tokenTotals, activity);
+  if (runUpdateStateRank(next.state) < runUpdateStateRank(previous.state)) {
+    return previous;
+  }
+  const previousTotals = runUpdateTokenTotals(previous);
+  const nextTotals = runUpdateTokenTotals(next);
+  const explicitSourcePruning = isExplicitRunUpdateSourcePruning(previous, next);
+  const tokenTotals = explicitSourcePruning
+    ? nextTotals
+    : maxRunTokenTotals(previousTotals, nextTotals);
+  const activity = conserveRunUpdateHighWaterUsage({
+    ...next,
+    activity: explicitSourcePruning
+      ? next.activity
+      : mergeRunUpdateActivityHighWater(previous.activity, next.activity)
+  }, tokenTotals);
+  const context = explicitSourcePruning
+    ? next.context
+    : options.preservePublishedContextHighWater
+      ? mergeRunUpdateContextFootprint(previous.context, next.context, tokenTotals, activity, true)
+      : next.context && terminalTokenTotalsEqual(previousTotals, nextTotals)
+        ? next.context
+        : mergeRunUpdateContextFootprint(previous.context, next.context, tokenTotals, activity);
   const merged: RunUpdatedWebhookEventV1 = {
     ...next,
     // The first delivered lifecycle anchor is public identity. A later usage
     // projection can improve terminal facts, but never move the run's start.
     startedAt: previous.startedAt,
-    traceIds: uniqueStrings([...previous.traceIds, ...next.traceIds]),
-    evidence: next.evidence,
-    coverage: next.coverage,
+    traceIds: explicitSourcePruning
+      ? next.traceIds
+      : uniqueStrings([...previous.traceIds, ...next.traceIds]),
+    evidence: preferredWebhookEvidence(previous.evidence, next.evidence),
+    coverage: mergeTerminalCoverage(previous.coverage, next.coverage),
+    state: runUpdateStateRank(next.state) >= runUpdateStateRank(previous.state)
+      ? next.state
+      : previous.state,
     updatedAt: latestIso([previous.updatedAt, next.updatedAt]),
     ...tokenTotals,
-    llmModels: uniqueStrings([...previous.llmModels, ...next.llmModels]),
+    llmModels: explicitSourcePruning
+      ? next.llmModels
+      : uniqueStrings([...previous.llmModels, ...next.llmModels]),
     ...(context ? { context } : {}),
     activity
   };
@@ -3808,8 +5406,287 @@ function mergeRunUpdatedWebhookEvents(
     merged,
     activityCost.costCoverage !== "unavailable"
       ? activityCost
-      : preferredLiveRunUpdateCost(previous, next)
+      : preferredLiveRunUpdateCost(previous, next, tokenTotals)
   );
+}
+
+function mergeRunUpdateActivityHighWater(
+  previous: RunLifecycleActivityWebhookV1[],
+  next: RunLifecycleActivityWebhookV1[]
+): RunLifecycleActivityWebhookV1[] {
+  const corroboration = suppressExactCorroboratingRunUpdateActivity(previous, next);
+  const nextByIdentity = new Map<string, RunLifecycleActivityWebhookV1>();
+  for (const activity of corroboration.next) {
+    const identity = terminalActivityIdentity(activity);
+    const existing = nextByIdentity.get(identity);
+    nextByIdentity.set(identity, existing ? mergeTerminalActivityRow(existing, activity) : activity);
+  }
+  return mergeTerminalActivity(corroboration.previous, corroboration.next)
+    .filter((activity) =>
+      nextByIdentity.has(terminalActivityIdentity(activity))
+      || !corroboration.next.some((candidate) => isExactRunUpdateActivityReplacement(activity, candidate))
+    )
+    .map((activity) => nextByIdentity.get(terminalActivityIdentity(activity)) ?? activity);
+}
+
+function suppressExactCorroboratingRunUpdateActivity(
+  previous: RunLifecycleActivityWebhookV1[],
+  next: RunLifecycleActivityWebhookV1[]
+): {
+  previous: RunLifecycleActivityWebhookV1[];
+  next: RunLifecycleActivityWebhookV1[];
+} {
+  const previousMatches = new Map<string, RunLifecycleActivityWebhookV1[]>();
+  const nextMatches = new Map<string, RunLifecycleActivityWebhookV1[]>();
+  for (const prior of previous) {
+    const matches = next.filter((candidate) => exactCorroboratingRunUpdateLlmActivity(prior, candidate));
+    previousMatches.set(terminalActivityIdentity(prior), matches);
+    for (const candidate of matches) {
+      const identity = terminalActivityIdentity(candidate);
+      nextMatches.set(identity, [...(nextMatches.get(identity) ?? []), prior]);
+    }
+  }
+  const isMutuallyUniquePair = (
+    left: RunLifecycleActivityWebhookV1,
+    right: RunLifecycleActivityWebhookV1
+  ): boolean => previousMatches.get(terminalActivityIdentity(left))?.length === 1
+    && nextMatches.get(terminalActivityIdentity(right))?.length === 1;
+  return {
+    previous: previous.filter((prior) => {
+      const candidate = previousMatches.get(terminalActivityIdentity(prior))?.[0];
+      return !candidate
+        || !isMutuallyUniquePair(prior, candidate)
+        || compareRunUpdateActivityAuthority(prior, candidate) >= 0;
+    }),
+    next: next.filter((candidate) => {
+      const prior = nextMatches.get(terminalActivityIdentity(candidate))?.[0];
+      return !prior
+        || !isMutuallyUniquePair(prior, candidate)
+        || compareRunUpdateActivityAuthority(candidate, prior) >= 0;
+    })
+  };
+}
+
+function exactCorroboratingRunUpdateLlmActivity(
+  left: RunLifecycleActivityWebhookV1,
+  right: RunLifecycleActivityWebhookV1
+): boolean {
+  if (
+    left.kind !== "llm_request"
+    || right.kind !== "llm_request"
+    || left.activityId === right.activityId
+    || terminalActivitySemanticKey(left) !== terminalActivitySemanticKey(right)
+    || (left.count ?? 1) !== 1
+    || (right.count ?? 1) !== 1
+    || left.evidence.basis === right.evidence.basis
+    || left.evidence.sourceId === right.evidence.sourceId
+    || left.parentActivityId !== right.parentActivityId
+    || terminalActivityUsageKey(left) == null
+    || terminalActivityUsageKey(left) !== terminalActivityUsageKey(right)
+  ) {
+    return false;
+  }
+  const leftCompletedMs = Date.parse(left.endedAt ?? left.startedAt);
+  const rightCompletedMs = Date.parse(right.endedAt ?? right.startedAt);
+  return Number.isFinite(leftCompletedMs)
+    && Number.isFinite(rightCompletedMs)
+    && Math.abs(leftCompletedMs - rightCompletedMs) <= LIVE_USAGE_CORROBORATION_MS;
+}
+
+function compareRunUpdateActivityAuthority(
+  left: RunLifecycleActivityWebhookV1,
+  right: RunLifecycleActivityWebhookV1
+): number {
+  const leftOutcome = left.outcome === "unknown" ? 0 : 1;
+  const rightOutcome = right.outcome === "unknown" ? 0 : 1;
+  return leftOutcome - rightOutcome
+    || webhookEvidenceScore(left.evidence) - webhookEvidenceScore(right.evidence);
+}
+
+function isExactRunUpdateActivityReplacement(
+  previous: RunLifecycleActivityWebhookV1,
+  next: RunLifecycleActivityWebhookV1
+): boolean {
+  // Different public IDs can describe a correction of the same native call
+  // when two safe sources project it independently. Exact semantic and timing
+  // identity is necessary but not sufficient: parallel calls can share all
+  // three. The incoming row must additionally carry a more conclusive outcome
+  // without weaker evidence, or strictly stronger evidence for an equally
+  // conclusive outcome. Authoritative usage projections remain replacements.
+  if (
+    terminalActivitySemanticKey(previous) !== terminalActivitySemanticKey(next)
+    || previous.startedAt !== next.startedAt
+    || previous.endedAt !== next.endedAt
+  ) {
+    return false;
+  }
+  if (next.evidence.basis === "usage_projection") {
+    return true;
+  }
+  const previousOutcome = previous.outcome === "unknown" ? 0 : 1;
+  const nextOutcome = next.outcome === "unknown" ? 0 : 1;
+  const previousEvidence = webhookEvidenceScore(previous.evidence);
+  const nextEvidence = webhookEvidenceScore(next.evidence);
+  return (nextOutcome > previousOutcome && nextEvidence >= previousEvidence)
+    || (nextOutcome >= previousOutcome && nextEvidence > previousEvidence);
+}
+
+function preferredUnpublishedRunUpdate(
+  previous: RunUpdatedWebhookEventV1,
+  next: RunUpdatedWebhookEventV1
+): RunUpdatedWebhookEventV1 {
+  const comparison = runUpdateProjectionOrder(previous, next);
+  return comparison <= 0 ? next : previous;
+}
+
+function runUpdateProjectionOrder(
+  left: RunUpdatedWebhookEventV1,
+  right: RunUpdatedWebhookEventV1
+): number {
+  return runUpdateStateRank(left.state) - runUpdateStateRank(right.state)
+    || left.updatedAt.localeCompare(right.updatedAt)
+    || left.totalTokens - right.totalTokens;
+}
+
+function nextIsoMillisecond(value: string): string {
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+    ? new Date(milliseconds + 1).toISOString()
+    : value;
+}
+
+function runUpdateStateRank(state: RunUpdatedWebhookEventV1["state"]): number {
+  return state === "settling" ? 2 : 1;
+}
+
+function runUpdateTokenTotals(event: RunUpdatedWebhookEventV1): RunTokenTotals {
+  return {
+    inputTokens: nonNegativeToken(event.inputTokens),
+    outputTokens: nonNegativeToken(event.outputTokens),
+    cacheReadInputTokens: nonNegativeToken(event.cacheReadInputTokens),
+    cacheCreationInputTokens: nonNegativeToken(event.cacheCreationInputTokens),
+    reasoningOutputTokens: nonNegativeToken(event.reasoningOutputTokens),
+    totalTokens: nonNegativeToken(event.inputTokens) + nonNegativeToken(event.outputTokens)
+  };
+}
+
+function tokenTotalsStrictlyDominate(left: RunTokenTotals, right: RunTokenTotals): boolean {
+  const atLeast = left.inputTokens >= right.inputTokens
+    && left.outputTokens >= right.outputTokens
+    && left.cacheReadInputTokens >= right.cacheReadInputTokens
+    && left.cacheCreationInputTokens >= right.cacheCreationInputTokens
+    && left.reasoningOutputTokens >= right.reasoningOutputTokens;
+  const greater = left.inputTokens > right.inputTokens
+    || left.outputTokens > right.outputTokens
+    || left.cacheReadInputTokens > right.cacheReadInputTokens
+    || left.cacheCreationInputTokens > right.cacheCreationInputTokens
+    || left.reasoningOutputTokens > right.reasoningOutputTokens;
+  return atLeast && greater;
+}
+
+function isExplicitRunUpdateSourcePruning(
+  previous: RunUpdatedWebhookEventV1,
+  next: RunUpdatedWebhookEventV1
+): boolean {
+  if (
+    previous.state !== "running"
+    || next.state !== "running"
+    || !tokenTotalsStrictlyDominate(runUpdateTokenTotals(previous), runUpdateTokenTotals(next))
+  ) {
+    return false;
+  }
+  const previousTraceIds = new Set(previous.traceIds);
+  const nextTraceIds = new Set(next.traceIds);
+  const removedTraceAuthority = previousTraceIds.size > nextTraceIds.size
+    && [...nextTraceIds].every((traceId) => previousTraceIds.has(traceId));
+  const previousRequests = previous.context?.observedLlmRequestCount;
+  const nextRequests = next.context?.observedLlmRequestCount;
+  return removedTraceAuthority
+    && previousRequests != null
+    && nextRequests != null
+    && nextRequests < previousRequests
+    && next.updatedAt >= previous.updatedAt;
+}
+
+function maxRunTokenTotals(left: RunTokenTotals, right: RunTokenTotals): RunTokenTotals {
+  const inputTokens = Math.max(left.inputTokens, right.inputTokens);
+  const outputTokens = Math.max(left.outputTokens, right.outputTokens);
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadInputTokens: Math.max(left.cacheReadInputTokens, right.cacheReadInputTokens),
+    cacheCreationInputTokens: Math.max(left.cacheCreationInputTokens, right.cacheCreationInputTokens),
+    reasoningOutputTokens: Math.max(left.reasoningOutputTokens, right.reasoningOutputTokens),
+    totalTokens: inputTokens + outputTokens
+  };
+}
+
+function conserveRunUpdateHighWaterUsage(
+  event: RunUpdatedWebhookEventV1,
+  target: RunTokenTotals
+): RunLifecycleActivityWebhookV1[] {
+  const remaining: RunTokenTotals = { ...target };
+  const result: RunLifecycleActivityWebhookV1[] = [];
+  let unallocated: RunLifecycleActivityWebhookV1 | undefined;
+  for (const item of [...event.activity].sort(compareLifecycleActivity)) {
+    if (isUnallocatedTerminalActivity(item)) {
+      unallocated = unallocated ? mergeTerminalActivityRow(unallocated, item) : item;
+      continue;
+    }
+    const usage = lifecycleActivityTokenTotals(item);
+    const fits = usage.valid
+      && usage.inputTokens <= remaining.inputTokens
+      && usage.outputTokens <= remaining.outputTokens
+      && usage.cacheReadInputTokens <= remaining.cacheReadInputTokens
+      && usage.cacheCreationInputTokens <= remaining.cacheCreationInputTokens
+      && usage.reasoningOutputTokens <= remaining.reasoningOutputTokens;
+    if (!usage.present || !fits) {
+      result.push(usage.present ? withoutLifecycleActivityUsage(item) : item);
+      continue;
+    }
+    remaining.inputTokens -= usage.inputTokens;
+    remaining.outputTokens -= usage.outputTokens;
+    remaining.cacheReadInputTokens -= usage.cacheReadInputTokens;
+    remaining.cacheCreationInputTokens -= usage.cacheCreationInputTokens;
+    remaining.reasoningOutputTokens -= usage.reasoningOutputTokens;
+    remaining.totalTokens = remaining.inputTokens + remaining.outputTokens;
+    result.push({
+      ...item,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      reasoningOutputTokens: usage.reasoningOutputTokens,
+      totalTokens: usage.totalTokens
+    });
+  }
+  if (hasTokenUsage(remaining)) {
+    const evidence = unallocated?.evidence ?? event.evidence;
+    result.push({
+      ...(unallocated ?? {
+        activityId: `activity_${contentHash({ runId: event.runId, kind: "run_update_high_water_usage" }).slice(0, 24)}`,
+        kind: "unknown" as const,
+        name: "Unallocated run usage",
+        outcome: "unknown" as const,
+        count: 1,
+        failureCount: 0,
+        startedAt: event.startedAt,
+        evidence
+      }),
+      endedAt: event.updatedAt,
+      durationMs: durationMs(unallocated?.startedAt ?? event.startedAt, event.updatedAt),
+      ...remaining,
+      usageAttributionBasis: "unavailable",
+      usageCoverage: result.some(hasLiveActivityUsage) ? "partial" : "unavailable",
+      evidence
+    });
+  }
+  return result.sort(compareLifecycleActivity);
+}
+
+function runUpdatedMeaningHash(event: RunUpdatedWebhookEventV1): string {
+  const { eventId: _eventId, ...meaning } = event;
+  return contentHash(meaning);
 }
 
 function liveRunUpdateCostFromUsageAtoms(
@@ -3868,15 +5745,17 @@ function liveRunUpdateCostFromMergedActivity(event: RunUpdatedWebhookEventV1): L
   );
 }
 
-function liveRunUpdateCostFromProjectedRun(run: ProductionRunV1 | undefined): LiveRunUpdateCost {
-  if (!run || typeof run.estimatedNanoUsd !== "number") {
+function liveRunUpdateCostFromProjectedRun(run: ProductionRunV1 | ShadowRunV1 | undefined): LiveRunUpdateCost {
+  if (!run) {
     return unavailableLiveRunUpdateCost();
   }
+  const estimatedNanoUsd = run.estimatedNanoUsd;
+  const hasEstimatedCost = typeof estimatedNanoUsd === "number";
   return {
-    estimatedNanoUsd: run.estimatedNanoUsd,
+    estimatedNanoUsd: hasEstimatedCost ? estimatedNanoUsd : 0,
     ...(typeof run.usageValueNanoUsd === "number" ? { usageValueNanoUsd: run.usageValueNanoUsd } : {}),
-    costEstimateBasis: normalizeCostEstimateBasis(run.costEstimateBasis),
-    costCoverage: run.costCoverage
+    costEstimateBasis: hasEstimatedCost ? normalizeCostEstimateBasis(run.costEstimateBasis) : "unavailable",
+    costCoverage: hasEstimatedCost ? run.costCoverage : "unavailable"
   };
 }
 
@@ -3889,20 +5768,24 @@ function unavailableLiveRunUpdateCost(): LiveRunUpdateCost {
 }
 
 function aggregateLiveRunUpdateCost(events: RunUpdatedWebhookEventV1[]): LiveRunUpdateCost {
-  const usageEvents = events.filter((event) => event.totalTokens > 0);
+  const usageEvents = events.filter((event) => hasTokenUsage(runUpdateTokenTotals(event)));
   const costs = usageEvents.map(liveRunUpdateCostFromEvent);
+  const usageValueNanoUsd = costs.length > 0
+    && costs.every((cost) => typeof cost.usageValueNanoUsd === "number")
+    ? sumOptionalNumbers(costs.map((cost) => cost.usageValueNanoUsd))
+    : undefined;
   const priced = costs.filter((cost) => cost.costCoverage !== "unavailable");
   if (priced.length === 0) {
-    return unavailableLiveRunUpdateCost();
+    return {
+      ...unavailableLiveRunUpdateCost(),
+      ...(typeof usageValueNanoUsd === "number" ? { usageValueNanoUsd } : {})
+    };
   }
   const bases = uniqueStrings(priced.map((cost) => cost.costEstimateBasis)
     .filter((basis) => basis !== "unavailable"));
-  const usageValues = priced
-    .map((cost) => cost.usageValueNanoUsd)
-    .filter((value): value is number => typeof value === "number");
   return {
     estimatedNanoUsd: sumOptionalNumbers(priced.map((cost) => cost.estimatedNanoUsd)),
-    ...(usageValues.length > 0 ? { usageValueNanoUsd: sumOptionalNumbers(usageValues) } : {}),
+    ...(typeof usageValueNanoUsd === "number" ? { usageValueNanoUsd } : {}),
     costEstimateBasis: bases.length === 1
       ? bases[0] as CostEstimateBasis
       : "unavailable",
@@ -3933,10 +5816,25 @@ function applyLiveRunUpdateCost(
 
 function preferredLiveRunUpdateCost(
   previous: RunUpdatedWebhookEventV1,
-  next: RunUpdatedWebhookEventV1
+  next: RunUpdatedWebhookEventV1,
+  targetTotals: RunTokenTotals
 ): LiveRunUpdateCost {
   const previousCost = liveRunUpdateCostFromEvent(previous);
   const nextCost = liveRunUpdateCostFromEvent(next);
+  const matchesPrevious = terminalTokenTotalsEqual(targetTotals, runUpdateTokenTotals(previous));
+  const matchesNext = terminalTokenTotalsEqual(targetTotals, runUpdateTokenTotals(next));
+  if (matchesNext && !matchesPrevious) {
+    return nextCost;
+  }
+  if (matchesPrevious && !matchesNext) {
+    return previousCost;
+  }
+  if (!matchesPrevious && !matchesNext) {
+    const priced = nextCost.costCoverage !== "unavailable" ? nextCost : previousCost;
+    return priced.costCoverage === "unavailable"
+      ? priced
+      : { ...priced, costCoverage: "partial" };
+  }
   return costCoverageRank(nextCost.costCoverage) >= costCoverageRank(previousCost.costCoverage)
     ? nextCost
     : previousCost;
@@ -4002,20 +5900,56 @@ function compareLifecycleActivity(
     || left.activityId.localeCompare(right.activityId);
 }
 
-function hasWriteCapableActivity(activity: RunLifecycleActivityWebhookV1[]): boolean {
-  return activity.some((item) => {
-    if (item.kind !== "tool") {
-      return false;
+type SuccessfulWriteArtifactProjection = {
+  artifactKeys: string[];
+  /** Artifact claims whose exact successful source is contradicted natively. */
+  invalidatedArtifactKeys: string[];
+};
+
+function successfulWriteArtifactProjectionForExecutionNodes(
+  nodes: Iterable<ExecutionNodeAtomV1>
+): SuccessfulWriteArtifactProjection {
+  const executionNodes = [...nodes];
+  const artifactKeys = new Set<string>();
+  const invalidatedArtifactKeys = new Set<string>();
+  for (const node of executionNodes.filter(isSuccessfulSemanticWriteNode)) {
+    const target = hasExactNativePermissionRejectionForExecutionNode(node, executionNodes)
+      ? invalidatedArtifactKeys
+      : artifactKeys;
+    for (const artifactKey of node.artifactKeys ?? []) {
+      target.add(artifactKey);
     }
-    const name = item.name.toLowerCase();
-    return name === "write"
-      || name === "edit"
-      || name === "multiedit"
-      || name === "apply_patch"
-      || name === "patch"
-      || name.includes("write")
-      || name.includes("edit");
-  });
+  }
+  // A separately proven invocation can legitimately produce the same opaque
+  // artifact. Keep it publishable rather than letting one rejected call erase
+  // independent authority.
+  for (const artifactKey of artifactKeys) {
+    invalidatedArtifactKeys.delete(artifactKey);
+  }
+  return {
+    artifactKeys: [...artifactKeys].sort(),
+    invalidatedArtifactKeys: [...invalidatedArtifactKeys].sort()
+  };
+}
+
+function successfulWriteArtifactKeysForExecutionNodes(
+  nodes: Iterable<ExecutionNodeAtomV1>
+): string[] {
+  return successfulWriteArtifactProjectionForExecutionNodes(nodes).artifactKeys;
+}
+
+function isSuccessfulSemanticWriteNode(node: ExecutionNodeAtomV1): boolean {
+  return node.nodeKind === "tool"
+    && node.outcome === "success"
+    && isWorkspaceMutationToolName(node.toolName ?? node.name);
+}
+
+function isWorkspaceMutationToolName(value: string): boolean {
+  return WORKSPACE_MUTATION_TOOL_NAMES.has(normalizedToolName(value));
+}
+
+function normalizedToolName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function tokenTotalsFromLifecycleActivity(activity: RunLifecycleActivityWebhookV1[]): RunTokenTotals {
@@ -4038,13 +5972,20 @@ function mergeRunUpdateContextFootprint(
   previous: RunContextFootprintV1 | undefined,
   next: RunContextFootprintV1 | undefined,
   totals: RunTokenTotals,
-  activity: RunLifecycleActivityWebhookV1[]
+  activity: RunLifecycleActivityWebhookV1[],
+  preserveLatestHighWater = false
 ): RunContextFootprintV1 | undefined {
   if (!previous && !next) {
     return undefined;
   }
   const initialInputContextTokens = previous?.initialInputContextTokens ?? next?.initialInputContextTokens;
-  const latestInputContextTokens = next?.latestInputContextTokens ?? previous?.latestInputContextTokens;
+  const latestCandidates = [
+    previous?.latestInputContextTokens,
+    next?.latestInputContextTokens
+  ].filter((value): value is number => typeof value === "number");
+  const latestInputContextTokens = preserveLatestHighWater
+    ? latestCandidates.length > 0 ? Math.max(...latestCandidates) : undefined
+    : next?.latestInputContextTokens ?? previous?.latestInputContextTokens;
   const peakCandidates = [
     previous?.peakInputContextTokens,
     next?.peakInputContextTokens,
@@ -4061,6 +6002,11 @@ function mergeRunUpdateContextFootprint(
     ? Math.max(0, peakInputContextTokens - initialInputContextTokens)
     : undefined;
   const basisCandidates = uniqueStrings([previous?.basis, next?.basis].filter((value): value is RunContextFootprintV1["basis"] => Boolean(value)));
+  const coverage = preserveLatestHighWater && previous && next
+    ? terminalUsageCoverageRank(next.coverage) >= terminalUsageCoverageRank(previous.coverage)
+      ? next.coverage
+      : previous.coverage
+    : next?.coverage ?? previous?.coverage ?? "complete_so_far";
   return {
     schemaVersion: 1,
     accumulatedInputTokens: totals.inputTokens + totals.cacheReadInputTokens + totals.cacheCreationInputTokens,
@@ -4073,7 +6019,7 @@ function mergeRunUpdateContextFootprint(
     ...(contextGrowthInputTokens != null ? { contextGrowthInputTokens } : {}),
     ...(initialInputContextTokens && peakInputContextTokens != null ? { contextGrowthRatio: peakInputContextTokens / initialInputContextTokens } : {}),
     basis: basisCandidates.length === 1 ? basisCandidates[0] as RunContextFootprintV1["basis"] : "derived_from_usage_atoms",
-    coverage: next?.coverage ?? previous?.coverage ?? "complete_so_far"
+    coverage
   };
 }
 
@@ -4092,6 +6038,60 @@ function observedLlmRequestActivityCount(activity: RunLifecycleActivityWebhookV1
 function liveRunUpdateEventId(event: RunUpdatedWebhookEventV1): string {
   const { eventId: _eventId, ...meaning } = event;
   return eventIdFor("run.update", contentHash(meaning));
+}
+
+function auxiliarySessionTitleRequestIdsForLiveSources(observation: SafeObservationV1): Set<string> {
+  return new Set([
+    ...observation.usageAtoms,
+    ...(observation.executionNodes ?? [])
+  ]
+    .filter((source) => source.usagePurpose === "auxiliary_session_title")
+    .map((source) => source.requestId)
+    .filter((requestId): requestId is string => requestId != null));
+}
+
+function addBoundedLiveAuxiliaryRequestId(requestIds: Set<string>, requestId: string): boolean {
+  if (requestIds.has(requestId)) {
+    return false;
+  }
+  requestIds.add(requestId);
+  while (requestIds.size > MAX_LIVE_AUXILIARY_SESSION_TITLE_REQUEST_IDS) {
+    const oldest = requestIds.values().next().value as string | undefined;
+    if (oldest == null) {
+      break;
+    }
+    requestIds.delete(oldest);
+  }
+  return true;
+}
+
+function withoutAuxiliarySessionTitleLiveSources(
+  observation: SafeObservationV1,
+  knownAuxiliaryRequestIds: ReadonlySet<string> = new Set<string>()
+): SafeObservationV1 {
+  const auxiliaryRequestIds = auxiliarySessionTitleRequestIdsForLiveSources(observation);
+  for (const requestId of knownAuxiliaryRequestIds) {
+    auxiliaryRequestIds.add(requestId);
+  }
+  const usageAtoms = observation.usageAtoms.filter((atom) =>
+    atom.usagePurpose !== "auxiliary_session_title"
+    && (atom.requestId == null || !auxiliaryRequestIds.has(atom.requestId))
+  );
+  const executionNodes = (observation.executionNodes ?? []).filter((node) =>
+    node.usagePurpose !== "auxiliary_session_title"
+    && (node.requestId == null || !auxiliaryRequestIds.has(node.requestId))
+  );
+  if (
+    usageAtoms.length === observation.usageAtoms.length
+    && executionNodes.length === (observation.executionNodes?.length ?? 0)
+  ) {
+    return observation;
+  }
+  return {
+    ...observation,
+    usageAtoms,
+    executionNodes
+  };
 }
 
 function liveSessionId(observation: SafeObservationV1, queryId: string): string {
@@ -4126,6 +6126,7 @@ function liveWebhookActivity(
     outcome: atom.outcome,
     count: 1,
     failureCount: atom.outcome === "failure" || atom.outcome === "rejected" ? 1 : 0,
+    ...(atom.outcome === "rejected" ? { rejectedCount: 1 } : {}),
     unknownCount: atom.outcome === "unknown" ? 1 : 0,
     startedAt: atom.startedAt,
     endedAt: atom.endedAt,
@@ -4460,6 +6461,57 @@ function liveSourceOverlapsSubject(
   return Number.isFinite(subjectStart) && Number.isFinite(sourceEnd) && sourceEnd >= subjectStart;
 }
 
+function liveSourceBeganOnOrBeforeTerminalBoundary(
+  source: Pick<SafeUsageAtomV1, "startedAt">,
+  completedAt: string
+): boolean {
+  const sourceStartedAt = Date.parse(source.startedAt);
+  const boundaryAt = Date.parse(completedAt);
+  return Number.isFinite(sourceStartedAt)
+    && Number.isFinite(boundaryAt)
+    && sourceStartedAt <= boundaryAt;
+}
+
+function isValidLiveTerminalBoundary(completedAt: string, startedAt: string): boolean {
+  const completedAtMs = Date.parse(completedAt);
+  const startedAtMs = Date.parse(startedAt);
+  return Number.isFinite(completedAtMs)
+    && Number.isFinite(startedAtMs)
+    && completedAtMs >= startedAtMs;
+}
+
+function earliestLiveTerminalCorrectionBoundary(
+  startedAt: string,
+  ...candidates: string[]
+): string {
+  const valid = candidates
+    .filter((candidate) => isValidLiveTerminalBoundary(candidate, startedAt))
+    .sort((left, right) => Date.parse(left) - Date.parse(right));
+  // The caller has an existing explicit anchor. Preserve an invalid value only
+  // until projection rejects it; never silently normalize it into authority.
+  return valid[0] ?? candidates[0]!;
+}
+
+function liveSourcesAtOrBeforeTerminalBoundary<T extends { startedAt: string }>(
+  sources: Iterable<T>,
+  completedAt: string | undefined
+): T[] {
+  const values = [...sources];
+  return completedAt
+    ? values.filter((source) => liveSourceBeganOnOrBeforeTerminalBoundary(source, completedAt))
+    : values;
+}
+
+function executionNodeBeginsAtOrBeforeCompletedBoundary(
+  node: ExecutionNodeAtomV1,
+  completedAt: string | undefined
+): boolean {
+  if (!completedAt) {
+    return true;
+  }
+  return liveSourceBeganOnOrBeforeTerminalBoundary(node, completedAt);
+}
+
 function canonicalLiveUsageAtom(atom: SafeUsageAtomV1, subject: LiveLifecycleSubject): SafeUsageAtomV1 {
   return {
     ...atom,
@@ -4479,6 +6531,44 @@ function canonicalLiveActivityAtom(atom: SafeActivityAtomV1, subject: LiveLifecy
   };
 }
 
+function liveActivityEvidenceKey(atom: SafeActivityAtomV1): string {
+  return atom.outcomeAuthority === "native_permission_decision"
+    ? `${atom.activityId}|native_permission_decision`
+    : atom.activityId;
+}
+
+function isNativePermissionDecisionActivity(atom: SafeActivityAtomV1): boolean {
+  return atom.provider === "claude-code"
+    && atom.kind === "tool"
+    && atom.outcome === "rejected"
+    && atom.outcomeAuthority === "native_permission_decision";
+}
+
+/**
+ * Live webhook activity IDs are the safe atom IDs. When a native decision
+ * arrives after a generic result, retain a small explicit replacement list so
+ * terminal revision merging removes only that exact generic semantic row.
+ * The identity helper gives opaque invocation ID precedence over request ID.
+ */
+function nativePermissionSupersededLiveActivityIds(
+  activities: Iterable<SafeActivityAtomV1>
+): string[] {
+  const values = [...activities];
+  const superseded = new Set<string>();
+  for (const decision of values.filter(isNativePermissionDecisionActivity)) {
+    for (const candidate of values) {
+      if (
+        candidate.activityId !== decision.activityId
+        && !isNativePermissionDecisionActivity(candidate)
+        && sameExactSafeActivityIdentity(candidate, decision)
+      ) {
+        superseded.add(candidate.activityId);
+      }
+    }
+  }
+  return [...superseded].sort();
+}
+
 function canonicalLiveExecutionNode(
   node: NonNullable<SafeObservationV1["executionNodes"]>[number],
   subject: LiveLifecycleSubject
@@ -4494,7 +6584,15 @@ function canonicalLiveExecutionNode(
 }
 
 function clampLiveSourceStart(value: string, lowerBound: string): string {
-  return Date.parse(value) >= Date.parse(lowerBound) ? value : lowerBound;
+  const sourceAt = Date.parse(value);
+  const subjectAt = Date.parse(lowerBound);
+  // Do not turn malformed provider source time into valid pre-terminal
+  // authority. Terminal projection filters invalid source timestamps closed;
+  // preserving the original value lets that filter do its job.
+  if (!Number.isFinite(sourceAt) || !Number.isFinite(subjectAt)) {
+    return value;
+  }
+  return sourceAt >= subjectAt ? value : lowerBound;
 }
 
 function liveTraceIds(observation: SafeObservationV1, queryId: string): string[] {
@@ -4614,6 +6712,9 @@ function aggregateRunBreakdown(runs: ProductionRunV1[], subjectRunId: string): R
       name: group[0].name,
       count: group.reduce((sum, item) => sum + item.count, 0),
       failureCount: group.reduce((sum, item) => sum + item.failureCount, 0),
+      ...(group.some((item) => (item.rejectedCount ?? 0) > 0) ? {
+        rejectedCount: group.reduce((sum, item) => sum + (item.rejectedCount ?? 0), 0)
+      } : {}),
       ...(group.some((item) => item.unknownCount != null) ? {
         unknownCount: group.reduce((sum, item) => sum + (item.unknownCount ?? 0), 0)
       } : {}),
@@ -4732,12 +6833,35 @@ function normalizeRunEndedDraft(event: RunEndedWebhookEventDraft): RunEndedWebho
 
 function monotonicRunEndedRevision(
   previous: RunEndedWebhookEventV1,
-  next: RunEndedWebhookEventDraft
+  next: RunEndedWebhookEventDraft,
+  sourcePrunedFilesChanged: readonly string[] | undefined = undefined,
+  sourcePrunedActivityIds: readonly string[] | undefined = undefined
 ): RunEndedWebhookEventDraft {
-  const preferredCost = preferredTerminalCost(previous, next);
   const preferredUsage = preferredTerminalUsage(previous, next);
-  const coverage = mergeTerminalCoverage(previous.coverage, next.coverage);
+  const preferredCost = preferredUsage === next
+    ? next
+    : preferredTerminalCost(previous, next);
+  const coverage = {
+    ...mergeTerminalCoverage(previous.coverage, next.coverage),
+    costCoverage: preferredCost.costCoverage
+  };
   const preferredContext = preferredTerminalContext(previous.context, next.context);
+  const outcome = preferredTerminalOutcome(previous.outcome, next.outcome);
+  const outcomeSource = outcome ? preferredTerminalOutcomeEventSource(previous, next) : undefined;
+  const sourcePrunedPaths = new Set(safeRepoRelativePaths([...(sourcePrunedFilesChanged ?? [])]));
+  // Terminal revisions are normally monotonic. A caller can remove a path
+  // only by supplying the narrowly mapped output of an exact native
+  // permission contradiction; every other prior path remains unioned.
+  const retainedPreviousFiles = sourcePrunedPaths.size === 0
+    ? previous.filesChanged
+    : previous.filesChanged.filter((path) => !sourcePrunedPaths.has(path));
+  const sourcePrunedActivities = new Set(sourcePrunedActivityIds ?? []);
+  // As with files, terminal activity rows are otherwise monotonic. A native
+  // decision may replace only the exact generic activity identity it
+  // supersedes; unrelated tool rows survive the correction unchanged.
+  const retainedPreviousActivity = sourcePrunedActivities.size === 0
+    ? previous.activity ?? []
+    : (previous.activity ?? []).filter((activity) => !sourcePrunedActivities.has(activity.activityId));
   const merged: RunEndedWebhookEventDraft = {
     ...next,
     sessionId: preferredTerminalSessionId(previous.sessionId, next.sessionId),
@@ -4745,9 +6869,10 @@ function monotonicRunEndedRevision(
       ? previous.repository
       : next.repository,
     startedAt: earliestIso([previous.startedAt, next.startedAt]),
-    endedAt: latestIso([previous.endedAt, next.endedAt]),
-    evidence: preferredWebhookEvidence(previous.evidence, next.evidence),
+    endedAt: outcomeSource?.endedAt ?? latestIso([previous.endedAt, next.endedAt]),
+    evidence: outcomeSource?.evidence ?? preferredWebhookEvidence(previous.evidence, next.evidence),
     coverage,
+    ...(outcome ? { outcome } : {}),
     inputTokens: preferredUsage.inputTokens,
     outputTokens: preferredUsage.outputTokens,
     cacheReadInputTokens: preferredUsage.cacheReadInputTokens,
@@ -4755,7 +6880,7 @@ function monotonicRunEndedRevision(
     reasoningOutputTokens: preferredUsage.reasoningOutputTokens,
     totalTokens: preferredUsage.inputTokens + preferredUsage.outputTokens,
     traceIds: uniqueStrings([...previous.traceIds, ...next.traceIds]),
-    filesChanged: safeRepoRelativePaths([...previous.filesChanged, ...next.filesChanged]),
+    filesChanged: safeRepoRelativePaths([...retainedPreviousFiles, ...next.filesChanged]),
     llmModels: uniqueStrings([...previous.llmModels, ...next.llmModels]),
     estimatedNanoUsd: preferredCost.estimatedNanoUsd,
     usageValueNanoUsd: preferredCost.usageValueNanoUsd,
@@ -4764,9 +6889,67 @@ function monotonicRunEndedRevision(
     // Context is optional. Never relabel a provisional footprint as final merely
     // because final usage arrived from another telemetry surface.
     context: preferredContext?.coverage === coverage.usageCoverage ? preferredContext : undefined,
-    activity: mergeTerminalActivity(previous.activity ?? [], next.activity ?? [])
+    activity: mergeTerminalActivity(retainedPreviousActivity, next.activity ?? [])
   };
   return normalizeRunEndedDraft(merged);
+}
+
+function preferredTerminalOutcome(
+  previous: RunEndedWebhookEventV1["outcome"],
+  next: RunEndedWebhookEventV1["outcome"]
+): RunEndedWebhookEventV1["outcome"] {
+  if (previous === "failure" || next === "failure") return "failure";
+  if (previous === "success" || next === "success") return "success";
+  return next ?? previous;
+}
+
+function terminalOutcomeAuthority(outcome: RunEndedWebhookEventV1["outcome"]): number {
+  if (outcome === "failure") return 3;
+  if (outcome === "success") return 2;
+  if (outcome === "unknown") return 1;
+  return 0;
+}
+
+function preferredTerminalOutcomeEventSource(
+  previous: RunEndedWebhookEventV1,
+  next: RunEndedWebhookEventDraft
+): RunEndedWebhookEventV1 | RunEndedWebhookEventDraft {
+  const previousOutcome = terminalOutcomeAuthority(previous.outcome);
+  const nextOutcome = terminalOutcomeAuthority(next.outcome);
+  if (nextOutcome !== previousOutcome) {
+    return nextOutcome > previousOutcome ? next : previous;
+  }
+  const previousEvidence = webhookEvidenceScore(previous.evidence);
+  const nextEvidence = webhookEvidenceScore(next.evidence);
+  if (nextEvidence !== previousEvidence) {
+    return nextEvidence > previousEvidence ? next : previous;
+  }
+  return next.endedAt >= previous.endedAt ? next : previous;
+}
+
+function preferredLiveTerminalOutcomeSource(
+  existing: LiveTerminalAnchor,
+  incoming: LiveTerminalAnchor
+): LiveTerminalAnchor {
+  const existingOutcome = terminalOutcomeAuthority(existing.completionOutcome);
+  const incomingOutcome = terminalOutcomeAuthority(incoming.completionOutcome);
+  if (incomingOutcome !== existingOutcome) {
+    return incomingOutcome > existingOutcome ? incoming : existing;
+  }
+  const existingEvidence = terminalCompletionEvidenceAuthority(existing.completionEvidence);
+  const incomingEvidence = terminalCompletionEvidenceAuthority(incoming.completionEvidence);
+  if (incomingEvidence !== existingEvidence) {
+    return incomingEvidence > existingEvidence ? incoming : existing;
+  }
+  return incoming.completedAt >= existing.completedAt ? incoming : existing;
+}
+
+function terminalCompletionEvidenceAuthority(
+  evidence: NonNullable<QueryOccurrenceV1["completionEvidence"]>
+): number {
+  if (evidence === "stop_hook" || evidence === "session_hook") return 3;
+  if (evidence === "closed_root_span" || evidence === "provider_completed_event") return 2;
+  return 1;
 }
 
 function preferredTerminalUsage(
@@ -4855,6 +7038,30 @@ function normalizeTerminalActivityBounds(
   runEndedAt: string
 ): RunLifecycleActivityWebhookV1 {
   const startedAt = clampIso(activity.startedAt, runStartedAt, runEndedAt);
+  // A native rejection is a permission decision, never an execution. Preserve
+  // its identity, count, and decision evidence, but do not manufacture an end
+  // time, duration, result, or usage attribution merely because the enclosing
+  // run has closed. This keeps the public lifecycle row faithful to the source
+  // boundary and lets a later decision correction replace only a provisional
+  // generic tool claim.
+  if (activity.outcome === "rejected") {
+    const {
+      endedAt: _endedAt,
+      durationMs: _durationMs,
+      resultSizeBytes: _resultSizeBytes,
+      providerReportedResultTokens: _providerReportedResultTokens,
+      inputTokens: _inputTokens,
+      outputTokens: _outputTokens,
+      cacheReadInputTokens: _cacheReadInputTokens,
+      cacheCreationInputTokens: _cacheCreationInputTokens,
+      reasoningOutputTokens: _reasoningOutputTokens,
+      totalTokens: _totalTokens,
+      usageAttributionBasis: _usageAttributionBasis,
+      usageCoverage: _usageCoverage,
+      ...decision
+    } = activity;
+    return { ...decision, startedAt };
+  }
   const endedAt = activity.endedAt ? clampIso(activity.endedAt, startedAt, runEndedAt) : undefined;
   return {
     ...activity,
@@ -5625,18 +7832,96 @@ function runIdsForCommit(
   return uniqueStrings([...summary.runIds, ...claimedRunIds]);
 }
 
-function artifactKeysForCommitRun(
+function completionBoundariesByQuery(runs: Iterable<ProductionRunV1>): Map<string, string> {
+  const boundaries = new Map<string, string>();
+  const malformedCompletionQueries = new Set<string>();
+  for (const run of runs) {
+    if (run.endedAt == null) {
+      continue;
+    }
+    const queryId = run.queryId ?? run.correlationId;
+    const startedAt = Date.parse(run.startedAt);
+    const completedAt = Date.parse(run.endedAt);
+    if (
+      !Number.isFinite(startedAt)
+      || !Number.isFinite(completedAt)
+      || completedAt < startedAt
+    ) {
+      malformedCompletionQueries.add(queryId);
+      continue;
+    }
+    const existing = boundaries.get(queryId);
+    // Duplicate/replayed completed rows for one opaque query are ambiguous.
+    // Keep the earliest valid boundary: later time may expand revocation
+    // authority, while the earlier boundary preserves the fail-closed fence.
+    if (!existing || completedAt < Date.parse(existing)) {
+      boundaries.set(queryId, run.endedAt);
+    }
+  }
+  for (const queryId of malformedCompletionQueries) {
+    // A present-but-unusable completion must not silently become “no
+    // boundary.” The verifier treats this unparsable marker as ineligible and
+    // therefore fails closed for every proof of that query.
+    boundaries.set(queryId, "invalid_completion_boundary");
+  }
+  return boundaries;
+}
+
+function successfulWriteArtifactProofsForCommitRun(
   workEpisodes: AgenticWorkEpisode[],
   summary: CommitAttributionSummary,
   run: ProductionRunV1
-): string[] {
+): CausalWriteArtifactProof[] {
   const queryId = run.queryId ?? run.correlationId;
-  return uniqueStrings(workEpisodes
+  return causalWriteArtifactProofsFromEvidence(workEpisodes
     .flatMap((episode) => commitEvidenceItemsForEpisode(episode, summary))
     .filter((evidence) =>
       evidence.queryId === queryId || (evidence.runIds ?? []).includes(run.runId)
-    )
-    .flatMap((evidence) => evidence.artifactKeys ?? []));
+    ));
+}
+
+/**
+ * Exact native-rejection markers are intentionally separate from the current
+ * causal proof set. A marker paired with a still-current successful proof is
+ * not a revocation candidate; a valid independent writer must remain active.
+ */
+function nativeRejectedCausalWriteArtifactProofsForCommitRun(
+  workEpisodes: AgenticWorkEpisode[],
+  summary: CommitAttributionSummary,
+  run: ProductionRunV1
+): CausalWriteArtifactProof[] {
+  return nativeRejectedCausalWriteArtifactProofsFromEvidence(
+    nativeRejectedCausalWriteArtifactEvidenceForCommitRun(workEpisodes, summary, run)
+  );
+}
+
+/**
+ * A native-rejection marker is authority only when its producer explicitly
+ * completed the causal-pair census for this commit/run scope. Legacy or
+ * partial evidence may block a new projection, but cannot revoke a prior
+ * externally delivered attribution.
+ */
+function nativeRejectedCausalWriteArtifactCensusForCommitRun(
+  workEpisodes: AgenticWorkEpisode[],
+  summary: CommitAttributionSummary,
+  run: ProductionRunV1
+): boolean {
+  const evidenceItems = nativeRejectedCausalWriteArtifactEvidenceForCommitRun(workEpisodes, summary, run);
+  return evidenceItems.length > 0
+    && evidenceItems.every((evidence) => evidence.causalWriteArtifactsComplete === true);
+}
+
+function nativeRejectedCausalWriteArtifactEvidenceForCommitRun(
+  workEpisodes: AgenticWorkEpisode[],
+  summary: CommitAttributionSummary,
+  run: ProductionRunV1
+): AgenticWorkEpisode["evidence"] {
+  const queryId = run.queryId ?? run.correlationId;
+  return workEpisodes
+    .flatMap((episode) => commitEvidenceItemsForEpisode(episode, summary))
+    .filter((evidence) =>
+      evidence.queryId === queryId || (evidence.runIds ?? []).includes(run.runId)
+    );
 }
 
 function commitEvidenceItemsForEpisode(
@@ -5674,19 +7959,18 @@ function commitQueryIdSet(summary: CommitAttributionSummary): Set<string> {
   return new Set(queryIds);
 }
 
-function artifactKeysForRun(
+function successfulWriteArtifactProofsForRun(
   workEpisodes: AgenticWorkEpisode[],
   repoKey: string,
   run: ProductionRunV1
-): string[] {
+): CausalWriteArtifactProof[] {
   const queryId = run.queryId ?? run.correlationId;
-  return uniqueStrings(workEpisodes.flatMap((episode) =>
+  return causalWriteArtifactProofsFromEvidence(workEpisodes.flatMap((episode) =>
     (episode.evidence ?? [])
       .filter((evidence) =>
         evidence.repoKey === repoKey
         && (evidence.queryId === queryId || (evidence.runIds ?? []).includes(run.runId))
       )
-      .flatMap((evidence) => evidence.causalArtifactKeys ?? [])
   ));
 }
 
@@ -5707,36 +7991,126 @@ function evidenceScopeForQueryIds(
   return { queryIds: scopedQueryIds, runIds };
 }
 
-function artifactKeysForEvidenceScope(
+function successfulWriteArtifactProofsForEvidenceScope(
   episode: AgenticWorkEpisode,
   repoKey: string,
   queryIds: string[],
   runIds: string[]
-): string[] {
+): CausalWriteArtifactProof[] {
   const queryIdSet = new Set(queryIds);
   const runIdSet = new Set(runIds);
-  return uniqueStrings((episode.evidence ?? [])
+  return causalWriteArtifactProofsFromEvidence((episode.evidence ?? [])
     .filter((evidence) =>
       evidence.repoKey === repoKey
       && (
         queryIdSet.has(evidence.queryId)
         || (evidence.runIds ?? []).some((runId) => runIdSet.has(runId))
       )
-    )
-    .flatMap((evidence) => evidence.causalArtifactKeys ?? []));
+    ));
+}
+
+function causalWriteArtifactProofsFromEvidence(
+  evidenceItems: AgenticWorkEpisode["evidence"]
+): CausalWriteArtifactProof[] {
+  return uniqueCausalWriteArtifactProofs(evidenceItems.flatMap((evidence) =>
+    (evidence.causalWriteArtifacts ?? []).map((artifact) => ({
+      queryId: evidence.queryId,
+      repoKey: evidence.repoKey,
+      artifactKey: artifact.artifactKey,
+      executionNodeId: artifact.executionNodeId
+    }))
+  ));
+}
+
+function nativeRejectedCausalWriteArtifactProofsFromEvidence(
+  evidenceItems: AgenticWorkEpisode["evidence"]
+): CausalWriteArtifactProof[] {
+  return uniqueCausalWriteArtifactProofs(evidenceItems.flatMap((evidence) => {
+    const currentPairs = new Set((evidence.causalWriteArtifacts ?? []).map((artifact) =>
+      `${artifact.artifactKey}\u0000${artifact.executionNodeId}`));
+    return (evidence.nativeRejectedCausalWriteArtifacts ?? [])
+      .filter((artifact) => !currentPairs.has(`${artifact.artifactKey}\u0000${artifact.executionNodeId}`))
+      .map((artifact) => ({
+        queryId: evidence.queryId,
+        repoKey: evidence.repoKey,
+        artifactKey: artifact.artifactKey,
+        executionNodeId: artifact.executionNodeId
+      }));
+  }));
+}
+
+function uniqueCausalWriteArtifactProofs(
+  proofs: Iterable<CausalWriteArtifactProof>
+): CausalWriteArtifactProof[] {
+  const byKey = new Map<string, CausalWriteArtifactProof>();
+  for (const proof of proofs) {
+    const key = `${proof.queryId}\u0000${proof.repoKey}\u0000${proof.artifactKey}\u0000${proof.executionNodeId}`;
+    byKey.set(key, proof);
+  }
+  return [...byKey.values()].sort((left, right) =>
+    left.queryId.localeCompare(right.queryId)
+    || left.repoKey.localeCompare(right.repoKey)
+    || left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
 }
 
 function attributedCommitCost(
   summary: CommitAttributionSummary,
-  snapshot: CommitPublicationSnapshot
+  snapshot: CommitPublicationSnapshot,
+  candidateRuns: ProductionRunV1[],
+  writingRuns: ProductionRunV1[]
 ): { estimatedNanoUsd: number; costCoverage: CommitAttributedWebhookEventV1["costCoverage"] } {
   const estimatedNanoUsd = snapshot.allocatedNanoUsd ?? summary.allocatedNanoUsd;
   if (typeof estimatedNanoUsd !== "number") {
     return { estimatedNanoUsd: 0, costCoverage: "unavailable" };
   }
+  const candidateRunIds = new Set(candidateRuns.map((run) => run.runId));
+  if (summary.runIds.some((runId) => !candidateRunIds.has(runId))) {
+    return { estimatedNanoUsd: 0, costCoverage: "unavailable" };
+  }
+  const writingRunIds = new Set(writingRuns.map((run) => run.runId));
+  const everyCandidateWrites = candidateRuns.length === writingRuns.length
+    && candidateRuns.every((run) => writingRunIds.has(run.runId));
+  if (!everyCandidateWrites) {
+    const candidateCost = exactRunCost(candidateRuns);
+    const writingCost = exactRunCost(writingRuns);
+    if (!candidateCost || !writingCost) {
+      return { estimatedNanoUsd: 0, costCoverage: "unavailable" };
+    }
+    const allocationMatchesCandidates = candidateCost.estimatedNanoUsd === estimatedNanoUsd
+      && candidateCost.costCoverage === snapshot.coverage;
+    const allocationAlreadyMatchesWriters = writingCost.estimatedNanoUsd === estimatedNanoUsd
+      && writingCost.costCoverage === snapshot.coverage;
+    if (!allocationMatchesCandidates && !allocationAlreadyMatchesWriters) {
+      return { estimatedNanoUsd: 0, costCoverage: "unavailable" };
+    }
+    return {
+      estimatedNanoUsd: writingCost.estimatedNanoUsd,
+      costCoverage: writingCost.costCoverage
+    };
+  }
   return {
     estimatedNanoUsd,
     costCoverage: snapshot.coverage
+  };
+}
+
+function exactRunCost(
+  runs: ProductionRunV1[]
+): { estimatedNanoUsd: number; costCoverage: CommitAttributedWebhookEventV1["costCoverage"] } | undefined {
+  if (
+    runs.length === 0
+    || runs.some((run) =>
+      typeof run.estimatedNanoUsd !== "number"
+      || run.costCoverage === "unavailable"
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    estimatedNanoUsd: runs.reduce((sum, run) => sum + (run.estimatedNanoUsd ?? 0), 0),
+    costCoverage: runs.every((run) => run.costCoverage === "complete") ? "complete" : "partial"
   };
 }
 
@@ -5881,8 +8255,18 @@ async function postWebhook(
 }
 
 function groupAtomsByQuery(atoms: SafeUsageAtomV1[]): Map<string, SafeUsageAtomV1[]> {
+  const auxiliaryRequestIds = new Set(atoms
+    .filter((atom) => atom.usagePurpose === "auxiliary_session_title")
+    .map((atom) => atom.requestId)
+    .filter((requestId): requestId is string => requestId != null));
   const grouped = new Map<string, SafeUsageAtomV1[]>();
   for (const atom of atoms) {
+    if (
+      atom.usagePurpose === "auxiliary_session_title"
+      || (atom.requestId != null && auxiliaryRequestIds.has(atom.requestId))
+    ) {
+      continue;
+    }
     const queryId = atom.queryId ?? atom.correlationId;
     grouped.set(queryId, [...(grouped.get(queryId) ?? []), atom]);
   }

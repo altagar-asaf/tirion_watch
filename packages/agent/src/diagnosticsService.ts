@@ -12,7 +12,7 @@ import type {
 } from "@tirion/agent-contract";
 import { AgentStorageClient } from "@tirion/agent-storage";
 import { DefaultPrivacyGuard, StateBackedCommitAttributionLedger, type QueryCostAttribution } from "@tirion/engine/production";
-import { SafeStructuredLog } from "./safeStructuredLog";
+import { SafeStructuredLog, type SafeStructuredLogWindow } from "./safeStructuredLog";
 
 const MAX_DIAGNOSTIC_EVENTS = 1000;
 
@@ -98,14 +98,19 @@ export class AgentDiagnosticsService {
     };
   }
 
-  async events(limit = MAX_DIAGNOSTIC_EVENTS): Promise<AgentDiagnosticEventV1[]> {
-    const logged = this.log?.read(limit) ?? [];
+  async events(
+    limit = MAX_DIAGNOSTIC_EVENTS,
+    window?: SafeStructuredLogWindow
+  ): Promise<AgentDiagnosticEventV1[]> {
+    const boundedLimit = Math.max(1, Math.min(Math.floor(limit), MAX_DIAGNOSTIC_EVENTS));
+    const logged = this.log?.read(boundedLimit, window) ?? [];
     if (logged.length > 0) {
       return logged;
     }
     return (await this.storage.listAgentDocuments<AgentDiagnosticEventV1>("diagnostic_event"))
-      .slice(0, Math.max(1, Math.min(limit, MAX_DIAGNOSTIC_EVENTS)))
-      .map((item) => item.value);
+      .map((item) => item.value)
+      .filter((event) => eventWithinWindow(event, window))
+      .slice(0, boundedLimit);
   }
 
   async constructStates(): Promise<AgentConstructStateV1[]> {
@@ -117,6 +122,11 @@ export class AgentDiagnosticsService {
   clearDurableLog(): void {
     this.log?.clear();
   }
+}
+
+function eventWithinWindow(event: AgentDiagnosticEventV1, window?: SafeStructuredLogWindow): boolean {
+  return (!window?.since || event.at >= window.since)
+    && (!window?.until || event.at <= window.until);
 }
 
 async function countVerifiedCommitAttributions(attributions: QueryCostAttribution[]): Promise<number> {

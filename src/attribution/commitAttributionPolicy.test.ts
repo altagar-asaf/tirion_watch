@@ -49,6 +49,58 @@ describe("evaluateCommitAttribution", () => {
     expect(result.decision).toBe("reportable");
   });
 
+  it("retains only the exact causal source pair whose artifact state matched the commit", () => {
+    const item = evidence("state-a");
+    item.causalWriteArtifactsComplete = true;
+    item.causalWriteArtifacts = [
+      { artifactKey: "artifact-a", executionNodeId: "node-write-match" },
+      { artifactKey: "artifact-b", executionNodeId: "node-write-other" }
+    ];
+    item.causalArtifactKeys = ["artifact-a", "artifact-b"];
+    item.artifactStates?.push({
+      artifactKey: "artifact-b",
+      worktreeStateKey: "state-other",
+      changeKind: "modified",
+      observedSequence: 2
+    });
+
+    const result = evaluateCommitAttribution({
+      candidate: candidate("state-a"),
+      episode: episode([item]),
+      lineageVerifiedQueryIds: new Set(["query-1"]),
+      activeQueryIds: new Set(),
+      candidateAnchorQueryIds: new Set()
+    });
+
+    expect(result.proof?.matchedCausalWriteArtifacts).toEqual([{
+      queryId: "query-1",
+      artifactKey: "artifact-a",
+      executionNodeId: "node-write-match"
+    }]);
+  });
+
+  it("uses an independent current shared-artifact writer rather than a native-rejected pair", () => {
+    const item = evidence("state-a");
+    item.causalWriteArtifactsComplete = true;
+    item.causalWriteArtifacts = [{ artifactKey: "artifact-a", executionNodeId: "node-write-valid" }];
+    item.causalArtifactKeys = ["artifact-a"];
+    item.nativeRejectedCausalWriteArtifacts = [{ artifactKey: "artifact-a", executionNodeId: "node-write-rejected" }];
+
+    const result = evaluateCommitAttribution({
+      candidate: candidate("state-a"),
+      episode: episode([item]),
+      lineageVerifiedQueryIds: new Set(["query-1"]),
+      activeQueryIds: new Set(),
+      candidateAnchorQueryIds: new Set()
+    });
+
+    expect(result.proof?.matchedCausalWriteArtifacts).toEqual([{
+      queryId: "query-1",
+      artifactKey: "artifact-a",
+      executionNodeId: "node-write-valid"
+    }]);
+  });
+
   it("rejects evidence from a previous repository epoch", () => {
     const item = evidence("state-a");
     item.epochId = "old-epoch";

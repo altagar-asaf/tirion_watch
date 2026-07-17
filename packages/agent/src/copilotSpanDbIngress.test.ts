@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentStorageClient } from "@tirion/agent-storage";
 import type { SafeObservationV1 } from "@tirion/agent-contract";
 import type { DiagnosticEvent } from "@tirion/engine/production";
@@ -142,6 +142,139 @@ describe("CopilotSpanDbIngress", () => {
         && occurrence.startedAt === "2026-05-30T00:00:01.000Z"
       )
     ));
+  });
+
+  it("waits for an in-flight span DB append and detached admission before sealing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-copilot-span-db-seal-"));
+    roots.push(root);
+    const dbPath = join(root, "agent-traces.db");
+    createSpanDb(dbPath);
+    // Both rows are visible to the initial poll. The second one must remain
+    // unadmitted once the first row has crossed the durable-append boundary
+    // and the pre-stop seal starts.
+    appendCopilotRunSpan(dbPath, "span_before_seal");
+    appendCopilotRunSpan(dbPath, "span_queued_after_seal");
+
+    const appendStarted = deferred();
+    const releaseAppend = deferred();
+    const acceptedStarted = deferred();
+    const releaseAccepted = deferred();
+    let appendCalls = 0;
+    const appendSafeObservation = vi.fn(async () => {
+      appendCalls += 1;
+      if (appendCalls === 1) {
+        appendStarted.resolve();
+        await releaseAppend.promise;
+      }
+      return true;
+    });
+    let acceptedCalls = 0;
+    const onAccepted = vi.fn(async () => {
+      acceptedCalls += 1;
+      if (acceptedCalls === 1) {
+        acceptedStarted.resolve();
+        await releaseAccepted.promise;
+      }
+    });
+    const storage = {
+      upsertSource: vi.fn(async () => undefined),
+      appendSafeObservation
+    } as unknown as AgentStorageClient;
+    const ingress = new CopilotSpanDbIngress(
+      storage,
+      "env_test",
+      () => new Date("2026-06-08T00:00:03.000Z"),
+      onAccepted
+    );
+    ingresses.push(ingress);
+
+    try {
+      await ingress.configure(copilotSpanDbConfiguration(dbPath));
+      await appendStarted.promise;
+
+      let sealSettled = false;
+      const seal = ingress.sealForQuiesce(1_000).then((result) => {
+        sealSettled = true;
+        return result;
+      });
+      await sleep(20);
+      expect(sealSettled).toBe(false);
+      expect(ingress.ingressSealStatus()).toEqual({ sealed: true });
+
+      releaseAppend.resolve();
+      await acceptedStarted.promise;
+      await sleep(20);
+
+      // The detached callback is intentionally independent of durable
+      // acknowledgement, but must remain part of pre-stop drain accounting.
+      expect(sealSettled).toBe(false);
+      await expect(ingress.drainAcceptedWork(10)).resolves.toBe(false);
+      // No already-selected follow-up row may cross the producer boundary
+      // after the seal, even though it was read in the same poll snapshot.
+      expect(appendSafeObservation).toHaveBeenCalledTimes(1);
+      expect(ingress.acceptedWorkGeneration()).toBe(1);
+
+      releaseAccepted.resolve();
+      await expect(seal).resolves.toBe(true);
+      expect(ingress.ingressSealStatus()).toEqual({ sealed: true });
+      expect(appendSafeObservation).toHaveBeenCalledTimes(1);
+      expect(ingress.acceptedWorkGeneration()).toBe(1);
+    } finally {
+      releaseAppend.resolve();
+      releaseAccepted.resolve();
+    }
+  });
+
+  it("reopens a timed-out span DB seal and resumes records deferred by that seal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-copilot-span-db-unseal-"));
+    roots.push(root);
+    const dbPath = join(root, "agent-traces.db");
+    createSpanDb(dbPath);
+    appendCopilotRunSpan(dbPath, "span_before_failed_seal");
+    appendCopilotRunSpan(dbPath, "span_deferred_until_unseal");
+
+    const appendStarted = deferred();
+    const releaseAppend = deferred();
+    let appendCalls = 0;
+    const appendSafeObservation = vi.fn(async () => {
+      appendCalls += 1;
+      if (appendCalls === 1) {
+        appendStarted.resolve();
+        await releaseAppend.promise;
+      }
+      return true;
+    });
+    const storage = {
+      upsertSource: vi.fn(async () => undefined),
+      appendSafeObservation
+    } as unknown as AgentStorageClient;
+    const ingress = new CopilotSpanDbIngress(
+      storage,
+      "env_test",
+      () => new Date("2026-06-08T00:00:03.000Z")
+    );
+    ingresses.push(ingress);
+
+    try {
+      await ingress.configure(copilotSpanDbConfiguration(dbPath));
+      await appendStarted.promise;
+
+      await expect(ingress.sealForQuiesce(10)).resolves.toBe(false);
+      expect(ingress.ingressSealStatus()).toEqual({ sealed: true });
+
+      releaseAppend.resolve();
+      await expect(ingress.drainAcceptedWork(100)).resolves.toBe(true);
+      // The queued second row is still deferred while the failed barrier is
+      // sealed; a failed barrier must not silently admit it.
+      expect(appendSafeObservation).toHaveBeenCalledTimes(1);
+
+      ingress.unsealAfterFailedQuiesce();
+      expect(ingress.ingressSealStatus()).toEqual({ sealed: false });
+      await waitUntil(async () => appendSafeObservation.mock.calls.length === 2);
+      expect(ingress.acceptedWorkGeneration()).toBe(2);
+    } finally {
+      releaseAppend.resolve();
+    }
   });
 
   it("preserves successful Copilot tool status and attaches only opaque causal artifact evidence", async () => {
@@ -296,7 +429,7 @@ function createSpanDb(dbPath: string): void {
   db.close();
 }
 
-function appendCopilotRunSpan(dbPath: string): void {
+function appendCopilotRunSpan(dbPath: string, spanId = "span_root"): void {
   const db = newDatabase(dbPath);
   db.prepare(`
     INSERT INTO spans (
@@ -307,8 +440,8 @@ function appendCopilotRunSpan(dbPath: string): void {
       turn_index, ttft_ms, status_code, status_message
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    "span_root",
-    "trace_copilot_1",
+    spanId,
+    `trace_copilot_${spanId}`,
     null,
     "invoke_agent GitHub Copilot Chat",
     1_780_099_201_000,
@@ -316,7 +449,7 @@ function appendCopilotRunSpan(dbPath: string): void {
     "invoke_agent",
     "github-copilot",
     "GitHub Copilot Chat",
-    "conversation-1",
+    `conversation-${spanId}`,
     "gpt-5.4",
     "gpt-5.4",
     1200,
@@ -326,7 +459,7 @@ function appendCopilotRunSpan(dbPath: string): void {
     null,
     null,
     null,
-    "chat-session-1",
+    `chat-session-${spanId}`,
     1,
     25,
     "ok",
@@ -442,4 +575,22 @@ async function waitUntil(predicate: () => Promise<boolean>, attempts = 50): Prom
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function copilotSpanDbConfiguration(spanDbPath: string) {
+  return {
+    schemaVersion: 1 as const,
+    enabled: true,
+    spanDbPath,
+    captureContent: false,
+    dbSpanExporter: true
+  };
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve = () => undefined;
+  const promise = new Promise<void>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
 }

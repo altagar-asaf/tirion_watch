@@ -128,6 +128,7 @@ No remote backend-to-agent control line is part of this preview.
 
 ## More Docs
 
+- [`agent-installation-and-operations.md`](agent-installation-and-operations.md)
 - [`docs/privacy.md`](docs/privacy.md)
 - [`docs/webhooks.md`](docs/webhooks.md)
 - [`docs/harness-run-monitoring.md`](docs/harness-run-monitoring.md)

@@ -52,6 +52,83 @@ describe("DefaultAgenticWorkEpisodeTracker", () => {
     expect(episode.evidence[0].epochId).toBe("epoch-b");
   });
 
+  it("preserves exact successful-write artifact pairs when same-epoch evidence merges", async () => {
+    const ledger = new MemoryWorkEpisodeLedger();
+    const tracker = trackerWith(ledger);
+    await tracker.start();
+    await tracker.observeRun(partialRun("query-1", "run-1", "session-1"));
+    const first = {
+      ...evidence("query-1", "repo-a", "epoch-a"),
+      causalWriteArtifacts: [{
+        artifactKey: "artifact-a",
+        executionNodeId: "node_successful_write_a"
+      }]
+    };
+    const later = {
+      ...first,
+      artifactKeys: ["artifact-a", "artifact-b"],
+      causalArtifactKeys: ["artifact-a", "artifact-b"],
+      causalWriteArtifacts: [{
+        artifactKey: "artifact-b",
+        executionNodeId: "node_successful_write_b"
+      }]
+    };
+
+    await tracker.observeWorkspaceEvidence([first]);
+    await tracker.observeWorkspaceEvidence([later]);
+
+    expect((await tracker.listEpisodes({}))[0]?.evidence[0]?.causalWriteArtifacts).toEqual([
+      { artifactKey: "artifact-a", executionNodeId: "node_successful_write_a" },
+      { artifactKey: "artifact-b", executionNodeId: "node_successful_write_b" }
+    ]);
+  });
+
+  it("replaces the native-rejected pair marker with a complete current causal census", async () => {
+    const ledger = new MemoryWorkEpisodeLedger();
+    const tracker = trackerWith(ledger);
+    await tracker.start();
+    await tracker.observeRun(partialRun("query-1", "run-1", "session-1"));
+    const first = {
+      ...evidence("query-1", "repo-a", "epoch-a"),
+      causalArtifactKeys: ["artifact-a", "artifact-b"],
+      causalWriteArtifacts: [{
+        artifactKey: "artifact-a",
+        executionNodeId: "node_successful_write_a"
+      }, {
+        artifactKey: "artifact-b",
+        executionNodeId: "node_successful_write_b"
+      }],
+      nativeRejectedCausalWriteArtifacts: [],
+      causalWriteArtifactsComplete: true
+    };
+    const retracted = {
+      ...first,
+      causalArtifactKeys: ["artifact-b"],
+      causalWriteArtifacts: [{
+        artifactKey: "artifact-b",
+        executionNodeId: "node_successful_write_b"
+      }],
+      nativeRejectedCausalWriteArtifacts: [{
+        artifactKey: "artifact-a",
+        executionNodeId: "node_successful_write_a"
+      }]
+    };
+    const noLongerMarked = {
+      ...retracted,
+      nativeRejectedCausalWriteArtifacts: []
+    };
+
+    await tracker.observeWorkspaceEvidence([first]);
+    await tracker.observeWorkspaceEvidence([retracted]);
+    expect((await tracker.listEpisodes({}))[0]?.evidence[0]).toMatchObject({
+      causalWriteArtifacts: [{ artifactKey: "artifact-b", executionNodeId: "node_successful_write_b" }],
+      nativeRejectedCausalWriteArtifacts: [{ artifactKey: "artifact-a", executionNodeId: "node_successful_write_a" }]
+    });
+
+    await tracker.observeWorkspaceEvidence([noLongerMarked]);
+    expect((await tracker.listEpisodes({}))[0]?.evidence[0]?.nativeRejectedCausalWriteArtifacts).toEqual([]);
+  });
+
   it("keeps concurrent sessions separate", async () => {
     const ledger = new MemoryWorkEpisodeLedger();
     const tracker = trackerWith(ledger);

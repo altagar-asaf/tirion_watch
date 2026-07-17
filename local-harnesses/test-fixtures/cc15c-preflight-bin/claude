@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "auth" && "${2:-}" == "status" && "${3:-}" == "--json" ]]; then
+  if [[ -n "${TIRION_CC15C_STUB_CAPTURE:-}" ]]; then
+    {
+      printf 'NO_PROXY=%s\n' "${NO_PROXY:-}"
+      printf 'no_proxy=%s\n' "${no_proxy:-}"
+      printf 'CLAUDE_CONFIG_DIR=%s\n' "${CLAUDE_CONFIG_DIR:-}"
+      printf 'ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY:-}"
+      printf 'ANTHROPIC_AUTH_TOKEN=%s\n' "${ANTHROPIC_AUTH_TOKEN:-}"
+      printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    } >"$TIRION_CC15C_STUB_CAPTURE"
+  fi
+  if [[ "${TIRION_CC15C_STUB_AUTHENTICATED:-}" == "1" ]]; then
+    printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"test"}'
+  else
+    printf '%s\n' '{"loggedIn":false}'
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' '1.2.3'
+  exit 0
+fi
+
+exit 64

@@ -43,6 +43,14 @@ const REVISIT_WINDOW_MS = 5 * 60 * 1_000;
 export class CopilotSpanDbIngress {
   private timer?: NodeJS.Timeout;
   private polling = false;
+  // A span-DB poll is a local telemetry producer just like the OTLP server.
+  // Track the entire poll and its detached runtime admission so a pre-stop
+  // barrier cannot mistake a durable append for a completed pipeline handoff.
+  private readonly inFlightPolls = new Set<Promise<void>>();
+  private readonly inFlightAcceptedDispatches = new Set<Promise<void>>();
+  private readonly acceptedWorkWaiters = new Set<() => void>();
+  private acceptedObservationGeneration = 0;
+  private ingressSealed = false;
   private spanDbPath?: string;
   private db?: SqliteDatabase;
   private lastStartTimeMs = 0;
@@ -86,9 +94,7 @@ export class CopilotSpanDbIngress {
     this.lastStartTimeMs = 0;
     this.initializedFromSource = false;
     this.seenSpanRevisions.clear();
-    this.timer = setInterval(() => void this.poll(), POLL_INTERVAL_MS);
-    this.timer.unref?.();
-    void this.poll();
+    this.startPolling();
   }
 
   async stop(): Promise<void> {
@@ -105,22 +111,89 @@ export class CopilotSpanDbIngress {
       this.db.close();
       this.db = undefined;
     }
+    this.notifyAcceptedWorkWaiters();
   }
 
-  private async poll(): Promise<void> {
-    if (!this.spanDbPath || this.polling) {
+  /**
+   * Seal new scheduled span-DB polling while every already-started poll and
+   * its detached downstream runtime admission reaches a settled state.
+   */
+  async sealForQuiesce(timeoutMs: number): Promise<boolean> {
+    this.ingressSealed = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    return await this.drainAcceptedWork(timeoutMs);
+  }
+
+  /** Reopen only after a failed pre-stop barrier; successful barriers stay sealed. */
+  unsealAfterFailedQuiesce(): void {
+    this.ingressSealed = false;
+    this.startPolling();
+  }
+
+  ingressSealStatus(): { sealed: boolean } {
+    return { sealed: this.ingressSealed };
+  }
+
+  /** In-memory only; used to prove a sealed drain reached a joint fixed point. */
+  acceptedWorkGeneration(): number {
+    return this.acceptedObservationGeneration;
+  }
+
+  /** Wait for currently accepted polling and detached admission work to settle. */
+  async drainAcceptedWork(timeoutMs: number): Promise<boolean> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      return false;
+    }
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      await Promise.resolve();
+      if (this.acceptedWorkIdle()) {
+        return true;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        return false;
+      }
+      await this.waitForAcceptedWorkChange(remainingMs);
+    }
+  }
+
+  private startPolling(): void {
+    if (this.ingressSealed || !this.spanDbPath || this.timer) {
+      return;
+    }
+    this.timer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
+    this.timer.unref?.();
+    this.poll();
+  }
+
+  private poll(): void {
+    if (!this.spanDbPath || this.polling || this.ingressSealed) {
       return;
     }
     this.polling = true;
+    const poll = this.pollOnce(this.spanDbPath);
+    this.inFlightPolls.add(poll);
+    void poll.finally(() => {
+      this.inFlightPolls.delete(poll);
+      this.polling = false;
+      this.notifyAcceptedWorkWaiters();
+    });
+  }
+
+  private async pollOnce(spanDbPath: string): Promise<void> {
     try {
-      if (!fs.existsSync(this.spanDbPath)) {
+      if (!fs.existsSync(spanDbPath)) {
         this.recordLifecycle("provider_replay", "waiting", "copilot_span_db_not_found", {
           severity: "warning",
           details: { configured: true }
         });
         return;
       }
-      const db = this.openDb();
+      const db = this.openDb(spanDbPath);
       if (!this.initializedFromSource) {
         const latest = db.prepare("SELECT MAX(start_time_ms) AS max_start_time_ms FROM spans").get();
         this.lastStartTimeMs = numberValue(latest?.max_start_time_ms) ?? 0;
@@ -133,6 +206,12 @@ export class CopilotSpanDbIngress {
       const attributesForSpan = db.prepare("SELECT key, value FROM span_attributes WHERE span_id = ?");
       const eventsForSpan = db.prepare("SELECT * FROM span_events WHERE span_id = ? ORDER BY timestamp_ms, id");
       for (const span of spans) {
+        // A poll may have selected a batch before the pre-stop seal arrived.
+        // Only the record already in durable admission may finish; leave every
+        // later record unremembered so a failed barrier can replay it.
+        if (this.ingressSealed) {
+          break;
+        }
         const spanId = stringValue(span.span_id);
         if (!spanId) {
           continue;
@@ -147,8 +226,6 @@ export class CopilotSpanDbIngress {
         if (this.seenSpanRevisions.get(spanId) === revision) {
           continue;
         }
-        this.rememberSpanRevision(spanId, revision);
-        this.lastStartTimeMs = Math.max(this.lastStartTimeMs, startTimeMs);
         const record: CopilotSpanDbRecord = {
           span,
           attributes,
@@ -156,23 +233,64 @@ export class CopilotSpanDbIngress {
           revision
         };
         await this.acceptRecord(record);
+        this.rememberSpanRevision(spanId, revision);
+        this.lastStartTimeMs = Math.max(this.lastStartTimeMs, startTimeMs);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.recordLifecycle("provider_replay", "failed", "copilot_span_db_read_failed", {
         severity: "error",
         details: {
-          message: redactPathFromMessage(message, this.spanDbPath)
+          message: redactPathFromMessage(message, spanDbPath)
         }
       });
       this.closeDb();
-    } finally {
-      this.polling = false;
     }
   }
 
   private dispatchAccepted(observation: SafeObservationV1): void {
-    void this.onAccepted?.(observation).catch(() => undefined);
+    this.acceptedObservationGeneration += 1;
+    const dispatch = Promise.resolve()
+      .then(async () => {
+        await this.onAccepted?.(observation);
+      })
+      .catch(() => undefined);
+    this.inFlightAcceptedDispatches.add(dispatch);
+    void dispatch.finally(() => {
+      this.inFlightAcceptedDispatches.delete(dispatch);
+      this.notifyAcceptedWorkWaiters();
+    });
+  }
+
+  private acceptedWorkIdle(): boolean {
+    return this.inFlightPolls.size === 0 && this.inFlightAcceptedDispatches.size === 0;
+  }
+
+  private async waitForAcceptedWorkChange(timeoutMs: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const release = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        this.acceptedWorkWaiters.delete(release);
+        resolve();
+      };
+      const timeout = setTimeout(release, timeoutMs);
+      timeout.unref?.();
+      this.acceptedWorkWaiters.add(release);
+      if (this.acceptedWorkIdle()) {
+        release();
+      }
+    });
+  }
+
+  private notifyAcceptedWorkWaiters(): void {
+    for (const release of [...this.acceptedWorkWaiters]) {
+      release();
+    }
   }
 
   private async acceptRecord(record: CopilotSpanDbRecord): Promise<boolean> {
@@ -254,12 +372,12 @@ export class CopilotSpanDbIngress {
     return appended;
   }
 
-  private openDb(): SqliteDatabase {
+  private openDb(spanDbPath: string): SqliteDatabase {
     if (this.db) {
       return this.db;
     }
     const DatabaseSync = loadDatabaseSync();
-    const db = new DatabaseSync(this.spanDbPath!, { readOnly: true, open: true });
+    const db = new DatabaseSync(spanDbPath, { readOnly: true, open: true });
     try {
       db.exec("PRAGMA query_only = ON");
       assertSpanDbSchema(db);

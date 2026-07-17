@@ -258,6 +258,10 @@ function sameChatSession(episode: AgenticWorkEpisode, run: PartialAgenticQueryRu
 
 function mergeEvidenceRecord(a: QueryWorkEvidence, b: QueryWorkEvidence): QueryWorkEvidence {
   const artifactStates = mergeArtifactStates(a.artifactStates ?? [], b.artifactStates ?? []);
+  // An explicitly supplied causal set is a current source-node census. It may
+  // be empty after a native permission decision, so it must replace rather
+  // than union prior proof pointers. Absent retains snapshot-only behavior.
+  const replacesCausalAuthority = b.causalWriteArtifactsComplete === true;
   return {
     ...a,
     ...b,
@@ -267,13 +271,42 @@ function mergeEvidenceRecord(a: QueryWorkEvidence, b: QueryWorkEvidence): QueryW
     dirtyAtStart: a.dirtyAtStart || b.dirtyAtStart,
     observedChangeCount: artifactStates.length,
     artifactKeys: uniqueStrings([...a.artifactKeys, ...b.artifactKeys]),
-    causalArtifactKeys: uniqueStrings([...(a.causalArtifactKeys ?? []), ...(b.causalArtifactKeys ?? [])]),
+    causalArtifactKeys: replacesCausalAuthority
+      ? uniqueStrings(b.causalArtifactKeys ?? [])
+      : uniqueStrings([...(a.causalArtifactKeys ?? []), ...(b.causalArtifactKeys ?? [])]),
+    causalWriteArtifacts: replacesCausalAuthority
+      ? b.causalWriteArtifacts
+      : mergeCausalWriteArtifacts(a.causalWriteArtifacts ?? [], b.causalWriteArtifacts ?? []),
+    // Native-rejected pairs are a current exact source-node census too. Do
+    // not retain an old rejection marker after a newer complete census has
+    // replaced it, but preserve/dedupe it for legacy incremental evidence.
+    nativeRejectedCausalWriteArtifacts: replacesCausalAuthority
+      ? b.nativeRejectedCausalWriteArtifacts
+      : mergeCausalWriteArtifacts(
+          a.nativeRejectedCausalWriteArtifacts ?? [],
+          b.nativeRejectedCausalWriteArtifacts ?? []
+        ),
+    causalWriteArtifactsComplete: a.causalWriteArtifactsComplete || b.causalWriteArtifactsComplete || undefined,
     artifactStates,
     addedLines: Math.max(a.addedLines, b.addedLines),
     deletedLines: Math.max(a.deletedLines, b.deletedLines),
     firstObservedAt: minIsoOptional(a.firstObservedAt, b.firstObservedAt),
     lastObservedAt: maxIsoOptional(a.lastObservedAt, b.lastObservedAt)
   };
+}
+
+function mergeCausalWriteArtifacts(
+  a: NonNullable<QueryWorkEvidence["causalWriteArtifacts"]>,
+  b: NonNullable<QueryWorkEvidence["causalWriteArtifacts"]>
+): NonNullable<QueryWorkEvidence["causalWriteArtifacts"]> {
+  const byPair = new Map<string, NonNullable<QueryWorkEvidence["causalWriteArtifacts"]>[number]>();
+  for (const item of [...a, ...b]) {
+    byPair.set(`${item.artifactKey}:${item.executionNodeId}`, item);
+  }
+  return [...byPair.values()].sort((left, right) =>
+    left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
 }
 
 function mergeArtifactStates(a: NonNullable<QueryWorkEvidence["artifactStates"]>, b: NonNullable<QueryWorkEvidence["artifactStates"]>) {

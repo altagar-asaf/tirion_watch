@@ -139,6 +139,8 @@ function handle(command: WorkerCommandName, payload: unknown): unknown {
       return replaceProductionRuns(asProductionRunsInput(payload));
     case "upsertProductionRuns":
       return upsertProductionRuns(asProductionRunsInput(payload));
+    case "applyProductionRunRetention":
+      return applyProductionRunRetention(asProductionRunRetentionInput(payload));
     case "listProductionRuns":
       return listProductionRuns();
     case "clearProductionRuns":
@@ -586,8 +588,16 @@ function appendSafeObservation(input: ObservationInput): boolean {
           observation_id = excluded.observation_id,
           atom_json = excluded.atom_json
       `);
+      const existingUsageAtom = database().prepare(`
+        SELECT atom_json FROM safe_usage_atoms WHERE atom_id = ?
+      `);
       for (const atom of observation.usageAtoms) {
-        statement.run(atom.atomId, observation.observationId, JSON.stringify(atom));
+        const existingRow = existingUsageAtom.get(atom.atomId) as { atom_json?: string } | undefined;
+        const existing = existingRow?.atom_json
+          ? JSON.parse(existingRow.atom_json) as SafeUsageAtomV1
+          : undefined;
+        const retained = existing ? monotonicSafeUsageOwnership(existing, atom) : atom;
+        statement.run(atom.atomId, observation.observationId, JSON.stringify(retained));
       }
       const activityStatement = database().prepare(`
         INSERT INTO safe_activity_atoms (activity_id, observation_id, atom_json)
@@ -596,8 +606,16 @@ function appendSafeObservation(input: ObservationInput): boolean {
           observation_id = excluded.observation_id,
           atom_json = excluded.atom_json
       `);
+      const existingActivityAtom = database().prepare(`
+        SELECT atom_json FROM safe_activity_atoms WHERE activity_id = ?
+      `);
       for (const atom of observation.activityAtoms ?? []) {
-        activityStatement.run(atom.activityId, observation.observationId, JSON.stringify(atom));
+        const existingRow = existingActivityAtom.get(atom.activityId) as { atom_json?: string } | undefined;
+        const existing = existingRow?.atom_json
+          ? JSON.parse(existingRow.atom_json) as SafeActivityAtomV1
+          : undefined;
+        const retained = existing ? retainNativePermissionRejection(existing, atom) : atom;
+        activityStatement.run(atom.activityId, observation.observationId, JSON.stringify(retained));
       }
       const executionNodeStatement = database().prepare(`
         INSERT INTO agent_documents (collection, document_key, sort_at, document_json)
@@ -633,6 +651,49 @@ function appendSafeObservation(input: ObservationInput): boolean {
   }
 }
 
+function monotonicSafeUsageOwnership(
+  existing: SafeUsageAtomV1,
+  incoming: SafeUsageAtomV1
+): SafeUsageAtomV1 {
+  const existingConflict = existing.ownershipConflictActivityIds ?? [];
+  const incomingConflict = incoming.ownershipConflictActivityIds ?? [];
+  const ownerConflict = Boolean(
+    existing.owningActivityId
+    && incoming.owningActivityId
+    && existing.owningActivityId !== incoming.owningActivityId
+  );
+  if (existingConflict.length > 0 || incomingConflict.length > 0 || ownerConflict) {
+    const ownershipConflictActivityIds = [...new Set([
+      ...existingConflict,
+      ...incomingConflict,
+      ...(existing.owningActivityId ? [existing.owningActivityId] : []),
+      ...(incoming.owningActivityId ? [incoming.owningActivityId] : [])
+    ])].slice(0, 8);
+    const { owningActivityId: _owningActivityId, ...withoutIncomingOwner } = incoming;
+    return { ...withoutIncomingOwner, ownershipConflictActivityIds };
+  }
+  return {
+    ...incoming,
+    ...(incoming.owningActivityId ?? existing.owningActivityId
+      ? { owningActivityId: incoming.owningActivityId ?? existing.owningActivityId }
+      : {})
+  };
+}
+
+function retainNativePermissionRejection(
+  existing: SafeActivityAtomV1,
+  incoming: SafeActivityAtomV1
+): SafeActivityAtomV1 {
+  const existingDecision = existing.outcome === "rejected"
+    && existing.outcomeAuthority === "native_permission_decision";
+  const incomingDecision = incoming.outcome === "rejected"
+    && incoming.outcomeAuthority === "native_permission_decision";
+  if (existingDecision && !incomingDecision) {
+    return existing;
+  }
+  return incoming;
+}
+
 function preferredQueryOccurrence(existing: QueryOccurrenceV1 | undefined, incoming: QueryOccurrenceV1): QueryOccurrenceV1 {
   if (!existing) {
     return incoming;
@@ -644,19 +705,39 @@ function preferredQueryOccurrence(existing: QueryOccurrenceV1 | undefined, incom
       : incoming.promptState === "disabled"
         ? incoming
         : existing;
-  const completedAt = [existing.completedAt, incoming.completedAt]
+  const latestCompletedAt = [existing.completedAt, incoming.completedAt]
     .filter((value): value is string => Boolean(value))
     .sort()
     .at(-1);
-  const completionSource = completedAt === incoming.completedAt ? incoming : existing;
+  const completionSource = latestCompletedAt === incoming.completedAt ? incoming : existing;
+  const completionOutcome = preferredCompletionOutcome(existing.completionOutcome, incoming.completionOutcome);
+  const completionOutcomeSource = preferredCompletionOutcomeSource(existing, incoming);
+  const completedAt = completionOutcome
+    ? completionOutcomeSource.completedAt
+    : latestCompletedAt;
+  const completionEvidence = completionOutcome
+    ? completionOutcomeSource.completionEvidence
+    : completionSource.completionEvidence;
+  const completionFailureCategory = completionOutcome === "failure"
+    ? preferredCompletionFailureCategory(
+        existing.completionFailureCategory,
+        incoming.completionFailureCategory
+      )
+    : undefined;
   const evidence = queryOccurrenceEvidencePriority(incoming.evidence) >= queryOccurrenceEvidencePriority(existing.evidence)
     ? incoming.evidence
     : existing.evidence;
   const lifecycleVisibility = existing.lifecycleVisibility === "internal" || incoming.lifecycleVisibility === "internal"
     ? "internal"
     : incoming.lifecycleVisibility ?? existing.lifecycleVisibility;
+  const {
+    completionEvidence: _preferredCompletionEvidence,
+    completionOutcome: _preferredCompletionOutcome,
+    completionFailureCategory: _preferredCompletionFailureCategory,
+    ...preferredFields
+  } = preferred;
   return {
-    ...preferred,
+    ...preferredFields,
     evidence,
     ...(lifecycleVisibility ? { lifecycleVisibility } : {}),
     startedAt: existing.startedAt < incoming.startedAt ? existing.startedAt : incoming.startedAt,
@@ -664,11 +745,63 @@ function preferredQueryOccurrence(existing: QueryOccurrenceV1 | undefined, incom
       ? { parentSessionId: incoming.parentSessionId ?? existing.parentSessionId }
       : {}),
     ...(completedAt ? { completedAt } : {}),
-    ...(completionSource.completionEvidence ? { completionEvidence: completionSource.completionEvidence } : {}),
+    ...(completionEvidence ? { completionEvidence } : {}),
+    ...(completionOutcome ? { completionOutcome } : {}),
+    ...(completionFailureCategory ? { completionFailureCategory } : {}),
     ...(incoming.repositoryKey ?? existing.repositoryKey
       ? { repositoryKey: incoming.repositoryKey ?? existing.repositoryKey }
       : {})
   };
+}
+
+function preferredCompletionOutcome(
+  existing: QueryOccurrenceV1["completionOutcome"],
+  incoming: QueryOccurrenceV1["completionOutcome"]
+): QueryOccurrenceV1["completionOutcome"] {
+  if (existing === "failure" || incoming === "failure") return "failure";
+  if (existing === "success" || incoming === "success") return "success";
+  return incoming ?? existing;
+}
+
+function completionOutcomeAuthority(outcome: QueryOccurrenceV1["completionOutcome"]): number {
+  if (outcome === "failure") return 3;
+  if (outcome === "success") return 2;
+  if (outcome === "unknown") return 1;
+  return 0;
+}
+
+function preferredCompletionOutcomeSource(
+  existing: QueryOccurrenceV1,
+  incoming: QueryOccurrenceV1
+): QueryOccurrenceV1 {
+  const existingOutcome = completionOutcomeAuthority(existing.completionOutcome);
+  const incomingOutcome = completionOutcomeAuthority(incoming.completionOutcome);
+  if (incomingOutcome !== existingOutcome) {
+    return incomingOutcome > existingOutcome ? incoming : existing;
+  }
+  const existingEvidence = completionEvidenceAuthority(existing.completionEvidence);
+  const incomingEvidence = completionEvidenceAuthority(incoming.completionEvidence);
+  if (incomingEvidence !== existingEvidence) {
+    return incomingEvidence > existingEvidence ? incoming : existing;
+  }
+  const existingAt = existing.completedAt ?? existing.startedAt;
+  const incomingAt = incoming.completedAt ?? incoming.startedAt;
+  return incomingAt >= existingAt ? incoming : existing;
+}
+
+function completionEvidenceAuthority(evidence: QueryOccurrenceV1["completionEvidence"]): number {
+  if (evidence === "stop_hook" || evidence === "session_hook") return 3;
+  if (evidence === "closed_root_span" || evidence === "provider_completed_event") return 2;
+  if (evidence === "inactivity") return 1;
+  return 0;
+}
+
+function preferredCompletionFailureCategory(
+  existing: QueryOccurrenceV1["completionFailureCategory"],
+  incoming: QueryOccurrenceV1["completionFailureCategory"]
+): QueryOccurrenceV1["completionFailureCategory"] {
+  if (!existing || existing === "unknown") return incoming ?? existing;
+  return existing;
 }
 
 function queryOccurrenceEvidencePriority(evidence: QueryOccurrenceV1["evidence"]): number {
@@ -897,6 +1030,35 @@ function upsertProductionRuns(input: ProductionRunsInput): void {
       statement.run(run.runId, JSON.stringify(run));
     }
     database().exec("COMMIT");
+  } catch (error) {
+    database().exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function applyProductionRunRetention(input: ProductionRunRetentionInput): ProductionUsageEpochV1 {
+  const current = productionUsageEpoch();
+  if (!current) {
+    throw new Error("storage_unavailable");
+  }
+  const epoch: ProductionUsageEpochV1 = {
+    ...current,
+    startedAt: current.startedAt > input.retainAfter ? current.startedAt : input.retainAfter
+  };
+  database().exec("BEGIN IMMEDIATE");
+  try {
+    database().exec("DELETE FROM production_runs");
+    const statement = database().prepare("INSERT INTO production_runs (run_id, run_json) VALUES (?, ?)");
+    for (const run of input.runs) {
+      statement.run(run.runId, JSON.stringify(run));
+    }
+    database().prepare(`
+      UPDATE production_usage_epoch
+      SET started_at = ?
+      WHERE singleton_id = 1
+    `).run(epoch.startedAt);
+    database().exec("COMMIT");
+    return epoch;
   } catch (error) {
     database().exec("ROLLBACK");
     throw error;
@@ -1242,7 +1404,16 @@ function sanitizeOversizedEvidence(value: unknown, maxArtifactStates: number): {
   }
   const artifactStates = Array.isArray(value.artifactStates) ? value.artifactStates : [];
   const baselineArtifactStates = Array.isArray(value.baselineArtifactStates) ? value.baselineArtifactStates : [];
-  if (artifactStates.length <= maxArtifactStates && baselineArtifactStates.length <= maxArtifactStates) {
+  const causalWriteArtifacts = Array.isArray(value.causalWriteArtifacts) ? value.causalWriteArtifacts : [];
+  const nativeRejectedCausalWriteArtifacts = Array.isArray(value.nativeRejectedCausalWriteArtifacts)
+    ? value.nativeRejectedCausalWriteArtifacts
+    : [];
+  if (
+    artifactStates.length <= maxArtifactStates
+    && baselineArtifactStates.length <= maxArtifactStates
+    && causalWriteArtifacts.length <= maxArtifactStates
+    && nativeRejectedCausalWriteArtifacts.length <= maxArtifactStates
+  ) {
     return { changed: false, value };
   }
   const baselineReasons = uniqueNonEmptyStrings([
@@ -1259,6 +1430,8 @@ function sanitizeOversizedEvidence(value: unknown, maxArtifactStates: number): {
       artifactStates: [],
       artifactKeys: [],
       causalArtifactKeys: [],
+      causalWriteArtifacts: [],
+      nativeRejectedCausalWriteArtifacts: [],
       observedChangeCount: 0,
       addedLines: 0,
       deletedLines: 0
@@ -1795,6 +1968,14 @@ function asProductionRunsInput(value: unknown): ProductionRunsInput {
   return { runs: record.runs as ProductionRunV1[] };
 }
 
+function asProductionRunRetentionInput(value: unknown): ProductionRunRetentionInput {
+  const record = asRecord(value);
+  return {
+    runs: record.runs as ProductionRunV1[],
+    retainAfter: requiredText(record.retainAfter)
+  };
+}
+
 function asRepositoryScopeInput(value: unknown): RepositoryScopeInput {
   const record = asRecord(value);
   return { record: record.record as EncryptedRepositoryScope };
@@ -1886,6 +2067,7 @@ type WorkerCommandName =
   | "productionUsageEpoch"
   | "replaceProductionRuns"
   | "upsertProductionRuns"
+  | "applyProductionRunRetention"
   | "listProductionRuns"
   | "clearProductionRuns"
   | "upsertRepositoryScope"
@@ -1971,6 +2153,10 @@ type ShadowRunsInput = {
 
 type ProductionRunsInput = {
   runs: ProductionRunV1[];
+};
+
+type ProductionRunRetentionInput = ProductionRunsInput & {
+  retainAfter: string;
 };
 
 type RepositoryScopeInput = {

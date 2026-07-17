@@ -12,8 +12,13 @@ import {
   CostCoverage,
   ExportResult,
   FirstClaimInput,
+  MatchedCausalWriteArtifactEvidence,
+  NativeCausalClaimReconciliationInput,
+  NativeCausalClaimReconciliationResult,
+  ObservedCommitCandidate,
   PrivacyGuard,
   QueryCostAttribution,
+  QueryWorkEvidence,
   usdFromNanoUsd
 } from "../types";
 import { applyPricingCoveragePolicy } from "../pricing/pricingCoveragePolicy";
@@ -114,6 +119,129 @@ export class JsonlCommitAttributionLedger implements CommitAttributionLedger {
       }
       await this.persistAttributions([...byQuery.values()]);
       return { claimedQueryIds, skippedQueryIds };
+    });
+  }
+
+  /**
+   * Native Claude permission decisions can arrive after an otherwise valid
+   * first claim was durably stored.  Reconcile only allocations that retained
+   * the exact causal source pairs used at claim time; legacy/snapshot-only
+   * claims intentionally remain outside this narrow correction path.
+   */
+  async reconcileNativeRejectedCausalClaims(
+    input: NativeCausalClaimReconciliationInput
+  ): Promise<NativeCausalClaimReconciliationResult> {
+    return this.enqueueWrite(async () => {
+      const attributions = await this.loadAttributions();
+      const candidates = new Map(input.candidates.map((candidate) => [
+        candidateKey(candidate.repoKey, candidate.epochId, candidate.commitHash),
+        candidate
+      ]));
+      const changedAt = new Date(this.now()).toISOString();
+      const revokedQueryIds = new Set<string>();
+      const revokedCommitHashes = new Set<string>();
+      const revalidatedQueryIds = new Set<string>();
+      const revalidatedCommitHashes = new Set<string>();
+      let changed = false;
+
+      for (const attribution of attributions) {
+        let attributionChanged = false;
+        let revokedAllocation = false;
+        for (const allocation of attribution.allocations) {
+          if (
+            allocation.allocationPolicy !== "first_claim"
+            || (allocation.status !== "active" && allocation.status !== "rewrite_pending")
+            || !allocation.proof
+          ) {
+            continue;
+          }
+          const storedPairs = allocation.proof.matchedCausalWriteArtifacts ?? [];
+          if (storedPairs.length === 0 || !allocation.epochId) {
+            // Missing proof provenance is deliberately non-revocable: an
+            // absent, expired, malformed, or unreadable census is not native
+            // rejection authority.
+            continue;
+          }
+          const candidate = candidates.get(candidateKey(
+            allocation.repoKey,
+            allocation.epochId,
+            allocation.commitHash
+          ));
+          if (!candidate) {
+            continue;
+          }
+
+          const sourceEvidence = sourceEvidenceForAllocation(input.evidence, allocation);
+          const explicitlyRejected = storedPairs.filter((pair) =>
+            isExplicitlyNativeRejectedPair(pair, sourceEvidence)
+          );
+          if (explicitlyRejected.length === 0) {
+            continue;
+          }
+
+          const currentMatchedPairs = currentMatchedCausalPairsForCandidate(
+            sourceEvidence,
+            candidate
+          );
+          if (currentMatchedPairs.length > 0) {
+            // An independent current source pair can still prove the exact
+            // candidate. Replace stale rejected provenance with only the
+            // current matched pair(s), never with every write in the query.
+            allocation.proof = {
+              ...allocation.proof,
+              matchedCausalWriteArtifacts: currentMatchedPairs
+            };
+            allocation.stateChangedAt = changedAt;
+            allocation.evidenceReasons = uniqueStrings([
+              ...allocation.evidenceReasons,
+              "native_causal_write_revalidated"
+            ]);
+            attributionChanged = true;
+            changed = true;
+            revalidatedQueryIds.add(attribution.queryId);
+            revalidatedCommitHashes.add(allocation.commitHash);
+            continue;
+          }
+
+          // Revocation requires every exact pair that justified this stored
+          // allocation to be explicitly native-rejected in its own complete
+          // query/repository/epoch census. Pair disappearance alone cannot
+          // revoke anything.
+          if (explicitlyRejected.length !== storedPairs.length) {
+            continue;
+          }
+          allocation.status = "superseded";
+          allocation.decision = "superseded";
+          allocation.rewritePendingAt = undefined;
+          allocation.stateChangedAt = changedAt;
+          allocation.evidenceReasons = uniqueStrings([
+            ...allocation.evidenceReasons,
+            "native_causal_write_retracted"
+          ]);
+          attributionChanged = true;
+          revokedAllocation = true;
+          changed = true;
+          revokedQueryIds.add(attribution.queryId);
+          revokedCommitHashes.add(allocation.commitHash);
+        }
+        if (!attributionChanged) {
+          continue;
+        }
+        if (revokedAllocation && !hasActiveFirstClaim(attribution)) {
+          attribution.status = "rejected";
+        }
+        await this.validate(attribution);
+      }
+
+      if (changed) {
+        await this.persistAttributions(attributions);
+      }
+      return {
+        revokedQueryIds: [...revokedQueryIds].sort(),
+        revokedCommitHashes: [...revokedCommitHashes].sort(),
+        revalidatedQueryIds: [...revalidatedQueryIds].sort(),
+        revalidatedCommitHashes: [...revalidatedCommitHashes].sort()
+      };
     });
   }
 
@@ -406,10 +534,15 @@ function summarizeProviderCosts(
 function summarizePublicationSnapshots(attributions: QueryCostAttribution[]): CommitPublicationSnapshot[] {
   const byCommit = new Map<string, Array<{ attribution: QueryCostAttribution; allocation: QueryCostAttribution["allocations"][number] }>>();
   for (const attribution of attributions) {
-    if (attribution.status !== "attributed" && attribution.status !== "rewrite_pending") {
+    const currentPublication = attribution.status === "attributed" || attribution.status === "rewrite_pending";
+    const nativeCorrection = attribution.status === "rejected";
+    if (!currentPublication && !nativeCorrection) {
       continue;
     }
-    for (const allocation of attribution.allocations.filter(isPublicationAllocation)) {
+    for (const allocation of attribution.allocations.filter((item) =>
+      isPublicationAllocation(item)
+      && (currentPublication || isNativeCausalRetractionAllocation(item))
+    )) {
       const key = `${allocation.repoKey}:${allocation.commitHash}`;
       byCommit.set(key, [...(byCommit.get(key) ?? []), { attribution, allocation }]);
     }
@@ -443,6 +576,12 @@ function summarizePublicationSnapshots(attributions: QueryCostAttribution[]): Co
   });
 }
 
+function isNativeCausalRetractionAllocation(allocation: QueryCostAttribution["allocations"][number]): boolean {
+  return allocation.status === "superseded"
+    && allocation.decision === "superseded"
+    && allocation.evidenceReasons.includes("native_causal_write_retracted");
+}
+
 function isSurfacedAllocation(allocation: QueryCostAttribution["allocations"][number]): boolean {
   return allocation.allocationPolicy === "first_claim"
     && (allocation.decision === "reportable" || allocation.decision === "superseded")
@@ -459,6 +598,103 @@ function isPublicationAllocation(allocation: QueryCostAttribution["allocations"]
     && (allocation.status === "active" || allocation.status === "rewrite_pending" || allocation.status === "superseded");
 }
 
+function candidateKey(repoKey: string, epochId: string, commitHash: string): string {
+  return `${repoKey}\u0000${epochId}\u0000${commitHash}`;
+}
+
+function sourceEvidenceForAllocation(
+  evidence: QueryWorkEvidence[],
+  allocation: QueryCostAttribution["allocations"][number]
+): QueryWorkEvidence[] {
+  if (!allocation.proof || !allocation.epochId) {
+    return [];
+  }
+  const sourceQueryIds = new Set((allocation.proof.matchedCausalWriteArtifacts ?? [])
+    .map((pair) => pair.queryId));
+  return evidence.filter((item) =>
+    sourceQueryIds.has(item.queryId)
+    && item.repoKey === allocation.repoKey
+    && item.epochId === allocation.epochId
+  );
+}
+
+function isExplicitlyNativeRejectedPair(
+  pair: MatchedCausalWriteArtifactEvidence,
+  evidence: QueryWorkEvidence[]
+): boolean {
+  return evidence.some((item) =>
+    item.queryId === pair.queryId
+    && item.causalWriteArtifactsComplete === true
+    && containsCausalPair(item.nativeRejectedCausalWriteArtifacts, pair)
+    && !containsCausalPair(item.causalWriteArtifacts, pair)
+  );
+}
+
+function currentMatchedCausalPairsForCandidate(
+  evidence: QueryWorkEvidence[],
+  candidate: ObservedCommitCandidate
+): MatchedCausalWriteArtifactEvidence[] {
+  const pairs = new Map<string, MatchedCausalWriteArtifactEvidence>();
+  for (const item of evidence) {
+    if (item.causalWriteArtifactsComplete !== true) {
+      continue;
+    }
+    for (const pair of item.causalWriteArtifacts ?? []) {
+      const matchesCandidate = (item.artifactStates ?? []).some((observed) =>
+        observed.artifactKey === pair.artifactKey
+        && candidate.artifactStates.some((committed) => artifactStatesMatch(observed, committed))
+      );
+      if (!matchesCandidate) {
+        continue;
+      }
+      const matched: MatchedCausalWriteArtifactEvidence = {
+        queryId: item.queryId,
+        artifactKey: pair.artifactKey,
+        executionNodeId: pair.executionNodeId
+      };
+      pairs.set(matchedCausalPairKey(matched), matched);
+    }
+  }
+  return [...pairs.values()].sort((left, right) =>
+    left.queryId.localeCompare(right.queryId)
+    || left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
+}
+
+function containsCausalPair(
+  pairs: QueryWorkEvidence["causalWriteArtifacts"],
+  expected: MatchedCausalWriteArtifactEvidence
+): boolean {
+  return (pairs ?? []).some((pair) =>
+    pair.artifactKey === expected.artifactKey
+    && pair.executionNodeId === expected.executionNodeId
+  );
+}
+
+function matchedCausalPairKey(pair: MatchedCausalWriteArtifactEvidence): string {
+  return `${pair.queryId}\u0000${pair.artifactKey}\u0000${pair.executionNodeId}`;
+}
+
+function artifactStatesMatch(
+  observed: NonNullable<QueryWorkEvidence["artifactStates"]>[number],
+  committed: ObservedCommitCandidate["artifactStates"][number]
+): boolean {
+  const sameArtifact = observed.artifactKey === committed.artifactKey
+    || observed.artifactKey === committed.previousArtifactKey
+    || observed.previousArtifactKey === committed.artifactKey;
+  if (!sameArtifact) {
+    return false;
+  }
+  if (observed.changeKind === "deleted" && committed.changeKind === "deleted") {
+    return true;
+  }
+  if (!committed.stateKey) {
+    return false;
+  }
+  return committed.stateKey === observed.worktreeStateKey || committed.stateKey === observed.indexStateKey;
+}
+
 function normalizeAttribution(attribution: QueryCostAttribution): QueryCostAttribution {
   const pricingCoverage = attribution.pricingCoverage
     ? applyPricingCoveragePolicy(attribution.pricingCoverage)
@@ -469,7 +705,8 @@ function normalizeAttribution(attribution: QueryCostAttribution): QueryCostAttri
       ...allocation,
       coverage: pricingCoverage?.state === "priced" && allocation.coverage === "partial" ? "complete" : allocation.coverage,
       parentHashes: uniqueStrings(allocation.parentHashes),
-      evidenceReasons: uniqueStrings(allocation.evidenceReasons)
+      evidenceReasons: uniqueStrings(allocation.evidenceReasons),
+      proof: allocation.proof ? normalizeProof(allocation.proof) : undefined
     }))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.commitHash.localeCompare(b.commitHash));
 
@@ -482,10 +719,56 @@ function normalizeAttribution(attribution: QueryCostAttribution): QueryCostAttri
       ...evidence,
       runIds: uniqueStrings(evidence.runIds),
       baselineReasons: uniqueStrings(evidence.baselineReasons),
-      artifactKeys: uniqueStrings(evidence.artifactKeys)
+      artifactKeys: uniqueStrings(evidence.artifactKeys),
+      causalArtifactKeys: evidence.causalArtifactKeys ? uniqueStrings(evidence.causalArtifactKeys) : undefined,
+      causalWriteArtifacts: evidence.causalWriteArtifacts
+        ? uniqueCausalWriteArtifacts(evidence.causalWriteArtifacts)
+        : undefined,
+      nativeRejectedCausalWriteArtifacts: evidence.nativeRejectedCausalWriteArtifacts
+        ? uniqueCausalWriteArtifacts(evidence.nativeRejectedCausalWriteArtifacts)
+        : undefined
     })),
     allocations
   };
+}
+
+function normalizeProof(proof: NonNullable<QueryCostAttribution["allocations"][number]["proof"]>) {
+  return {
+    ...proof,
+    anchorQueryIds: uniqueStrings(proof.anchorQueryIds),
+    inheritedQueryIds: uniqueStrings(proof.inheritedQueryIds),
+    matchedCausalWriteArtifacts: proof.matchedCausalWriteArtifacts
+      ? uniqueMatchedCausalWriteArtifacts(proof.matchedCausalWriteArtifacts)
+      : undefined,
+    reasonCodes: uniqueStrings(proof.reasonCodes)
+  };
+}
+
+function uniqueMatchedCausalWriteArtifacts(
+  pairs: MatchedCausalWriteArtifactEvidence[]
+): MatchedCausalWriteArtifactEvidence[] {
+  const byPair = new Map<string, MatchedCausalWriteArtifactEvidence>();
+  for (const pair of pairs) {
+    byPair.set(matchedCausalPairKey(pair), pair);
+  }
+  return [...byPair.values()].sort((left, right) =>
+    left.queryId.localeCompare(right.queryId)
+    || left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
+}
+
+function uniqueCausalWriteArtifacts(
+  artifacts: NonNullable<QueryCostAttribution["evidence"][number]["causalWriteArtifacts"]>
+): NonNullable<QueryCostAttribution["evidence"][number]["causalWriteArtifacts"]> {
+  const byPair = new Map<string, NonNullable<QueryCostAttribution["evidence"][number]["causalWriteArtifacts"]>[number]>();
+  for (const artifact of artifacts) {
+    byPair.set(`${artifact.artifactKey}:${artifact.executionNodeId}`, artifact);
+  }
+  return [...byPair.values()].sort((left, right) =>
+    left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
 }
 
 function matchesQueryAttribution(attribution: QueryCostAttribution, query: CommitAttributionQuery): boolean {
@@ -602,14 +885,27 @@ function allocationFromClaim(
 }
 
 function proofForQuery(proof: NonNullable<QueryCostAttribution["allocations"][number]["proof"]>, queryId: string) {
+  const { matchedCausalWriteArtifacts, ...base } = proof;
+  // Direct allocations retain only pairs from their own query. An inherited
+  // allocation depends on its direct anchor(s), so it retains those source
+  // pairs instead. This prevents a sibling anchor's valid write from keeping a
+  // rejected direct allocation alive.
+  const scopedPairs = proof.inheritedQueryIds.includes(queryId)
+    ? matchedCausalWriteArtifacts
+    : matchedCausalWriteArtifacts?.filter((pair) => pair.queryId === queryId);
+  const scoped = scopedPairs && scopedPairs.length > 0
+    ? { matchedCausalWriteArtifacts: uniqueMatchedCausalWriteArtifacts(scopedPairs) }
+    : {};
   return proof.inheritedQueryIds.includes(queryId)
     ? {
-        ...proof,
+        ...base,
+        ...scoped,
         kind: "episode_inheritance" as const,
         inheritedQueryIds: [queryId]
       }
     : {
-        ...proof,
+        ...base,
+        ...scoped,
         inheritedQueryIds: []
       };
 }

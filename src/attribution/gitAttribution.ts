@@ -178,11 +178,35 @@ export class DefaultGitAttribution implements GitAttribution {
       });
       this.publish({ kind: "allocation_changed" });
     }
-    const [candidates, episodes, attributions] = await Promise.all([
+    const [candidates, episodes, persistedAttributions] = await Promise.all([
       this.observations.listCandidates(),
       this.episodes.listEpisodes({}),
       this.ledger.listQueryAttributions({})
     ]);
+    let attributions = persistedAttributions;
+    const nativeCausalReconciliation = await this.ledger.reconcileNativeRejectedCausalClaims({
+      evidence: episodes.flatMap((episode) => episode.evidence),
+      candidates
+    });
+    if (
+      nativeCausalReconciliation.revokedQueryIds.length > 0
+      || nativeCausalReconciliation.revalidatedQueryIds.length > 0
+    ) {
+      attributions = await this.ledger.listQueryAttributions({});
+    }
+    if (nativeCausalReconciliation.revokedCommitHashes.length > 0) {
+      await this.reconcileNativeRejectedCandidateStates(
+        candidates,
+        attributions,
+        nativeCausalReconciliation.revokedCommitHashes
+      );
+      for (const commitHash of nativeCausalReconciliation.revokedCommitHashes) {
+        this.publish({ kind: "allocation_changed", commitHash });
+      }
+    }
+    for (const commitHash of nativeCausalReconciliation.revalidatedCommitHashes) {
+      this.publish({ kind: "allocation_changed", commitHash });
+    }
     const synchronizedStatuses = await this.synchronizeQueryStatuses(episodes, attributions);
     if (synchronizedStatuses > 0) {
       this.publish({ kind: "candidate_changed" });
@@ -214,7 +238,9 @@ export class DefaultGitAttribution implements GitAttribution {
       const candidateEpisodeTransferableQueryIds = new Set([...candidateEpisodeTransferableGroups.values()].flat());
       const wasReportable = candidate.decision === "reportable";
       let reported = false;
-      const reasons = new Set(candidate.reasonCodes.filter(isObservationReasonCode));
+      const reasons = new Set(candidate.reasonCodes.filter((reason) =>
+        isObservationReasonCode(reason) || reason === "native_causal_write_retracted"
+      ));
       if (wasReportable) {
         reasons.add("verified_content_continuity");
       }
@@ -411,7 +437,12 @@ export class DefaultGitAttribution implements GitAttribution {
     const expiredQueryIds: string[] = [];
     let changed = 0;
     for (const attribution of attributions) {
-      if (attribution.status === "attributed" || attribution.status === "rewrite_pending" || attribution.status === "legacy_unverified") {
+      if (
+        attribution.status === "attributed"
+        || attribution.status === "rewrite_pending"
+        || attribution.status === "legacy_unverified"
+        || attribution.status === "rejected"
+      ) {
         continue;
       }
       const queryEpisodes = episodes.filter((episode) => episode.queryIds.includes(attribution.queryId));
@@ -438,6 +469,43 @@ export class DefaultGitAttribution implements GitAttribution {
       await this.workspaceChanges.resolveQueries(expiredQueryIds);
     }
     return changed;
+  }
+
+  private async reconcileNativeRejectedCandidateStates(
+    candidates: ObservedCommitCandidate[],
+    attributions: QueryCostAttribution[],
+    revokedCommitHashes: string[]
+  ): Promise<void> {
+    const revoked = new Set(revokedCommitHashes);
+    for (const candidate of candidates) {
+      if (!revoked.has(candidate.commitHash) || hasActiveAllocationForCandidate(attributions, candidate)) {
+        continue;
+      }
+      const nextReasons = uniqueStrings([
+        ...candidate.reasonCodes.filter((reason) => reason !== "verified_content_continuity"),
+        "native_causal_write_retracted"
+      ]);
+      const unchanged = candidate.decision === "pending_evidence"
+        && JSON.stringify(candidate.reasonCodes) === JSON.stringify(nextReasons);
+      if (unchanged) {
+        continue;
+      }
+      candidate.decision = "pending_evidence";
+      candidate.reasonCodes = nextReasons;
+      await this.observations.updateCandidate(candidate);
+      this.recordEvent({
+        kind: "attributionDecision",
+        commitHash: candidate.commitHash,
+        status: "pending_evidence",
+        reason: "native_causal_write_retracted"
+      });
+      this.recordLifecycle("candidate", "pending_evidence", "native_causal_write_retracted", {
+        repoKey: candidate.repoKey,
+        epochId: candidate.epochId,
+        commitHash: candidate.commitHash
+      });
+      this.publish({ kind: "candidate_changed", commitHash: candidate.commitHash });
+    }
   }
 
   private async lineageVerifiedQueryIds(candidate: ObservedCommitCandidate, episode: AgenticWorkEpisode): Promise<Set<string>> {
@@ -613,6 +681,19 @@ function activeFirstClaimQueryIds(attributions: QueryCostAttribution[]): Set<str
       && allocation.status === "active"
     ))
     .map((attribution) => attribution.queryId));
+}
+
+function hasActiveAllocationForCandidate(
+  attributions: QueryCostAttribution[],
+  candidate: ObservedCommitCandidate
+): boolean {
+  return attributions.some((attribution) => attribution.allocations.some((allocation) =>
+    allocation.allocationPolicy === "first_claim"
+    && (allocation.status === "active" || allocation.status === "rewrite_pending")
+    && allocation.repoKey === candidate.repoKey
+    && allocation.epochId === candidate.epochId
+    && allocation.commitHash === candidate.commitHash
+  ));
 }
 
 function rewritePendingGroups(attributions: QueryCostAttribution[], queryIds: string[], replacementCommitHash: string): Map<string, string[]> {

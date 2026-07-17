@@ -3,6 +3,7 @@ import {
   ArtifactStateEvidence,
   AttributionDecision,
   AttributionProof,
+  MatchedCausalWriteArtifactEvidence,
   ObservedCommitCandidate,
   QueryWorkEvidence
 } from "../types";
@@ -81,15 +82,24 @@ export function evaluateCommitAttribution(input: CommitAttributionPolicyInput): 
       ))
     : [];
   const queryIds = uniqueStrings([...anchors, ...inherited]);
-  const proofKind = proofKindFor(currentEpochEvidence, candidate.artifactStates);
+  const proofAnchorQueryIds = uniqueStrings([...anchors, ...retainedCandidateAnchors]);
+  const proofEvidence = currentEpochEvidence.filter((evidence) =>
+    proofAnchorQueryIds.includes(evidence.queryId)
+  );
+  const matchedCausalWriteArtifacts = matchedCausalWriteArtifactsForCommit(
+    proofEvidence,
+    candidate.artifactStates
+  );
+  const proofKind = proofKindFor(proofEvidence, candidate.artifactStates);
   return {
     decision: "reportable",
     queryIds,
     proof: {
       kind: proofKind,
-      anchorQueryIds: uniqueStrings([...anchors, ...retainedCandidateAnchors]),
+      anchorQueryIds: proofAnchorQueryIds,
       inheritedQueryIds: inherited,
-      matchedArtifactCount: matchedArtifactCount(currentEpochEvidence, candidate.artifactStates),
+      matchedArtifactCount: matchedArtifactCount(proofEvidence, candidate.artifactStates),
+      ...(matchedCausalWriteArtifacts.length > 0 ? { matchedCausalWriteArtifacts } : {}),
       reasonCodes: uniqueStrings([
         "active_epoch",
         "lineage_verified",
@@ -118,9 +128,24 @@ function hardFailureReason(
 }
 
 function hasContentContinuity(evidence: QueryWorkEvidence, committed: ArtifactStateEvidence[]): boolean {
-  return (evidence.artifactStates ?? []).some((observed) =>
+  return attributableArtifactStates(evidence).some((observed) =>
     committed.some((candidate) => artifactStatesMatch(observed, candidate))
   );
+}
+
+/**
+ * Snapshot-only evidence predates execution proof capture and remains valid
+ * under its normal baseline rules. Once a record carries an explicit causal
+ * proof set, however, it is an authority boundary: an empty set after native
+ * revalidation must not silently fall back to broad artifact-state matching.
+ */
+function attributableArtifactStates(evidence: QueryWorkEvidence): ArtifactStateEvidence[] {
+  if (evidence.causalWriteArtifactsComplete !== true) {
+    return evidence.artifactStates ?? [];
+  }
+  const artifactKeys = new Set((evidence.causalWriteArtifacts ?? [])
+    .map((artifact) => artifact.artifactKey));
+  return (evidence.artifactStates ?? []).filter((state) => artifactKeys.has(state.artifactKey));
 }
 
 function artifactStatesMatch(observed: ArtifactStateEvidence, committed: ArtifactStateEvidence): boolean {
@@ -140,7 +165,7 @@ function artifactStatesMatch(observed: ArtifactStateEvidence, committed: Artifac
 }
 
 function proofKindFor(evidence: QueryWorkEvidence[], committed: ArtifactStateEvidence[]): AttributionProof["kind"] {
-  const deletion = evidence.some((item) => (item.artifactStates ?? []).some((observed) =>
+  const deletion = evidence.some((item) => attributableArtifactStates(item).some((observed) =>
     committed.some((candidate) =>
       observed.changeKind === "deleted"
       && candidate.changeKind === "deleted"
@@ -153,13 +178,52 @@ function proofKindFor(evidence: QueryWorkEvidence[], committed: ArtifactStateEvi
 function matchedArtifactCount(evidence: QueryWorkEvidence[], committed: ArtifactStateEvidence[]): number {
   const matches = new Set<string>();
   for (const item of evidence) {
-    for (const observed of item.artifactStates ?? []) {
+    for (const observed of attributableArtifactStates(item)) {
       if (committed.some((candidate) => artifactStatesMatch(observed, candidate))) {
         matches.add(observed.artifactKey);
       }
     }
   }
   return matches.size;
+}
+
+/**
+ * A commit claim may retain only causal source pairs whose own artifact state
+ * actually matched this candidate.  Broad query evidence, same-name tools,
+ * and causal pairs for another changed artifact are deliberately excluded.
+ * Snapshot-only/legacy evidence has no pair authority and therefore produces
+ * no revocable proof pointer.
+ */
+function matchedCausalWriteArtifactsForCommit(
+  evidence: QueryWorkEvidence[],
+  committed: ArtifactStateEvidence[]
+): MatchedCausalWriteArtifactEvidence[] {
+  const byPair = new Map<string, MatchedCausalWriteArtifactEvidence>();
+  for (const item of evidence) {
+    if (item.causalWriteArtifactsComplete !== true) {
+      continue;
+    }
+    for (const pair of item.causalWriteArtifacts ?? []) {
+      const matched = (item.artifactStates ?? []).some((observed) =>
+        observed.artifactKey === pair.artifactKey
+        && committed.some((candidate) => artifactStatesMatch(observed, candidate))
+      );
+      if (!matched) {
+        continue;
+      }
+      const value: MatchedCausalWriteArtifactEvidence = {
+        queryId: item.queryId,
+        artifactKey: pair.artifactKey,
+        executionNodeId: pair.executionNodeId
+      };
+      byPair.set(`${value.queryId}:${value.artifactKey}:${value.executionNodeId}`, value);
+    }
+  }
+  return [...byPair.values()].sort((left, right) =>
+    left.queryId.localeCompare(right.queryId)
+    || left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
 }
 
 function uniqueStrings(values: string[]): string[] {

@@ -710,6 +710,25 @@ export type ArtifactStateEvidence = {
   observedSequence: number;
 };
 
+/**
+ * An opaque artifact identity paired with the exact successful semantic write
+ * execution node that produced it. This proof survives grouped activity rows,
+ * whose aggregate outcome can otherwise be unknown for mixed invocations.
+ */
+export type CausalWriteArtifactEvidence = {
+  artifactKey: string;
+  executionNodeId: string;
+};
+
+/**
+ * A causal write pair retained inside an attributed-commit proof. The source
+ * query remains opaque, but is necessary when an inherited allocation must be
+ * revalidated against the exact query that supplied its continuity proof.
+ */
+export type MatchedCausalWriteArtifactEvidence = CausalWriteArtifactEvidence & {
+  queryId: string;
+};
+
 export type ObservedCommitCandidate = {
   candidateId: string;
   epochId: string;
@@ -732,6 +751,12 @@ export type AttributionProof = {
   anchorQueryIds: string[];
   inheritedQueryIds: string[];
   matchedArtifactCount: number;
+  /**
+   * Optional exact source pairs that actually matched this commit at claim
+   * time. Legacy/snapshot-only proofs intentionally omit the field, so an
+   * empty or unreadable later census cannot retroactively revoke them.
+   */
+  matchedCausalWriteArtifacts?: MatchedCausalWriteArtifactEvidence[];
   reasonCodes: string[];
 };
 
@@ -772,6 +797,16 @@ export type QueryWorkEvidence = {
   artifactKeys: string[];
   /** Artifact keys causally tied to this query by exact successful write telemetry. */
   causalArtifactKeys?: string[];
+  /** Per-artifact successful-write proof; only these keys may drive run-level file output. */
+  causalWriteArtifacts?: CausalWriteArtifactEvidence[];
+  /**
+   * Exact successful-write pairs contradicted by a native permission decision.
+   * This is deliberately distinct from an empty causal census: unreadable or
+   * absent source nodes are not evidence of a native rejection.
+   */
+  nativeRejectedCausalWriteArtifacts?: CausalWriteArtifactEvidence[];
+  /** True when causalWriteArtifacts is a complete current execution-node census, not a delta. */
+  causalWriteArtifactsComplete?: boolean;
   baselineArtifactStates?: ArtifactStateEvidence[];
   artifactStates?: ArtifactStateEvidence[];
   addedLines: number;
@@ -1254,10 +1289,27 @@ export type FirstClaimInput = {
   queryIds: string[];
 };
 
+/**
+ * Current episode evidence used to revalidate an already-durable causal
+ * commit claim after a native permission decision arrives out of order.
+ */
+export type NativeCausalClaimReconciliationInput = {
+  evidence: QueryWorkEvidence[];
+  candidates: ObservedCommitCandidate[];
+};
+
+export type NativeCausalClaimReconciliationResult = {
+  revokedQueryIds: string[];
+  revokedCommitHashes: string[];
+  revalidatedQueryIds: string[];
+  revalidatedCommitHashes: string[];
+};
+
 export interface CommitAttributionLedger {
   upsertQueryAttribution(attribution: QueryCostAttribution): Promise<void>;
   tryFirstClaim(input: FirstClaimInput): Promise<{ claimedQueryIds: string[]; skippedQueryIds: string[] }>;
   transferFirstClaim(input: FirstClaimInput & { supersededCommitHash: string }): Promise<{ claimedQueryIds: string[]; skippedQueryIds: string[] }>;
+  reconcileNativeRejectedCausalClaims(input: NativeCausalClaimReconciliationInput): Promise<NativeCausalClaimReconciliationResult>;
   markRewritePending(repoKey: string, commitHashes: string[], observedAt?: string): Promise<number>;
   expireRewritePending(before: string): Promise<number>;
   quarantineLegacy(activeEpochIds?: Set<string>): Promise<number>;

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   AGENT_PROTOCOL_MAJOR,
   agentOwnsUsage,
+  hasExactNativePermissionRejectionForExecutionNode,
+  sameExactSafeActivityIdentity,
   negotiateProtocol,
   ownershipManifestFor,
   parseHandshakeRequestV1,
@@ -87,6 +89,101 @@ describe("agent contract", () => {
       captureContent: true,
       dbSpanExporter: true
     })).toThrow(/invalid/i);
+  });
+
+  it("matches native Claude permission rejection only to the exact opaque tool invocation", () => {
+    const successfulWrite = {
+      schemaVersion: 1 as const,
+      nodeId: "node_successful_write",
+      queryId: "qry_permission_conflict",
+      // Hooks and OTLP use different request identities for the same tool use.
+      requestId: "req_post_tool_use",
+      invocationId: "invocation_shared_tool_use",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      nodeKind: "tool" as const,
+      name: "Write",
+      toolName: "Write",
+      outcome: "success" as const,
+      startedAt: "2026-07-14T12:00:00.000Z"
+    };
+    const nativeRejection = {
+      ...successfulWrite,
+      nodeId: "node_native_rejection",
+      requestId: "req_otlp_decision",
+      outcome: "rejected" as const,
+      outcomeAuthority: "native_permission_decision" as const
+    };
+
+    expect(hasExactNativePermissionRejectionForExecutionNode(successfulWrite, [nativeRejection])).toBe(true);
+    expect(hasExactNativePermissionRejectionForExecutionNode(successfulWrite, [{
+      ...nativeRejection,
+      invocationId: "invocation_separate_write"
+    }])).toBe(false);
+    expect(hasExactNativePermissionRejectionForExecutionNode(successfulWrite, [{
+      ...nativeRejection,
+      toolName: "Edit"
+    }])).toBe(false);
+    // An invocation ID on only one side must not silently fall back to an
+    // otherwise equal request ID; that would recreate the cross-surface bug.
+    expect(hasExactNativePermissionRejectionForExecutionNode(successfulWrite, [{
+      ...nativeRejection,
+      requestId: successfulWrite.requestId,
+      invocationId: undefined
+    }])).toBe(false);
+    // Legacy node records without provider tool-use IDs retain their narrow
+    // request-ID fallback only when neither side has invocation identity.
+    expect(hasExactNativePermissionRejectionForExecutionNode({
+      ...successfulWrite,
+      invocationId: undefined,
+      requestId: "req_legacy"
+    }, [{
+      ...nativeRejection,
+      invocationId: undefined,
+      requestId: "req_legacy"
+    }])).toBe(true);
+  });
+
+  it("uses opaque invocation precedence for exact Claude activity identity", () => {
+    const activity = {
+      schemaVersion: 1 as const,
+      activityId: "act_permission_identity",
+      queryId: "qry_permission_identity",
+      requestId: "req_reused_provider_request",
+      invocationId: "invocation_actual_tool_use",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      kind: "tool" as const,
+      name: "Write",
+      outcome: "success" as const,
+      startedAt: "2026-07-14T12:00:00.000Z"
+    };
+    expect(sameExactSafeActivityIdentity(activity, {
+      ...activity,
+      activityId: "act_native_same_invocation",
+      requestId: "req_otlp_permission_decision",
+      outcome: "rejected"
+    })).toBe(true);
+    expect(sameExactSafeActivityIdentity(activity, {
+      ...activity,
+      activityId: "act_other_tool_use_same_request",
+      invocationId: "invocation_other_tool_use"
+    })).toBe(false);
+    expect(sameExactSafeActivityIdentity(activity, {
+      ...activity,
+      activityId: "act_partial_legacy_identity",
+      invocationId: undefined
+    })).toBe(false);
+    expect(sameExactSafeActivityIdentity({
+      ...activity,
+      invocationId: undefined,
+      requestId: "req_legacy_tool"
+    }, {
+      ...activity,
+      activityId: "act_legacy_permission_identity",
+      invocationId: undefined,
+      requestId: "req_legacy_tool"
+    })).toBe(true);
   });
 });
 

@@ -48,4 +48,24 @@ describe("RuntimeWorkScheduler", () => {
     await scheduler.drain();
     expect(completed).toEqual(["diagnostics_refresh", "usage_projection"]);
   });
+
+  it("drains work enqueued by a completed prior lane to a fixed point", async () => {
+    const scheduler = new RuntimeWorkScheduler();
+    const completed: string[] = [];
+
+    scheduler.enqueue("usage_projection", async () => {
+      completed.push("usage_projection");
+      scheduler.enqueue("webhook_lifecycle_projection", async () => {
+        completed.push("webhook_lifecycle_projection");
+      });
+    });
+
+    await expect(scheduler.drainToFixedPoint()).resolves.toBe(true);
+    expect(completed).toEqual(["usage_projection", "webhook_lifecycle_projection"]);
+  });
+
+  it("fails closed for an invalid fixed-point round bound", async () => {
+    const scheduler = new RuntimeWorkScheduler();
+    await expect(scheduler.drainToFixedPoint(0)).resolves.toBe(false);
+  });
 });

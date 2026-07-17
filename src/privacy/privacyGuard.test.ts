@@ -226,12 +226,48 @@ show the actual user prompt
         stateKey: "hmac-state-key",
         changeKind: "modified",
         observedSequence: 2
+      }],
+      causalWriteArtifacts: [{
+        artifactKey: "artifact_key_opaque",
+        executionNodeId: "node_opaque_01"
+      }],
+      nativeRejectedCausalWriteArtifacts: [{
+        artifactKey: "artifact_key_rejected",
+        executionNodeId: "node_opaque_02"
       }]
     };
 
     expect(guard.validateAttribution(safe).ok).toBe(true);
     expect(guard.validateAttribution({ ...safe, fileContent: "secret" }).ok).toBe(false);
     expect(guard.validateAttribution({ ...safe, rawDiff: "secret" }).ok).toBe(false);
+    expect(guard.validateAttribution({
+      ...safe,
+      causalWriteArtifacts: [{
+        artifactKey: "/private/worktree.ts",
+        executionNodeId: "node_opaque_01"
+      }]
+    }).ok).toBe(false);
+    expect(guard.validateAttribution({
+      ...safe,
+      causalWriteArtifacts: [{
+        artifactKey: "artifact_key_opaque",
+        executionNodeId: "raw telemetry content"
+      }]
+    }).ok).toBe(false);
+    expect(guard.validateAttribution({
+      ...safe,
+      causalWriteArtifacts: Array.from({ length: 101 }, (_, index) => ({
+        artifactKey: `artifact_${index}`,
+        executionNodeId: `node_${index}`
+      }))
+    }).ok).toBe(false);
+    expect(guard.validateAttribution({
+      ...safe,
+      nativeRejectedCausalWriteArtifacts: [{
+        artifactKey: "/private/worktree.ts",
+        executionNodeId: "node_opaque_02"
+      }]
+    }).ok).toBe(false);
   });
 
   it("strictly validates outbound GitHub Check publication intents", () => {
@@ -420,6 +456,41 @@ show the actual user prompt
     };
 
     expect(guard.validatePublication(event).ok).toBe(true);
+    expect(guard.validatePublication({ ...event, outcome: "failure" }).ok).toBe(true);
+    expect(guard.validatePublication({ ...event, outcome: "rejected" }).ok).toBe(false);
+    const recoveredFailure = {
+      ...event,
+      outcome: "failure",
+      evidence: {
+        ...event.evidence,
+        delayed: true,
+        timingConfidence: "high"
+      },
+      coverage: {
+        ...event.coverage,
+        usageCoverage: "none"
+      },
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      reasoningOutputTokens: 0,
+      totalTokens: 0,
+      llmModels: [],
+      usageValueNanoUsd: undefined,
+      activity: undefined
+    };
+    expect(guard.validatePublication(recoveredFailure).ok).toBe(true);
+    expect(guard.validatePublication({ ...recoveredFailure, outcome: undefined }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...recoveredFailure,
+      evidence: { ...recoveredFailure.evidence, timingConfidence: "medium" }
+    }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...recoveredFailure,
+      coverage: { ...recoveredFailure.coverage, usageCoverage: "partial" }
+    }).ok).toBe(false);
+    expect(guard.validatePublication({ ...recoveredFailure, inputTokens: 1, totalTokens: 1 }).ok).toBe(false);
     const provisionalTerminal = {
       ...event,
       coverage: {
@@ -449,6 +520,14 @@ show the actual user prompt
     }).ok).toBe(true);
     expect(guard.validatePublication({ ...event, usageValueNanoUsd: -1 }).ok).toBe(false);
     expect(guard.validatePublication({ ...event, usageValueUsd: 0.0001 }).ok).toBe(false);
+    expect(guard.validatePublication({
+      ...event,
+      activity: [{ ...event.activity[0], rejectedCount: 1 }, event.activity[1]]
+    }).ok).toBe(true);
+    expect(guard.validatePublication({
+      ...event,
+      activity: [{ ...event.activity[0], rejectedCount: 2 }, event.activity[1]]
+    }).ok).toBe(false);
     expect(guard.validatePublication({
       ...event,
       activity: [{ ...event.activity[0], failureCount: 4 }, event.activity[1]]

@@ -133,6 +133,7 @@ describe("agent production run attribution foundation", () => {
     const baseline = (await repositories.listSnapshots()).at(-1)!;
     const startedAt = new Date(Date.parse(baseline.observedAt) + 1).toISOString();
     const resolved = await repositories.resolveWorkspaceEvidence(repository, ["src/causal-write.ts"]);
+    const rejected = await repositories.resolveWorkspaceEvidence(repository, ["src/rejected-write.ts"]);
     expect(resolved).toMatchObject({
       repositoryKey: expect.stringMatching(/^[a-f0-9]{64}$/),
       artifactKeys: [expect.stringMatching(/^[a-f0-9]{64}$/)]
@@ -188,6 +189,21 @@ describe("agent production run attribution foundation", () => {
         endedAt: observedAt,
         artifactKeys: resolved!.artifactKeys,
         artifactEvidence: "provider_write_hook"
+      }, {
+        schemaVersion: 1,
+        nodeId: "node_rejected_write",
+        queryId: completed.correlationId,
+        repositoryKey: resolved!.repositoryKey,
+        provider: "codex",
+        runtime: "codex",
+        nodeKind: "tool",
+        name: "Write",
+        toolName: "Write",
+        outcome: "rejected",
+        startedAt: observedAt,
+        endedAt: observedAt,
+        artifactKeys: rejected!.artifactKeys,
+        artifactEvidence: "provider_write_hook"
       }],
       usageAtoms: []
     });
@@ -200,9 +216,563 @@ describe("agent production run attribution foundation", () => {
     expect(evidence).toEqual([expect.objectContaining({
       queryId: completed.correlationId,
       repoKey: resolved!.repositoryKey,
-      causalArtifactKeys: resolved!.artifactKeys
+      causalArtifactKeys: resolved!.artifactKeys,
+      causalWriteArtifacts: [{
+        artifactKey: resolved!.artifactKeys[0],
+        executionNodeId: "node_causal_write"
+      }]
     })]);
+    expect(evidence[0]?.causalWriteArtifacts?.map((item) => item.artifactKey)).not.toContain(rejected!.artifactKeys[0]);
     expect(JSON.stringify(evidence)).not.toContain("causal-write.ts");
+
+    await attribution.stop();
+    await repositories.stop();
+    await storage.close();
+  });
+
+  it("does not create causal proof or commit authority from a generic Claude Write conflicted by its exact native rejection", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-agent-rejected-write-"));
+    roots.push(root);
+    const repository = join(root, "repo");
+    execFileSync("git", ["init", repository]);
+    execFileSync("git", ["-C", repository, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", repository, "config", "user.name", "Test"]);
+    writeFileSync(join(repository, "initial.txt"), "initial\n");
+    execFileSync("git", ["-C", repository, "add", "."]);
+    execFileSync("git", ["-C", repository, "commit", "-m", "initial"]);
+
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: new Date().toISOString(),
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const scopes = new RepositoryScopeManagement(storage, join(root, "locator.key"));
+    await scopes.add(repository, "repository", metadata.environmentId, new Date().toISOString());
+    const repositories = new AgentRepositoryObservationService(storage, scopes, join(root, "hmac.key"), 60_000);
+    await repositories.start();
+    await repositories.refresh();
+    const baseline = (await repositories.listSnapshots()).at(-1)!;
+    const startedAt = new Date(Date.parse(baseline.observedAt) + 1).toISOString();
+    const endedAt = new Date(Date.parse(startedAt) + 1).toISOString();
+    const resolved = await repositories.resolveWorkspaceEvidence(repository, ["rejected-write.ts"]);
+    expect(resolved).toMatchObject({
+      repositoryKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+      artifactKeys: [expect.stringMatching(/^[a-f0-9]{64}$/)]
+    });
+    const completed = {
+      ...run(startedAt, endedAt),
+      runId: "run_rejected_claude_write",
+      correlationId: "qry_rejected_claude_write",
+      queryId: "qry_rejected_claude_write",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      repositoryKey: resolved!.repositoryKey
+    };
+    await storage.replaceProductionRuns([completed]);
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: "node_successful_unrelated_claude_write",
+      sortAt: startedAt,
+      value: {
+        schemaVersion: 1,
+        nodeId: "node_successful_unrelated_claude_write",
+        queryId: completed.queryId,
+        repositoryKey: resolved!.repositoryKey,
+        requestId: "req_conflicted_claude_write",
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "logs",
+        nodeKind: "tool",
+        name: "Write",
+        toolName: "Write",
+        outcome: "success",
+        startedAt,
+        artifactKeys: resolved!.artifactKeys,
+        artifactEvidence: "provider_write_hook"
+      } satisfies ExecutionNodeAtomV1
+    });
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: "node_rejected_claude_write",
+      sortAt: startedAt,
+      value: {
+        schemaVersion: 1,
+        nodeId: "node_rejected_claude_write",
+        queryId: completed.queryId,
+        repositoryKey: resolved!.repositoryKey,
+        requestId: "req_conflicted_claude_write",
+        provider: "claude-code",
+        runtime: "claude-code",
+        signal: "logs",
+        nodeKind: "tool",
+        name: "Write",
+        toolName: "Write",
+        outcome: "rejected",
+        outcomeAuthority: "native_permission_decision",
+        startedAt
+      } satisfies ExecutionNodeAtomV1
+    });
+
+    const attribution = new AgentVerifiedAttributionService(storage, repositories);
+    await attribution.start();
+    await attribution.observeProductionRuns([completed]);
+
+    const evidence = await attribution.listWorkspaceEvidence();
+    expect(evidence).toEqual([expect.objectContaining({
+      causalWriteArtifactsComplete: true,
+      causalWriteArtifacts: [],
+      nativeRejectedCausalWriteArtifacts: [{
+        artifactKey: resolved!.artifactKeys[0],
+        executionNodeId: "node_successful_unrelated_claude_write"
+      }]
+    })]);
+    expect(evidence.flatMap((item) => item.causalArtifactKeys ?? [])).not.toContain(resolved!.artifactKeys[0]);
+
+    writeFileSync(join(repository, "rejected-write.ts"), "not written by the rejected tool\n");
+    execFileSync("git", ["-C", repository, "add", "rejected-write.ts"]);
+    execFileSync("git", ["-C", repository, "commit", "-m", "rejected write"]);
+    await repositories.refresh();
+
+    expect(await repositories.requireObservation().listCandidates()).toEqual([
+      expect.objectContaining({ decision: "pending_evidence" })
+    ]);
+    expect(await attribution.listCommitAttributions()).toEqual([]);
+
+    await attribution.stop();
+    await repositories.stop();
+    await storage.close();
+  });
+
+  it("retracts only the exact durable causal pair when a Claude native decision arrives after success", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-agent-late-native-rejection-"));
+    roots.push(root);
+    const repository = join(root, "repo");
+    execFileSync("git", ["init", repository]);
+    execFileSync("git", ["-C", repository, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", repository, "config", "user.name", "Test"]);
+    writeFileSync(join(repository, "initial.txt"), "initial\n");
+    execFileSync("git", ["-C", repository, "add", "."]);
+    execFileSync("git", ["-C", repository, "commit", "-m", "initial"]);
+
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: new Date().toISOString(),
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const scopes = new RepositoryScopeManagement(storage, join(root, "locator.key"));
+    await scopes.add(repository, "repository", metadata.environmentId, new Date().toISOString());
+    const repositories = new AgentRepositoryObservationService(storage, scopes, join(root, "hmac.key"), 60_000);
+    await repositories.start();
+    await repositories.refresh();
+    const baseline = (await repositories.listSnapshots()).at(-1)!;
+    const startedAt = new Date(Date.parse(baseline.observedAt) + 1).toISOString();
+    const rejected = await repositories.resolveWorkspaceEvidence(repository, ["src/rejected.ts"]);
+    const independent = await repositories.resolveWorkspaceEvidence(repository, ["src/independent.ts"]);
+    expect(rejected?.repositoryKey).toBe(independent?.repositoryKey);
+    mkdirSync(join(repository, "src"));
+    writeFileSync(join(repository, "src", "rejected.ts"), "rejected later\n");
+    writeFileSync(join(repository, "src", "independent.ts"), "independent\n");
+    const observedAt = new Date().toISOString();
+    const queryId = "qry_late_native_durable";
+    const completed = {
+      ...run(startedAt, observedAt),
+      runId: "run_late_native_durable",
+      correlationId: queryId,
+      queryId,
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      repositoryKey: rejected!.repositoryKey
+    };
+    await storage.replaceProductionRuns([completed]);
+    const successfulRejected: ExecutionNodeAtomV1 = {
+      schemaVersion: 1,
+      nodeId: "node_late_native_rejected_write",
+      queryId,
+      repositoryKey: rejected!.repositoryKey,
+      requestId: "req_hook_late_native_rejected",
+      invocationId: "invocation_late_native_rejected",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      nodeKind: "tool",
+      name: "Write",
+      toolName: "Write",
+      outcome: "success",
+      startedAt: observedAt,
+      artifactKeys: rejected!.artifactKeys,
+      artifactEvidence: "provider_write_hook"
+    };
+    const successfulIndependent: ExecutionNodeAtomV1 = {
+      ...successfulRejected,
+      nodeId: "node_late_native_independent_write",
+      requestId: "req_hook_late_native_independent",
+      invocationId: "invocation_late_native_independent",
+      artifactKeys: independent!.artifactKeys
+    };
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: successfulRejected.nodeId,
+      sortAt: observedAt,
+      value: successfulRejected
+    });
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: successfulIndependent.nodeId,
+      sortAt: observedAt,
+      value: successfulIndependent
+    });
+    await repositories.refresh();
+
+    const attribution = new AgentProductionRunAttribution(storage, repositories);
+    await attribution.start();
+    await attribution.observeProductionRuns([completed]);
+    expect((await attribution.listEvidence())[0]?.causalWriteArtifacts).toEqual(expect.arrayContaining([
+      { artifactKey: rejected!.artifactKeys[0], executionNodeId: successfulRejected.nodeId },
+      { artifactKey: independent!.artifactKeys[0], executionNodeId: successfulIndependent.nodeId }
+    ]));
+
+    const decision: ExecutionNodeAtomV1 = {
+      ...successfulRejected,
+      nodeId: "node_late_native_permission_decision",
+      requestId: "req_otlp_late_native_rejected",
+      outcome: "rejected",
+      outcomeAuthority: "native_permission_decision",
+      artifactKeys: undefined,
+      artifactEvidence: undefined
+    };
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: decision.nodeId,
+      sortAt: new Date(Date.parse(observedAt) + 1).toISOString(),
+      value: decision
+    });
+    await attribution.observeSafeObservation({
+      schemaVersion: 1,
+      observationId: "obs_late_native_permission_decision",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "claude-code-otlp-logs-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: new Date(Date.parse(observedAt) + 1).toISOString(),
+      executionNodes: [decision],
+      usageAtoms: []
+    });
+
+    const [evidence] = await attribution.listEvidence();
+    expect(evidence).toMatchObject({
+      causalWriteArtifactsComplete: true,
+      causalWriteArtifacts: [{
+        artifactKey: independent!.artifactKeys[0],
+        executionNodeId: successfulIndependent.nodeId
+      }],
+      nativeRejectedCausalWriteArtifacts: [{
+        artifactKey: rejected!.artifactKeys[0],
+        executionNodeId: successfulRejected.nodeId
+      }]
+    });
+    const [episode] = await attribution.listEpisodes({ queryId });
+    expect(episode?.evidence[0]).toMatchObject({
+      causalWriteArtifactsComplete: true,
+      causalWriteArtifacts: [{
+        artifactKey: independent!.artifactKeys[0],
+        executionNodeId: successfulIndependent.nodeId
+      }],
+      nativeRejectedCausalWriteArtifacts: [{
+        artifactKey: rejected!.artifactKeys[0],
+        executionNodeId: successfulRejected.nodeId
+      }]
+    });
+
+    await attribution.stop();
+    await repositories.stop();
+    await storage.close();
+  });
+
+  it("ignores an exact Claude native rejection that began after the completed-run boundary", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-agent-post-boundary-native-rejection-"));
+    roots.push(root);
+    const repository = join(root, "repo");
+    execFileSync("git", ["init", repository]);
+    execFileSync("git", ["-C", repository, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", repository, "config", "user.name", "Test"]);
+    writeFileSync(join(repository, "initial.txt"), "initial\n");
+    execFileSync("git", ["-C", repository, "add", "."]);
+    execFileSync("git", ["-C", repository, "commit", "-m", "initial"]);
+
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: new Date().toISOString(),
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const scopes = new RepositoryScopeManagement(storage, join(root, "locator.key"));
+    await scopes.add(repository, "repository", metadata.environmentId, new Date().toISOString());
+    const repositories = new AgentRepositoryObservationService(storage, scopes, join(root, "hmac.key"), 60_000);
+    await repositories.start();
+    await repositories.refresh();
+    const baseline = (await repositories.listSnapshots()).at(-1)!;
+    const startedAt = new Date(Date.parse(baseline.observedAt) + 1).toISOString();
+    const completedAt = new Date(Date.parse(startedAt) + 1).toISOString();
+    const postBoundaryAt = new Date(Date.parse(completedAt) + 1).toISOString();
+    const resolved = await repositories.resolveWorkspaceEvidence(repository, ["src/post-boundary.ts"]);
+    expect(resolved).toMatchObject({
+      repositoryKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+      artifactKeys: [expect.stringMatching(/^[a-f0-9]{64}$/)]
+    });
+    mkdirSync(join(repository, "src"));
+    writeFileSync(join(repository, "src", "post-boundary.ts"), "successful write\n");
+    const queryId = "qry_post_boundary_native_rejection";
+    const completed = {
+      ...run(startedAt, completedAt),
+      runId: "run_post_boundary_native_rejection",
+      correlationId: queryId,
+      queryId,
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      repositoryKey: resolved!.repositoryKey
+    };
+    await storage.replaceProductionRuns([completed]);
+    const successfulWrite: ExecutionNodeAtomV1 = {
+      schemaVersion: 1,
+      nodeId: "node_post_boundary_successful_write",
+      queryId,
+      repositoryKey: resolved!.repositoryKey,
+      requestId: "req_hook_post_boundary_write",
+      invocationId: "invocation_post_boundary_write",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      nodeKind: "tool",
+      name: "Write",
+      toolName: "Write",
+      outcome: "success",
+      startedAt: completedAt,
+      artifactKeys: resolved!.artifactKeys,
+      artifactEvidence: "provider_write_hook"
+    };
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: successfulWrite.nodeId,
+      sortAt: completedAt,
+      value: successfulWrite
+    });
+    await repositories.refresh();
+
+    const attribution = new AgentProductionRunAttribution(storage, repositories);
+    await attribution.start();
+    await attribution.observeProductionRuns([completed]);
+    expect((await attribution.listEvidence())[0]).toMatchObject({
+      causalWriteArtifacts: [{
+        artifactKey: resolved!.artifactKeys[0],
+        executionNodeId: successfulWrite.nodeId
+      }]
+    });
+
+    const postBoundaryDecision: ExecutionNodeAtomV1 = {
+      ...successfulWrite,
+      nodeId: "node_post_boundary_native_permission_decision",
+      requestId: "req_otlp_post_boundary_write",
+      outcome: "rejected",
+      outcomeAuthority: "native_permission_decision",
+      startedAt: postBoundaryAt,
+      artifactKeys: undefined,
+      artifactEvidence: undefined
+    };
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: postBoundaryDecision.nodeId,
+      sortAt: postBoundaryAt,
+      value: postBoundaryDecision
+    });
+    await attribution.observeSafeObservation({
+      schemaVersion: 1,
+      observationId: "obs_post_boundary_native_permission_decision",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "claude-code-otlp-logs-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: postBoundaryAt,
+      executionNodes: [postBoundaryDecision],
+      usageAtoms: []
+    });
+
+    const [evidence] = await attribution.listEvidence();
+    expect(evidence).toMatchObject({
+      causalWriteArtifactsComplete: true,
+      causalWriteArtifacts: [{
+        artifactKey: resolved!.artifactKeys[0],
+        executionNodeId: successfulWrite.nodeId
+      }]
+    });
+    expect(evidence?.nativeRejectedCausalWriteArtifacts ?? []).toEqual([]);
+
+    await attribution.stop();
+    await repositories.stop();
+    await storage.close();
+  });
+
+  it("defers a decision received before terminal evidence until the completed boundary is known", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-agent-decision-before-terminal-"));
+    roots.push(root);
+    const repository = join(root, "repo");
+    execFileSync("git", ["init", repository]);
+    execFileSync("git", ["-C", repository, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", repository, "config", "user.name", "Test"]);
+    writeFileSync(join(repository, "initial.txt"), "initial\n");
+    execFileSync("git", ["-C", repository, "add", "."]);
+    execFileSync("git", ["-C", repository, "commit", "-m", "initial"]);
+
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    const metadata = await storage.initialize({
+      now: new Date().toISOString(),
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const scopes = new RepositoryScopeManagement(storage, join(root, "locator.key"));
+    await scopes.add(repository, "repository", metadata.environmentId, new Date().toISOString());
+    const repositories = new AgentRepositoryObservationService(storage, scopes, join(root, "hmac.key"), 60_000);
+    await repositories.start();
+    await repositories.refresh();
+    const baseline = (await repositories.listSnapshots()).at(-1)!;
+    const startedAt = new Date(Date.parse(baseline.observedAt) + 1).toISOString();
+    const writeAt = new Date(Date.parse(startedAt) + 1).toISOString();
+    const completedAt = new Date(Date.parse(writeAt) + 1).toISOString();
+    const postBoundaryAt = new Date(Date.parse(completedAt) + 1).toISOString();
+    const resolved = await repositories.resolveWorkspaceEvidence(repository, ["src/decision-before-terminal.ts"]);
+    expect(resolved).toBeDefined();
+    mkdirSync(join(repository, "src"));
+    writeFileSync(join(repository, "src", "decision-before-terminal.ts"), "successful write\n");
+    const queryId = "qry_decision_before_terminal";
+    const active = {
+      ...run(startedAt, completedAt),
+      runId: "run_decision_before_terminal",
+      correlationId: queryId,
+      queryId,
+      sessionId: "ses_decision_before_terminal",
+      provider: "claude-code" as const,
+      runtime: "claude-code",
+      repositoryKey: resolved!.repositoryKey,
+      endedAt: undefined
+    };
+    const successfulWrite: ExecutionNodeAtomV1 = {
+      schemaVersion: 1,
+      nodeId: "node_decision_before_terminal_successful_write",
+      queryId,
+      sessionId: active.sessionId,
+      repositoryKey: resolved!.repositoryKey,
+      requestId: "req_hook_decision_before_terminal",
+      invocationId: "invocation_decision_before_terminal",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      nodeKind: "tool",
+      name: "Write",
+      toolName: "Write",
+      outcome: "success",
+      startedAt: writeAt,
+      artifactKeys: resolved!.artifactKeys,
+      artifactEvidence: "provider_write_hook"
+    };
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: successfulWrite.nodeId,
+      sortAt: successfulWrite.startedAt,
+      value: successfulWrite
+    });
+    await repositories.refresh();
+
+    const attribution = new AgentProductionRunAttribution(storage, repositories);
+    await attribution.start();
+    const startObservation: SafeObservationV1 = {
+      schemaVersion: 1,
+      observationId: "obs_decision_before_terminal_start",
+      sourceId: "hook_claude_code_lifecycle",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "claude-code-hooks-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: startedAt,
+      repositoryKey: resolved!.repositoryKey,
+      queryOccurrences: [{
+        schemaVersion: 1,
+        queryId,
+        sessionId: active.sessionId,
+        repositoryKey: resolved!.repositoryKey,
+        provider: "claude-code",
+        runtime: "claude-code",
+        startedAt,
+        promptState: "captured",
+        evidence: "submission_hook"
+      }],
+      usageAtoms: []
+    };
+    await attribution.observeSafeObservation(startObservation);
+    await attribution.observeRun(productionRunForAttribution(active));
+    expect((await attribution.listEvidence())[0]).toMatchObject({
+      causalWriteArtifacts: [{
+        artifactKey: resolved!.artifactKeys[0],
+        executionNodeId: successfulWrite.nodeId
+      }]
+    });
+
+    const postBoundaryDecision: ExecutionNodeAtomV1 = {
+      ...successfulWrite,
+      nodeId: "node_decision_before_terminal_post_boundary_rejection",
+      requestId: "req_otlp_decision_before_terminal",
+      outcome: "rejected",
+      outcomeAuthority: "native_permission_decision",
+      startedAt: postBoundaryAt,
+      artifactKeys: undefined,
+      artifactEvidence: undefined
+    };
+    await storage.upsertAgentDocument("execution_node_atom", {
+      key: postBoundaryDecision.nodeId,
+      sortAt: postBoundaryAt,
+      value: postBoundaryDecision
+    });
+    await attribution.observeSafeObservation({
+      schemaVersion: 1,
+      observationId: "obs_decision_before_terminal_rejection",
+      sourceId: "otlp_claude_code_logs",
+      provider: "claude-code",
+      runtime: "claude-code",
+      signal: "logs",
+      profileVersion: "claude-code-otlp-logs-v1",
+      resourceCount: 1,
+      recordCount: 1,
+      observedAt: postBoundaryAt,
+      executionNodes: [postBoundaryDecision],
+      usageAtoms: []
+    });
+    let [evidence] = await attribution.listEvidence();
+    expect(evidence).toMatchObject({
+      causalWriteArtifacts: [{
+        artifactKey: resolved!.artifactKeys[0],
+        executionNodeId: successfulWrite.nodeId
+      }]
+    });
+    expect(evidence.nativeRejectedCausalWriteArtifacts ?? []).toEqual([]);
+
+    await attribution.observeSafeObservation({
+      ...startObservation,
+      observationId: "obs_decision_before_terminal_completed",
+      observedAt: completedAt,
+      queryOccurrences: startObservation.queryOccurrences?.map((occurrence) => ({
+        ...occurrence,
+        completedAt,
+        completionEvidence: "stop_hook" as const
+      }))
+    });
+    [evidence] = await attribution.listEvidence();
+    expect(evidence).toMatchObject({
+      causalWriteArtifacts: [{
+        artifactKey: resolved!.artifactKeys[0],
+        executionNodeId: successfulWrite.nodeId
+      }]
+    });
+    expect(evidence.nativeRejectedCausalWriteArtifacts ?? []).toEqual([]);
 
     await attribution.stop();
     await repositories.stop();
@@ -1023,11 +1593,18 @@ describe("agent production run attribution foundation", () => {
     const baselineSnapshot = (await repositories.listSnapshots()).at(-1)!;
     const startedAt = new Date(Date.parse(baselineSnapshot.observedAt) + 1).toISOString();
     const completed = run(startedAt, new Date(Date.parse(startedAt) + 5_000).toISOString());
+    const writeEvidence = await repositories.resolveWorkspaceEvidence(repository, ["generated.ts"]);
+    expect(writeEvidence).toBeDefined();
     await storage.replaceProductionRuns([completed]);
     await storage.upsertAgentDocument("execution_node_atom", {
       key: "write-node",
       sortAt: completed.startedAt,
-      value: writeNode(completed, repository)
+      value: {
+        ...writeNode(completed, repository),
+        repositoryKey: writeEvidence!.repositoryKey,
+        artifactKeys: writeEvidence!.artifactKeys,
+        artifactEvidence: "provider_tool_event"
+      }
     });
 
     writeFileSync(join(repository, "generated.ts"), "export const generated = 1;\n");
@@ -1086,11 +1663,18 @@ describe("agent production run attribution foundation", () => {
     const baselineSnapshot = (await repositories.listSnapshots()).at(-1)!;
     const startedAt = new Date(Date.parse(baselineSnapshot.observedAt) + 1).toISOString();
     const completed = run(startedAt, new Date(Date.parse(startedAt) + 5_000).toISOString());
+    const editEvidence = await repositories.resolveWorkspaceEvidence(repository, ["edited.ts"]);
+    expect(editEvidence).toBeDefined();
     await storage.replaceProductionRuns([completed]);
     await storage.upsertAgentDocument("execution_node_atom", {
       key: "edit-node",
       sortAt: completed.startedAt,
-      value: editNode(completed, repository)
+      value: {
+        ...editNode(completed, repository),
+        repositoryKey: editEvidence!.repositoryKey,
+        artifactKeys: editEvidence!.artifactKeys,
+        artifactEvidence: "provider_tool_event"
+      }
     });
 
     writeFileSync(join(repository, "edited.ts"), "export const value = 1;\n");
@@ -1141,11 +1725,18 @@ describe("agent production run attribution foundation", () => {
     const baselineSnapshot = (await repositories.listSnapshots()).at(-1)!;
     const startedAt = new Date(Date.parse(baselineSnapshot.observedAt) + 1).toISOString();
     const completed = run(startedAt, new Date(Date.parse(startedAt) + 5_000).toISOString());
+    const writeEvidence = await repositories.resolveWorkspaceEvidence(repository, ["generated.ts"]);
+    expect(writeEvidence).toBeDefined();
     await storage.replaceProductionRuns([completed]);
     await storage.upsertAgentDocument("execution_node_atom", {
       key: "write-node-truncated",
       sortAt: completed.startedAt,
-      value: writeNode(completed, repository, "truncated provider payload")
+      value: {
+        ...writeNode(completed, repository, "truncated provider payload"),
+        repositoryKey: writeEvidence!.repositoryKey,
+        artifactKeys: writeEvidence!.artifactKeys,
+        artifactEvidence: "provider_tool_event"
+      }
     });
 
     writeFileSync(join(repository, "generated.ts"), "export const generated = 1;\n");

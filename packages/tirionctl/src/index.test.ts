@@ -28,6 +28,27 @@ describe("tirionctl", () => {
     expect(JSON.parse(output.text())).toMatchObject({ health: "healthy", ownershipState: "agent_shadow" });
   });
 
+  it("runs the bounded pre-stop quiesce barrier and rejects malformed timeout input", async () => {
+    const { env } = await startAgent("agent_full_owner");
+    const output = buffer();
+    expect(await runTirionCtl([
+      "runtime", "quiesce", "--timeout-ms", "1000"
+    ], { env, stdout: output, stderr: buffer() })).toBe(0);
+    expect(JSON.parse(output.text())).toMatchObject({
+      schemaVersion: 1,
+      state: "drained",
+      telemetryIngressDrained: true,
+      runtimeWorkDrained: true,
+      webhookDrained: true
+    });
+
+    const invalid = buffer();
+    expect(await runTirionCtl([
+      "runtime", "quiesce", "--timeout-ms", "99"
+    ], { env, stdout: buffer(), stderr: invalid })).toBe(2);
+    expect(invalid.text()).toContain("runtime quiesce");
+  });
+
   it("exposes shadow runs without pretending they are production", async () => {
     const { env } = await startAgent();
     const output = buffer();
@@ -159,6 +180,40 @@ describe("tirionctl", () => {
         }
       }
     });
+  });
+
+  it("reads a bounded UTC diagnostic window and rejects invalid log ranges", async () => {
+    const { env } = await startAgent();
+    const output = buffer();
+    const since = new Date(Date.now() - 60_000).toISOString();
+    const until = new Date(Date.now() + 60_000).toISOString();
+    expect(await runTirionCtl([
+      "logs",
+      "--limit", "1000",
+      "--since", since,
+      "--until", until
+    ], { env, stdout: output, stderr: buffer() })).toBe(0);
+    expect(JSON.parse(output.text())).toMatchObject({
+      schemaVersion: 1,
+      events: expect.arrayContaining([
+        expect.objectContaining({ code: "runtime_started" })
+      ])
+    });
+
+    const stderr = buffer();
+    expect(await runTirionCtl([
+      "logs",
+      "--since", "2026-06-08T00:00:02Z",
+      "--until", "2026-06-08T00:00:01Z"
+    ], { env, stdout: buffer(), stderr })).toBe(1);
+    expect(stderr.text()).toBe("invalid_request\n");
+
+    const nonUtc = buffer();
+    expect(await runTirionCtl([
+      "logs",
+      "--since", "2026-06-08T00:00:01+03:00"
+    ], { env, stdout: buffer(), stderr: nonUtc })).toBe(1);
+    expect(nonUtc.text()).toBe("invalid_request\n");
   });
 
   it("configures a supported provider through the agent", async () => {

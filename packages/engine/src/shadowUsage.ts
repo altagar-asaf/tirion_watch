@@ -1,3 +1,4 @@
+import { sameExactSafeActivityIdentity } from "@tirion/agent-contract";
 import type {
   SafeActivityAtomV1,
   SafeObservationV1,
@@ -104,15 +105,34 @@ export class DefaultShadowUsagePipeline {
     occurrences: QueryOccurrenceV1[] = [],
     activities: SafeActivityAtomV1[] = []
   ): ShadowRunV1[] {
+    const occurrenceByQuery = new Map(occurrences.map((occurrence) => [occurrence.queryId, occurrence]));
     const internalQueryIds = new Set(occurrences
       .filter((occurrence) => occurrence.lifecycleVisibility === "internal")
       .map((occurrence) => occurrence.queryId));
-    const visibleAtoms = atoms.filter((atom) => !internalQueryIds.has(atom.queryId ?? atom.correlationId));
-    const visibleActivities = activities.filter((activity) => !internalQueryIds.has(activity.queryId));
-    const deduped = [...new Map(visibleAtoms.map((atom) => [atom.atomId, atom])).values()];
+    const visibleAtoms = atoms.filter((atom) => {
+      const queryId = atom.queryId ?? atom.correlationId;
+      return !internalQueryIds.has(queryId)
+        && evidenceStartedWithinCompletionBoundary(atom.startedAt, occurrenceByQuery.get(queryId));
+    });
+    const auxiliarySessionTitleRequestIds = new Set(visibleAtoms
+      .filter(isExplicitAuxiliarySessionTitleUsage)
+      .map((atom) => atom.requestId)
+      .filter((requestId): requestId is string => requestId != null));
+    const excludedAuxiliaryAtoms = visibleAtoms.filter((atom) =>
+      isAuxiliarySessionTitleUsage(atom, auxiliarySessionTitleRequestIds));
+    const auxiliarySessionTitleQueryIds = new Set(excludedAuxiliaryAtoms
+      .map((atom) => atom.queryId ?? atom.correlationId));
+    const customerUsageAtoms = visibleAtoms.filter((atom) =>
+      !isAuxiliarySessionTitleUsage(atom, auxiliarySessionTitleRequestIds));
+    const queryIdsWithCustomerUsage = new Set(customerUsageAtoms
+      .map((atom) => atom.queryId ?? atom.correlationId));
+    const visibleActivities = activities.filter((activity) =>
+      !internalQueryIds.has(activity.queryId)
+      && evidenceStartedWithinCompletionBoundary(activity.startedAt, occurrenceByQuery.get(activity.queryId)));
+    const deduped = [...new Map(customerUsageAtoms.map((atom) => [atom.atomId, atom])).values()];
     const groups = new Map<string, SafeUsageAtomV1[]>();
     const contextGroups = new Map<string, SafeUsageAtomV1[]>();
-    for (const atom of visibleAtoms) {
+    for (const atom of customerUsageAtoms) {
       const queryId = atom.queryId ?? atom.correlationId;
       contextGroups.set(queryId, [...(contextGroups.get(queryId) ?? []), atom]);
     }
@@ -120,8 +140,8 @@ export class DefaultShadowUsagePipeline {
       const queryId = atom.queryId ?? atom.correlationId;
       groups.set(queryId, [...(groups.get(queryId) ?? []), atom]);
     }
-    const occurrenceByQuery = new Map(occurrences.map((occurrence) => [occurrence.queryId, occurrence]));
-    const preferredActivityAtoms = preferredSafeActivities(visibleActivities);
+    const preferredActivityProjection = projectPreferredSafeActivities(visibleActivities);
+    const preferredActivityAtoms = preferredActivityProjection.activities;
     const activitiesByQuery = new Map<string, SafeActivityAtomV1[]>();
     for (const activity of preferredActivityAtoms) {
       activitiesByQuery.set(activity.queryId, [...(activitiesByQuery.get(activity.queryId) ?? []), activity]);
@@ -133,9 +153,20 @@ export class DefaultShadowUsagePipeline {
         now,
         occurrenceByQuery.get(queryId),
         activitiesByQuery.get(queryId) ?? [],
-        contextGroups.get(queryId) ?? group
+        contextGroups.get(queryId) ?? group,
+        auxiliarySessionTitleQueryIds.has(queryId),
+        preferredActivityProjection.ownershipAliases,
+        preferredActivityProjection.ownershipConflicts
       ));
-    return aggregateLinkedSubagentRuns(projected, preferredActivityAtoms)
+    const occurrenceOnly = [...occurrenceByQuery.values()]
+      .filter((occurrence): occurrence is AuthoritativeOutcomeOccurrence =>
+        !queryIdsWithCustomerUsage.has(occurrence.queryId) && isAuthoritativeOutcomeOccurrence(occurrence))
+      .map((occurrence) => projectOccurrenceOnlyGroup(
+        occurrence,
+        activitiesByQuery.get(occurrence.queryId) ?? [],
+        auxiliarySessionTitleQueryIds.has(occurrence.queryId)
+      ));
+    return aggregateLinkedSubagentRuns([...projected, ...occurrenceOnly], preferredActivityAtoms)
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
   }
 
@@ -179,6 +210,51 @@ export class DefaultShadowUsagePipeline {
       reasonCodes
     };
   }
+}
+
+function evidenceStartedWithinCompletionBoundary(
+  evidenceStartedAt: string,
+  occurrence: QueryOccurrenceV1 | undefined
+): boolean {
+  const boundary = durableCompletionBoundary(occurrence);
+  if (!boundary) {
+    return true;
+  }
+  const startedAt = Date.parse(evidenceStartedAt);
+  return Number.isFinite(startedAt) && startedAt <= Date.parse(boundary);
+}
+
+function durableCompletionBoundary(occurrence: QueryOccurrenceV1 | undefined): string | undefined {
+  if (
+    !occurrence
+    || occurrence.lifecycleVisibility === "internal"
+    || !occurrence.completedAt
+    || (
+      occurrence.completionEvidence !== "stop_hook"
+      && occurrence.completionEvidence !== "session_hook"
+      && occurrence.completionEvidence !== "closed_root_span"
+      && occurrence.completionEvidence !== "provider_completed_event"
+    )
+  ) {
+    return undefined;
+  }
+  const startedAt = Date.parse(occurrence.startedAt);
+  const completedAt = Date.parse(occurrence.completedAt);
+  return Number.isFinite(startedAt) && Number.isFinite(completedAt) && completedAt >= startedAt
+    ? occurrence.completedAt
+    : undefined;
+}
+
+function isExplicitAuxiliarySessionTitleUsage(atom: SafeUsageAtomV1): boolean {
+  return atom.usagePurpose === "auxiliary_session_title";
+}
+
+function isAuxiliarySessionTitleUsage(
+  atom: SafeUsageAtomV1,
+  auxiliaryRequestIds: ReadonlySet<string>
+): boolean {
+  return isExplicitAuxiliarySessionTitleUsage(atom)
+    || (atom.requestId != null && auxiliaryRequestIds.has(atom.requestId));
 }
 
 type LinkedSubagentRun = {
@@ -275,9 +351,20 @@ function finalizeLinkedSubagentBreakdown(
   };
 }
 
+type PreferredSafeActivityProjection = {
+  activities: SafeActivityAtomV1[];
+  ownershipAliases: ReadonlyMap<string, readonly string[]>;
+  ownershipConflicts: ReadonlySet<string>;
+};
+
 export function preferredSafeActivities(activities: SafeActivityAtomV1[]): SafeActivityAtomV1[] {
+  return projectPreferredSafeActivities(activities).activities;
+}
+
+function projectPreferredSafeActivities(activities: SafeActivityAtomV1[]): PreferredSafeActivityProjection {
   const parents = activities.map((_activity, index) => index);
   const owners = new Map<string, number>();
+  const nativePermissionDecisions = activities.filter(isNativePermissionRejection);
   const find = (index: number): number => {
     while (parents[index] !== index) {
       parents[index] = parents[parents[index]];
@@ -294,10 +381,22 @@ export function preferredSafeActivities(activities: SafeActivityAtomV1[]): SafeA
   };
   for (const [index, activity] of activities.entries()) {
     const scope = `${activity.provider}|${activity.queryId}`;
+    // Only the exact same provider/query/tool invocation may join a native
+    // rejection. Invocation identity takes precedence over request ID, so a
+    // reused request cannot make another provider tool use a descendant.
+    const nativeDecisionGroup = nativePermissionDecisionGroupForActivity(
+      activity,
+      nativePermissionDecisions
+    );
+    const componentScope = nativeDecisionGroup
+      ? `native_permission_decision|${nativeDecisionGroup}`
+      : "generic";
     const keys = [
-      `${scope}|activity|${activity.activityId}`,
-      ...(activity.requestId ? [`${scope}|request|${activity.requestId}`] : []),
-      ...(activity.childSessionId ? [`${scope}|child|${activity.childSessionId}`] : [])
+      `${scope}|${componentScope}|activity|${activity.activityId}`,
+      ...(safeActivityInvocationIdentityKey(activity)
+        ? [`${scope}|${componentScope}|identity|${safeActivityInvocationIdentityKey(activity)}`]
+        : []),
+      ...(activity.childSessionId ? [`${scope}|${componentScope}|child|${activity.childSessionId}`] : [])
     ];
     for (const key of keys) {
       const owner = owners.get(key);
@@ -307,38 +406,191 @@ export function preferredSafeActivities(activities: SafeActivityAtomV1[]): SafeA
       owners.set(key, index);
     }
   }
-  const preferred = new Map<number, SafeActivityAtomV1>();
+  const grouped = new Map<number, SafeActivityAtomV1[]>();
   for (const [index, activity] of activities.entries()) {
     const root = find(index);
-    const existing = preferred.get(root);
-    preferred.set(root, existing ? mergeActivityEvidence(existing, activity) : activity);
+    grouped.set(root, [...(grouped.get(root) ?? []), activity]);
   }
-  return [...preferred.values()];
+  const ownershipAliases = new Map<string, readonly string[]>();
+  const ownershipConflicts = new Set<string>();
+  const preferred = [...grouped.values()].map((component) => {
+    const merged = mergeActivityEvidence(component);
+    const key = activityOwnershipKey(merged);
+    // A native permission rejection is activity evidence only. In particular,
+    // it must not inherit generic result/trace aliases that could allocate
+    // descendant usage to a tool which never executed.
+    ownershipAliases.set(key, isNativePermissionRejection(merged)
+      ? []
+      : [...new Set(component.map((activity) => activity.activityId))].sort());
+    if (activityOwnershipConflict(component)) {
+      ownershipConflicts.add(key);
+    }
+    return merged;
+  });
+  return { activities: preferred, ownershipAliases, ownershipConflicts };
 }
 
-function mergeActivityEvidence(left: SafeActivityAtomV1, right: SafeActivityAtomV1): SafeActivityAtomV1 {
-  const preferred = activityPreference(right) >= activityPreference(left) ? right : left;
-  const trace = [left, right].find((activity) => activity.evidenceBasis === "trace_span");
-  const canonical = trace ?? preferred;
-  const failed = [left, right].find((activity) => activity.outcome === "failure" || activity.outcome === "rejected");
-  const outcome = failed?.outcome
-    ?? ([left, right].some((activity) => activity.outcome === "success") ? "success" : "unknown");
+function activityOwnershipKey(activity: SafeActivityAtomV1): string {
+  return `${activity.provider}|${activity.queryId}|${activity.activityId}`;
+}
+
+function nativePermissionDecisionGroupKey(activity: SafeActivityAtomV1): string | undefined {
+  if (!isNativePermissionRejection(activity)) {
+    return undefined;
+  }
+  const scope = `${activity.provider}|${activity.queryId}`;
+  const identity = safeActivityInvocationIdentityKey(activity);
+  return identity
+    ? `${scope}|${identity}|semantic|${activity.kind}|${activity.name}`
+    : `${scope}|activity|${activity.activityId}`;
+}
+
+function nativePermissionDecisionGroupForActivity(
+  activity: SafeActivityAtomV1,
+  nativePermissionDecisions: readonly SafeActivityAtomV1[]
+): string | undefined {
+  const ownGroup = nativePermissionDecisionGroupKey(activity);
+  if (ownGroup) {
+    return ownGroup;
+  }
+  const decision = nativePermissionDecisions.find((candidate) =>
+    sameExactSafeActivityIdentity(candidate, activity));
+  return decision ? nativePermissionDecisionGroupKey(decision) : undefined;
+}
+
+function safeActivityInvocationIdentityKey(activity: Pick<SafeActivityAtomV1, "requestId" | "invocationId">): string | undefined {
+  if (typeof activity.invocationId === "string" && activity.invocationId !== "") {
+    return `invocation|${activity.invocationId}`;
+  }
+  if (typeof activity.requestId === "string" && activity.requestId !== "") {
+    return `request|${activity.requestId}`;
+  }
+  return undefined;
+}
+
+function activityOwnershipConflict(activities: SafeActivityAtomV1[]): boolean {
+  const childSessions = new Set(activities.flatMap((activity) =>
+    activity.childSessionId ? [activity.childSessionId] : []));
+  const semantics = new Set(activities.map((activity) => `${activity.kind}|${activity.name}`));
+  return childSessions.size > 1 || semantics.size > 1;
+}
+
+function mergeActivityEvidence(activities: SafeActivityAtomV1[]): SafeActivityAtomV1 {
+  const preferred = activities.reduce((current, activity) =>
+    activityPreference(activity) >= activityPreference(current) ? activity : current
+  );
+  const trace = activities.find((activity) => activity.evidenceBasis === "trace_span");
+  const nativePermissionRejection = activities.find((activity) =>
+    isNativePermissionRejection(activity)
+    && sameExactActivityIdentity(activities, activity)
+  );
+  if (nativePermissionRejection) {
+    return rejectedNativePermissionDecision(nativePermissionRejection);
+  }
+  const childLifecycle = activities.find(isExactSubagentLifecycleActivity);
+  const agentLaunch = activities.find(isExactClaudeAgentLaunchActivity);
+  const semanticAuthority = childLifecycle ?? agentLaunch;
+  // Exact child lifecycle, or the open Agent launch until lifecycle arrives,
+  // owns timing and outcome semantics. The trace activity ID remains canonical
+  // for descendant token ownership.
+  const canonical = semanticAuthority ?? trace ?? preferred;
+  const rejected = activities.find((activity) =>
+    activity.outcome === "rejected" && sameExactActivityIdentity(activities, activity)
+  );
+  const failed = activities.find((activity) => activity.outcome === "failure");
+  const outcome = rejected?.outcome
+    ?? failed?.outcome
+    ?? (semanticAuthority
+      ? semanticAuthority.outcome
+      : activities.some((activity) => activity.outcome === "success") ? "success" : "unknown");
+  const timingEvidence = childLifecycle
+    ? activities.filter(isExactSubagentLifecycleActivity)
+    : agentLaunch
+      ? activities.filter(isExactClaudeAgentLaunchActivity)
+      : activities;
+  const semantic = semanticAuthority ?? preferred;
+  const { outcomeAuthority: _outcomeAuthority, ...canonicalFields } = canonical;
   return {
-    ...canonical,
-    name: preferred.name,
-    kind: preferred.kind,
+    ...canonicalFields,
+    activityId: trace?.activityId ?? canonical.activityId,
+    name: semantic.name,
+    kind: semantic.kind,
     outcome,
+    ...(rejected?.outcomeAuthority ? { outcomeAuthority: rejected.outcomeAuthority } : {}),
     requestId: preferred.requestId ?? canonical.requestId,
-    childSessionId: preferred.childSessionId ?? canonical.childSessionId,
-    startedAt: left.startedAt < right.startedAt ? left.startedAt : right.startedAt,
-    endedAt: [left.endedAt, right.endedAt].filter((value): value is string => Boolean(value)).sort().at(-1),
-    durationMs: Math.max(left.durationMs ?? 0, right.durationMs ?? 0) || undefined,
-    resultSizeBytes: Math.max(left.resultSizeBytes ?? 0, right.resultSizeBytes ?? 0) || undefined,
+    invocationId: preferred.invocationId
+      ?? canonical.invocationId
+      ?? activities.find((activity) => activity.invocationId)?.invocationId,
+    childSessionId: semanticAuthority?.childSessionId
+      ?? preferred.childSessionId
+      ?? canonical.childSessionId
+      ?? activities.find((activity) => activity.childSessionId)?.childSessionId,
+    startedAt: timingEvidence.map((activity) => activity.startedAt).sort()[0] ?? canonical.startedAt,
+    endedAt: timingEvidence
+      .map((activity) => activity.endedAt)
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .at(-1),
+    durationMs: Math.max(...timingEvidence.map((activity) => activity.durationMs ?? 0)) || undefined,
+    resultSizeBytes: Math.max(...activities.map((activity) => activity.resultSizeBytes ?? 0)) || undefined,
     providerReportedResultTokens: Math.max(
-      left.providerReportedResultTokens ?? 0,
-      right.providerReportedResultTokens ?? 0
+      ...activities.map((activity) => activity.providerReportedResultTokens ?? 0)
     ) || undefined
   };
+}
+
+function sameExactActivityIdentity(
+  activities: SafeActivityAtomV1[],
+  candidate: SafeActivityAtomV1
+): boolean {
+  return activities.every((activity) => sameExactSafeActivityIdentity(activity, candidate));
+}
+
+function isNativePermissionRejection(activity: SafeActivityAtomV1): boolean {
+  return activity.outcome === "rejected"
+    && activity.outcomeAuthority === "native_permission_decision";
+}
+
+function rejectedNativePermissionDecision(decision: SafeActivityAtomV1): SafeActivityAtomV1 {
+  const {
+    activityId: _activityId,
+    requestId: _requestId,
+    childSessionId: _childSessionId,
+    kind: _kind,
+    name: _name,
+    outcome: _outcome,
+    outcomeAuthority: _outcomeAuthority,
+    durationMs: _durationMs,
+    resultSizeBytes: _resultSizeBytes,
+    providerReportedResultTokens: _providerReportedResultTokens,
+    sensitiveAuditEvidence: _sensitiveAuditEvidence,
+    endedAt: _endedAt,
+    ...safeDecisionFields
+  } = decision;
+  return {
+    ...safeDecisionFields,
+    activityId: decision.activityId,
+    ...(decision.requestId ? { requestId: decision.requestId } : {}),
+    kind: decision.kind,
+    name: decision.name,
+    outcome: "rejected",
+    outcomeAuthority: "native_permission_decision",
+    startedAt: decision.startedAt
+  };
+}
+
+function isExactSubagentLifecycleActivity(activity: SafeActivityAtomV1): boolean {
+  return activity.kind === "subagent"
+    && activity.evidenceBasis === "subagent_hook"
+    && activity.evidenceSourceId === "hook_claude_code_lifecycle";
+}
+
+function isExactClaudeAgentLaunchActivity(activity: SafeActivityAtomV1): boolean {
+  return activity.provider === "claude-code"
+    && activity.kind === "subagent"
+    && Boolean(activity.childSessionId)
+    && activity.evidenceBasis === "subagent_hook"
+    && activity.evidenceSourceId === "hook_claude_code_tools";
 }
 
 function activityPreference(activity: SafeActivityAtomV1): number {
@@ -363,6 +615,7 @@ function mergeLinkedSubagentRun(
   const modelProviders = new Set([parent.modelProvider, child.modelProvider].filter(Boolean));
   const estimatedNanoUsd = optionalPairSum(parent.estimatedNanoUsd, child.estimatedNanoUsd);
   const usageValueNanoUsd = optionalPairSum(parent.usageValueNanoUsd, child.usageValueNanoUsd);
+  const context = mergeLinkedSubagentContext(parent, child);
   return {
     ...parent,
     model: models.length === 1 ? models[0] : undefined,
@@ -377,6 +630,7 @@ function mergeLinkedSubagentRun(
     totalTokens: parent.totalTokens + child.totalTokens,
     estimatedNanoUsd,
     usageValueNanoUsd,
+    ...(context ? { context } : {}),
     costCoverage: combinedCostCoverage(parent.costCoverage, child.costCoverage),
     toolCallCount: (parent.toolCallCount ?? 0) + (child.toolCallCount ?? 0),
     breakdown: mergeSubagentBreakdown(parent, child, activity),
@@ -386,6 +640,104 @@ function mergeLinkedSubagentRun(
       : undefined,
     warnings: [...new Set([...parent.warnings, ...child.warnings])]
   };
+}
+
+function mergeLinkedSubagentContext(
+  parent: ShadowRunV1,
+  child: ShadowRunV1
+): RunContextFootprintV1 | undefined {
+  const entries = [parent, child].flatMap((run) => run.context ? [{ run, context: run.context }] : []);
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  const initialInputContextTokens = linkedInitialInputContextTokens(entries);
+  const latestInputContextTokens = linkedLatestInputContextTokens(entries);
+  const peakCandidates = entries.flatMap(({ context }) => [
+    context.initialInputContextTokens,
+    context.latestInputContextTokens,
+    context.peakInputContextTokens
+  ]).filter((value): value is number => value != null);
+  const peakInputContextTokens = peakCandidates.length > 0 ? Math.max(...peakCandidates) : undefined;
+  const contextGrowthInputTokens = initialInputContextTokens != null && peakInputContextTokens != null
+    ? Math.max(0, peakInputContextTokens - initialInputContextTokens)
+    : undefined;
+  const bases = [...new Set(entries.map(({ context }) => context.basis))];
+
+  return {
+    schemaVersion: 1,
+    accumulatedInputTokens: inputContextTokensForRun(parent) + inputContextTokensForRun(child),
+    ...(initialInputContextTokens != null ? { initialInputContextTokens } : {}),
+    ...(latestInputContextTokens != null ? { latestInputContextTokens } : {}),
+    ...(peakInputContextTokens != null ? { peakInputContextTokens } : {}),
+    cacheReadInputTokens: parent.cacheReadInputTokens + child.cacheReadInputTokens,
+    cacheCreationInputTokens: parent.cacheCreationInputTokens + child.cacheCreationInputTokens,
+    observedLlmRequestCount: entries.reduce((sum, { context }) => sum + context.observedLlmRequestCount, 0),
+    ...(contextGrowthInputTokens != null ? { contextGrowthInputTokens } : {}),
+    ...(initialInputContextTokens && peakInputContextTokens != null
+      ? { contextGrowthRatio: peakInputContextTokens / initialInputContextTokens }
+      : {}),
+    basis: bases.length === 1 ? bases[0] : "derived_from_usage_atoms",
+    coverage: linkedContextCoverage(parent, child)
+  };
+}
+
+function linkedInitialInputContextTokens(
+  entries: Array<{ run: ShadowRunV1; context: RunContextFootprintV1 }>
+): number | undefined {
+  const candidates = entries.filter(({ context }) => context.initialInputContextTokens != null);
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  const earliestStartedAt = candidates.map(({ run }) => run.startedAt).sort()[0];
+  const values = [...new Set(candidates
+    .filter(({ run }) => run.startedAt === earliestStartedAt)
+    .map(({ context }) => context.initialInputContextTokens!))];
+  return values.length === 1 ? values[0] : undefined;
+}
+
+function linkedLatestInputContextTokens(
+  entries: Array<{ run: ShadowRunV1; context: RunContextFootprintV1 }>
+): number | undefined {
+  if (entries.some(({ context }) =>
+    context.observedLlmRequestCount > 0 && context.latestInputContextTokens == null)) {
+    return undefined;
+  }
+  const candidates = entries.filter(({ context }) => context.latestInputContextTokens != null);
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  const values = [...new Set(candidates.map(({ context }) => context.latestInputContextTokens!))];
+  // Run completion order is not LLM-request order: a root can complete after a
+  // child even when the child's request supplied the latest observed context.
+  // Until the footprint contract retains an explicit latest-request timestamp,
+  // only an identical linked value is order-independent.
+  return values.length === 1 ? values[0] : undefined;
+}
+
+function linkedContextCoverage(parent: ShadowRunV1, child: ShadowRunV1): RunContextFootprintV1["coverage"] {
+  const entries = [parent, child];
+  const missingReportedInputContext = entries.some((run) =>
+    !run.context
+    && (
+      inputContextTokensForRun(run) > 0
+      || run.outputTokens > 0
+      || run.reasoningOutputTokens > 0
+    ));
+  const contexts = entries.flatMap((run) => run.context ? [run.context] : []);
+  if (
+    missingReportedInputContext
+    || contexts.some((context) => context.coverage === "none" || context.coverage === "partial")
+  ) {
+    return "partial";
+  }
+  return parent.endedAt && child.endedAt && contexts.every((context) => context.coverage === "final")
+    ? "final"
+    : "complete_so_far";
+}
+
+function inputContextTokensForRun(run: ShadowRunV1): number {
+  return run.inputTokens + run.cacheReadInputTokens + run.cacheCreationInputTokens;
 }
 
 function mergeSubagentBreakdown(
@@ -404,6 +756,7 @@ function mergeSubagentBreakdown(
       name: activity.name,
       count: 1,
       failureCount: activity.outcome === "failure" || activity.outcome === "rejected" ? 1 : 0,
+      ...(activity.outcome === "rejected" ? { rejectedCount: 1 } : {}),
       unknownCount: activity.outcome === "unknown" ? 1 : 0,
       attributionBasis: "activity_only",
       coverage: "unavailable"
@@ -532,11 +885,21 @@ export class DefaultProductionUsagePipeline {
     occurrences: QueryOccurrenceV1[] = [],
     activities: SafeActivityAtomV1[] = []
   ): ProductionRunV1[] {
-    return this.shadowPolicy.project(atoms, now, occurrences, activities).map(({ shadow: _shadow, ...run }) => ({
-      ...run,
-      production: true,
-      runId: `run_${(run.queryId ?? run.correlationId).slice(4)}`
-    }));
+    const occurrenceByQuery = new Map(occurrences.map((occurrence) => [occurrence.queryId, occurrence]));
+    return this.shadowPolicy.project(atoms, now, occurrences, activities)
+      .filter((run) => {
+        if (run.provider !== "claude-code") {
+          return true;
+        }
+        const occurrence = occurrenceByQuery.get(run.queryId ?? run.correlationId);
+        return occurrence?.lifecycleVisibility !== "internal"
+          && occurrence?.evidence === "submission_hook";
+      })
+      .map(({ shadow: _shadow, ...run }) => ({
+        ...run,
+        production: true,
+        runId: `run_${(run.queryId ?? run.correlationId).slice(4)}`
+      }));
   }
 
   totals(runs: ProductionRunV1[]): ProductionTotalsV1 {
@@ -546,13 +909,83 @@ export class DefaultProductionUsagePipeline {
   }
 }
 
+type AuthoritativeOutcomeOccurrence = QueryOccurrenceV1 & {
+  completedAt: string;
+  completionEvidence: Exclude<NonNullable<QueryOccurrenceV1["completionEvidence"]>, "inactivity">;
+  completionOutcome: NonNullable<QueryOccurrenceV1["completionOutcome"]>;
+};
+
+function isAuthoritativeOutcomeOccurrence(
+  occurrence: QueryOccurrenceV1
+): occurrence is AuthoritativeOutcomeOccurrence {
+  const startedAt = Date.parse(occurrence.startedAt);
+  const completedAt = Date.parse(occurrence.completedAt ?? "");
+  return occurrence.lifecycleVisibility !== "internal"
+    && typeof occurrence.completedAt === "string"
+    && Number.isFinite(startedAt)
+    && Number.isFinite(completedAt)
+    && completedAt >= startedAt
+    && occurrence.completionEvidence != null
+    && occurrence.completionEvidence !== "inactivity"
+    && occurrence.completionOutcome != null;
+}
+
+function projectOccurrenceOnlyGroup(
+  occurrence: AuthoritativeOutcomeOccurrence,
+  activities: SafeActivityAtomV1[],
+  auxiliarySessionTitleExcluded = false
+): ShadowRunV1 {
+  const totals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 0
+  };
+  return {
+    schemaVersion: 1,
+    shadow: true,
+    runId: `shadow_${occurrence.queryId.slice(4)}`,
+    correlationId: occurrence.queryId,
+    queryId: occurrence.queryId,
+    sessionId: occurrence.sessionId,
+    ...(occurrence.repositoryKey ? { repositoryKey: occurrence.repositoryKey } : {}),
+    promptState: occurrence.promptState,
+    ...(occurrence.promptText ? { promptText: occurrence.promptText } : {}),
+    provider: occurrence.provider,
+    runtime: occurrence.runtime,
+    authority: "event",
+    ...totals,
+    costEstimateBasis: "unavailable",
+    billingContext: "unknown",
+    costCoverage: "unavailable",
+    evidenceGrade: "estimated_usage_cost_unattributed",
+    toolCallCount: activities.length,
+    breakdown: runBreakdown(occurrence.queryId, occurrence.provider, [], activities, totals),
+    completionEvidence: occurrence.completionEvidence,
+    completionOutcome: occurrence.completionOutcome,
+    startedAt: occurrence.startedAt,
+    endedAt: occurrence.completedAt,
+    warnings: [
+      ...(auxiliarySessionTitleExcluded ? ["auxiliary_session_title_excluded" as const] : []),
+      "no_usage_atoms",
+      "model_unavailable",
+      "billing_context_unavailable"
+    ]
+  };
+}
+
 function projectGroup(
   queryId: string,
   atoms: SafeUsageAtomV1[],
   now: Date,
   occurrence: QueryOccurrenceV1 | undefined,
   activities: SafeActivityAtomV1[],
-  contextAtoms: SafeUsageAtomV1[]
+  contextAtoms: SafeUsageAtomV1[],
+  auxiliarySessionTitleExcluded: boolean,
+  activityOwnershipAliases: ReadonlyMap<string, readonly string[]>,
+  activityOwnershipConflicts: ReadonlySet<string>
 ): ShadowRunV1 {
   const provider = atoms[0].provider;
   const priority = authorityPriority(provider);
@@ -591,6 +1024,7 @@ function projectGroup(
   const price = priceAtoms(selected, resolvedBillingContext);
   const usageValue = usageValueAtoms(selected, price);
   const warnings: ShadowRunV1["warnings"] = [];
+  if (auxiliarySessionTitleExcluded) warnings.push("auxiliary_session_title_excluded");
   if (accountingAtoms.length > selected.length) warnings.push("lower_authority_overlap_discarded");
   if (accountingAtoms.length === 0) warnings.push("no_usage_atoms");
   if (!model) warnings.push("model_unavailable");
@@ -607,7 +1041,7 @@ function projectGroup(
   const sessionId = occurrence?.sessionId ?? (sessionIds.length === 1 ? sessionIds[0] : queryId);
   if (sessionIds.length !== 1 && atoms.some((atom) => atom.queryId)) warnings.push("session_identity_unavailable");
   const endedAt = completedAt(
-    accountingAtoms.length > 0 ? accountingAtoms : atoms,
+    selected.length > 0 ? selected : accountingAtoms.length > 0 ? accountingAtoms : atoms,
     now,
     accountingAtoms.length > 0,
     occurrence
@@ -619,7 +1053,7 @@ function projectGroup(
     cacheCreationInputTokens,
     reasoningOutputTokens,
     totalTokens: inputTokens + outputTokens
-  });
+  }, activityOwnershipAliases, activityOwnershipConflicts);
   const context = contextFootprintFromUsageAtoms(selected, {
     accumulatedInputTokens: inputTokens + cacheReadInputTokens + cacheCreationInputTokens,
     cacheReadInputTokens,
@@ -660,6 +1094,12 @@ function projectGroup(
     toolCallCount: activities.length,
     breakdown,
     ...(context ? { context } : {}),
+    ...(occurrence && isAuthoritativeOutcomeOccurrence(occurrence)
+      ? {
+          completionEvidence: occurrence.completionEvidence,
+          completionOutcome: occurrence.completionOutcome
+        }
+      : {}),
     startedAt,
     endedAt,
     warnings: [...new Set(warnings)]
@@ -671,9 +1111,36 @@ function runBreakdown(
   provider: SafeObservationV1["provider"],
   atoms: SafeUsageAtomV1[],
   activities: SafeActivityAtomV1[],
-  totals: Pick<ShadowRunV1, "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens" | "reasoningOutputTokens" | "totalTokens">
+  totals: Pick<ShadowRunV1, "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens" | "reasoningOutputTokens" | "totalTokens">,
+  activityOwnershipAliases: ReadonlyMap<string, readonly string[]> = new Map(),
+  activityOwnershipConflicts: ReadonlySet<string> = new Set()
 ): RunBreakdownV1[] {
   const dedupedActivities = [...new Map(activities.map((activity) => [activity.activityId, activity])).values()];
+  const conflictingRequestIds = new Set(atoms
+    .filter((atom) => (atom.ownershipConflictActivityIds?.length ?? 0) > 0)
+    .map((atom) => atom.requestId)
+    .filter((requestId): requestId is string => requestId != null));
+  const conflictingOwnerIds = new Set(atoms.flatMap((atom) => atom.ownershipConflictActivityIds ?? []));
+  if (provider === "claude-code") {
+    const atomsByRequest = new Map<string, SafeUsageAtomV1[]>();
+    for (const atom of atoms) {
+      if (atom.requestId) {
+        atomsByRequest.set(atom.requestId, [...(atomsByRequest.get(atom.requestId) ?? []), atom]);
+      }
+    }
+    for (const [requestId, revisions] of atomsByRequest) {
+      const owners = new Set(revisions.flatMap((atom) => [
+        ...(atom.owningActivityId ? [atom.owningActivityId] : []),
+        ...(atom.ownershipConflictActivityIds ?? [])
+      ]));
+      if (revisions.some((atom) => (atom.ownershipConflictActivityIds?.length ?? 0) > 0) || owners.size > 1) {
+        conflictingRequestIds.add(requestId);
+        for (const owner of owners) {
+          conflictingOwnerIds.add(owner);
+        }
+      }
+    }
+  }
   const byGroup = new Map<string, SafeActivityAtomV1[]>();
   for (const activity of dedupedActivities) {
     const key = `${activity.kind}:${activity.name}`;
@@ -686,8 +1153,17 @@ function runBreakdown(
   let allocatedCacheCreation = 0;
   let allocatedReasoning = 0;
   for (const [key, group] of byGroup) {
-    const activityIds = new Set(group.map((activity) => activity.activityId));
-    const candidates = atoms.filter((atom) => atom.owningActivityId && activityIds.has(atom.owningActivityId));
+    const ownershipIdsByActivity = new Map(group.map((activity) => {
+      const ownershipKey = activityOwnershipKey(activity);
+      return [activity.activityId, activityOwnershipConflicts.has(ownershipKey)
+        ? []
+        : activityOwnershipAliases.get(ownershipKey) ?? [activity.activityId]] as const;
+    }));
+    const activityIds = new Set([...ownershipIdsByActivity.values()].flat());
+    const candidates = atoms.filter((atom) =>
+      atom.owningActivityId
+      && activityIds.has(atom.owningActivityId)
+      && (atom.requestId == null || !conflictingRequestIds.has(atom.requestId)));
     const priority = authorityPriority(provider);
     const selectedAuthority = candidates.length > 0
       ? [...candidates].sort((a, b) => priority.indexOf(a.authority) - priority.indexOf(b.authority))[0].authority
@@ -707,6 +1183,23 @@ function runBreakdown(
       && allocatedCacheCreation + cacheCreationInputTokens <= totals.cacheCreationInputTokens
       && allocatedReasoning + reasoningOutputTokens <= totals.reasoningOutputTokens;
     const hasAttributedUsage = selected.length > 0 && conserves;
+    const selectedOwnerIds = new Set(selected.flatMap((atom) =>
+      atom.owningActivityId ? [atom.owningActivityId] : []));
+    const hasExactChildIdentity = group.some((activity) => activity.childSessionId);
+    const exactChildSessions = new Set(group.flatMap((activity) =>
+      activity.childSessionId ? [activity.childSessionId] : []));
+    const everyExactChildOwned = !hasExactChildIdentity || (
+      exactChildSessions.size === group.length
+      && group.every((activity) =>
+        (ownershipIdsByActivity.get(activity.activityId) ?? [])
+          .some((activityId) => selectedOwnerIds.has(activityId)))
+    );
+    const hasOwnershipConflict = [...activityIds].some((activityId) => conflictingOwnerIds.has(activityId));
+    const coverage = !hasAttributedUsage
+      ? "unavailable"
+      : hasOwnershipConflict || (group[0].kind === "subagent" && !everyExactChildOwned)
+        ? "partial"
+        : "complete";
     if (hasAttributedUsage) {
       allocatedInput += inputTokens;
       allocatedOutput += outputTokens;
@@ -714,6 +1207,7 @@ function runBreakdown(
       allocatedCacheCreation += cacheCreationInputTokens;
       allocatedReasoning += reasoningOutputTokens;
     }
+    const rejectedCount = group.filter((activity) => activity.outcome === "rejected").length;
     breakdown.push({
       schemaVersion: 1,
       breakdownId: breakdownId(queryId, key),
@@ -721,6 +1215,7 @@ function runBreakdown(
       name: group[0].name,
       count: group.length,
       failureCount: group.filter((activity) => activity.outcome === "failure" || activity.outcome === "rejected").length,
+      ...(rejectedCount > 0 ? { rejectedCount } : {}),
       unknownCount: group.filter((activity) => activity.outcome === "unknown").length,
       totalDurationMs: optionalSum(group.map((activity) => activity.durationMs)),
       resultSizeBytes: optionalSum(group.map((activity) => activity.resultSizeBytes)),
@@ -735,7 +1230,7 @@ function runBreakdown(
         totalTokens
       } : {}),
       attributionBasis: hasAttributedUsage ? "trace_descendant" : "activity_only",
-      coverage: hasAttributedUsage ? "complete" : "unavailable"
+      coverage
     });
   }
   const unallocated = {
@@ -929,11 +1424,12 @@ function completedAt(
   const latestClosedBoundary = closedBoundaries.map((atom) => atom.endedAt!).sort().at(-1);
   const allAccountingEnded = atoms.every((atom) => atom.endedAt);
   const latest = atoms.flatMap((atom) => atom.endedAt ? [atom.endedAt] : []).sort().at(-1);
-  if (occurrence?.completedAt) {
+  const completionBoundary = durableCompletionBoundary(occurrence);
+  if (completionBoundary) {
     if (!allAccountingEnded || !latest) {
       return undefined;
     }
-    return occurrence.completedAt > latest ? occurrence.completedAt : latest;
+    return completionBoundary;
   }
   // Submission hooks prove that a harness lifecycle surface is active. Individual
   // model responses are revisions of that turn, not terminal evidence. A closed
@@ -1028,12 +1524,14 @@ function preferProviderUsageSurface(
     || atom.sourceId === "otlp_claude_code_traces"
   );
   if (traceAtoms.length === 0) {
-    return atoms;
+    return reconcileClaudeRequestRevisions(atoms);
   }
   const logAtoms = atoms.filter((atom) => !traceAtoms.includes(atom));
-  const logsByRequest = new Map(logAtoms.flatMap((atom) => atom.requestId ? [[atom.requestId, atom] as const] : []));
-  const traceRequests = new Set(traceAtoms.flatMap((atom) => atom.requestId ? [atom.requestId] : []));
-  const enrichedTraces = traceAtoms.map((atom) => {
+  const reconciledLogs = reconcileClaudeRequestRevisions(logAtoms);
+  const reconciledTraces = reconcileClaudeRequestRevisions(traceAtoms);
+  const logsByRequest = new Map(reconciledLogs.flatMap((atom) => atom.requestId ? [[atom.requestId, atom] as const] : []));
+  const traceRequests = new Set(reconciledTraces.flatMap((atom) => atom.requestId ? [atom.requestId] : []));
+  const enrichedTraces = reconciledTraces.map((atom) => {
     const fallback = atom.requestId ? logsByRequest.get(atom.requestId) : undefined;
     if (!fallback) {
       return atom;
@@ -1046,8 +1544,47 @@ function preferProviderUsageSurface(
       endedAt: atom.endedAt ?? fallback.endedAt
     };
   });
-  const unmatchedLogs = logAtoms.filter((atom) => !atom.requestId || !traceRequests.has(atom.requestId));
-  return [...enrichedTraces, ...unmatchedLogs];
+  const unmatchedLogs = reconciledLogs.filter((atom) => !atom.requestId || !traceRequests.has(atom.requestId));
+  return reconcileClaudeRequestRevisions([...enrichedTraces, ...unmatchedLogs]);
+}
+
+function reconcileClaudeRequestRevisions(atoms: SafeUsageAtomV1[]): SafeUsageAtomV1[] {
+  const groups = new Map<string, SafeUsageAtomV1[]>();
+  for (const atom of atoms) {
+    const key = atom.requestId ? `request:${atom.requestId}` : `atom:${atom.atomId}`;
+    groups.set(key, [...(groups.get(key) ?? []), atom]);
+  }
+  return [...groups.values()].map((revisions) => {
+    const preferred = [...revisions].sort(compareClaudeUsageRevision).at(-1)!;
+    const explicitConflicts = revisions.flatMap((atom) => atom.ownershipConflictActivityIds ?? []);
+    const resolvedOwners = revisions.flatMap((atom) => atom.owningActivityId ? [atom.owningActivityId] : []);
+    const ownerIds = [...new Set([...explicitConflicts, ...resolvedOwners])].sort().slice(0, 8);
+    if (explicitConflicts.length > 0 || new Set(resolvedOwners).size > 1) {
+      const { owningActivityId: _owningActivityId, ...withoutOwner } = preferred;
+      return { ...withoutOwner, ownershipConflictActivityIds: ownerIds };
+    }
+    const owner = resolvedOwners[0];
+    return owner && !preferred.owningActivityId
+      ? { ...preferred, owningActivityId: owner }
+      : preferred;
+  });
+}
+
+function compareClaudeUsageRevision(left: SafeUsageAtomV1, right: SafeUsageAtomV1): number {
+  const ended = (left.endedAt ?? "").localeCompare(right.endedAt ?? "");
+  if (ended !== 0) {
+    return ended;
+  }
+  const usage = usageRevisionWeight(left) - usageRevisionWeight(right);
+  return usage !== 0 ? usage : left.atomId.localeCompare(right.atomId);
+}
+
+function usageRevisionWeight(atom: SafeUsageAtomV1): number {
+  return (atom.inputTokens ?? 0)
+    + (atom.outputTokens ?? 0)
+    + (atom.cacheReadInputTokens ?? 0)
+    + (atom.cacheCreationInputTokens ?? 0)
+    + (atom.reasoningOutputTokens ?? 0);
 }
 
 function enrichProviderUsageSurface(

@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
+import {
+  hasExactNativePermissionRejectionForExecutionNode,
+  isNativePermissionRejectionExecutionNode
+} from "@tirion/agent-contract";
 import type {
   ExecutionNodeAtomV1,
   ProductionRunV1,
@@ -10,6 +14,7 @@ import type {
 import type { AgentStorageClient } from "@tirion/agent-storage";
 import {
   type ArtifactStateEvidence,
+  type CausalWriteArtifactEvidence,
   aiCreditsFromNanoUsd,
   type CommitAttributionChange,
   DefaultAgenticWorkEpisodeTracker,
@@ -48,6 +53,23 @@ const SETTLING_MS = 2 * 60 * 1000;
 const EVIDENCE_TTL_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_RUN_STALE_MS = 4 * 60 * 60 * 1000;
 const ACTIVE_OBSERVATION_POLL_MS = 250;
+const WORKSPACE_MUTATION_TOOL_NAMES = new Set([
+  "applypatch",
+  "createfile",
+  "deletefile",
+  "edit",
+  "fileedit",
+  "insertedit",
+  "movefile",
+  "multiedit",
+  "notebookedit",
+  "patch",
+  "renamefile",
+  "replaceinfile",
+  "strreplace",
+  "write",
+  "writefile"
+]);
 
 type RunObservationBoundary = {
   runId: string;
@@ -173,12 +195,53 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       .filter((occurrence) => occurrence.lifecycleVisibility !== "internal")
       .filter(hasOccurrenceWorkspaceIdentity)
       .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+    const newlyBoundCompletedQueryIds = new Set<string>();
     for (const occurrence of occurrences) {
+      const before = this.runBoundaries.get(occurrence.queryId);
       const boundaryWasNew = this.rememberRunBoundary(boundaryFromOccurrence(occurrence));
+      const after = this.runBoundaries.get(occurrence.queryId);
+      if (
+        after?.endedAt
+        && isFiniteIso(after.endedAt)
+        && after.endedAt !== before?.endedAt
+      ) {
+        newlyBoundCompletedQueryIds.add(occurrence.queryId);
+      }
       if (!boundaryWasNew) {
         continue;
       }
       await this.observeRunStart(partialRunFromOccurrence(occurrence));
+    }
+    // A native decision can arrive after the completed run and after an
+    // earlier successful Write was already merged into workspace evidence.
+    // Re-census the durable execution nodes immediately so causal authority is
+    // retractable rather than append-only.
+    const decisionQueryIds = new Set((observation.executionNodes ?? [])
+      .filter(isNativePermissionRejectionExecutionNode)
+      .map((node) => node.queryId));
+    const reCensusQueryIds = new Set([
+      ...decisionQueryIds,
+      ...newlyBoundCompletedQueryIds
+    ]);
+    if (reCensusQueryIds.size === 0) {
+      return;
+    }
+    const completedDecisionBoundaries = [...reCensusQueryIds]
+      .map((queryId) => this.runBoundaries.get(queryId))
+      .filter((boundary): boundary is RunObservationBoundary & { endedAt: string } =>
+        Boolean(boundary?.endedAt && isFiniteIso(boundary.endedAt))
+      );
+    // A decision observed while a run is still open cannot be classified as a
+    // late correction: without a trusted explicit completion boundary there
+    // is no source-time upper bound. Retain its safe node, then re-census when
+    // that boundary arrives so pre-terminal receipt order cannot bypass the
+    // same source-time gate.
+    if (completedDecisionBoundaries.length === 0) {
+      return;
+    }
+    const snapshots = await this.repositories.listSnapshots();
+    for (const boundary of completedDecisionBoundaries) {
+      await this.augmentExecutionWriteEvidence(partialRunFromBoundary(boundary), snapshots);
     }
   }
 
@@ -325,8 +388,29 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
     run: PartialAgenticQueryRun,
     snapshots: RepositorySnapshotObservation[]
   ): Promise<void> {
-    const writes = await executionWriteEvidenceForQuery(run.queryId, this.storage, this.repositories);
-    if (writes.length === 0) {
+    const retainedBoundary = this.runBoundaries.get(run.queryId);
+    const completedAt = retainedBoundary?.endedAt && isFiniteIso(retainedBoundary.endedAt)
+      ? retainedBoundary.endedAt
+      : validCompletedBoundary(run.startedAt, run.endedAt);
+    const writes = await executionWriteEvidenceForQuery(
+      run.queryId,
+      completedAt,
+      this.storage,
+      this.repositories
+    );
+    const existing = await this.evidence.listEvidence({ queryId: run.queryId });
+    const existingByRepo = new Map(existing.map((item) => [item.repoKey, item]));
+    const writesByRepo = new Map(writes.map((write) => [write.repoKey, write]));
+    // An explicit causal proof set is a replaceable projection of durable
+    // execution nodes, not an append-only fact. Include prior execution-backed
+    // records so a later native decision can remove stale writer authority.
+    const repositoryKeys = new Set([
+      ...writesByRepo.keys(),
+      ...existing
+        .filter((item) => item.causalWriteArtifacts !== undefined)
+        .map((item) => item.repoKey)
+    ]);
+    if (repositoryKeys.size === 0) {
       this.recordEvent({
         kind: "constructLifecycle",
         construct: "ProductionRunAttribution",
@@ -338,14 +422,17 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       });
       return;
     }
-    const existing = await this.evidence.listEvidence({ queryId: run.queryId });
-    const existingByRepo = new Map(existing.map((item) => [item.repoKey, item]));
     const augmented: QueryWorkEvidence[] = [];
-    for (const write of writes) {
-      const current = existingByRepo.get(write.repoKey);
-      const next = current
-        ? mergeExecutionWriteEvidence(current, write)
-        : evidenceFromExecutionWrite(run, write, snapshots, this.now());
+    for (const repoKey of repositoryKeys) {
+      const write = writesByRepo.get(repoKey);
+      const current = existingByRepo.get(repoKey);
+      const next = write
+        ? current
+          ? mergeExecutionWriteEvidence(current, write)
+          : evidenceFromExecutionWrite(run, write, snapshots, this.now())
+        : current
+          ? withoutExecutionWriteCausalEvidence(current)
+          : undefined;
       if (current && next && sameEvidenceState(current, next)) {
         continue;
       }
@@ -358,12 +445,12 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
           reason: "execution_write_evidence_could_not_bind_repository",
           runId: run.id,
           queryId: run.queryId,
-          repoKey: write.repoKey
+          repoKey
         });
         continue;
       }
       await this.evidence.upsertEvidence(next);
-      existingByRepo.set(write.repoKey, next);
+      existingByRepo.set(repoKey, next);
       const index = this.pending.findIndex((item) => item.queryId === next.queryId && item.repoKey === next.repoKey);
       if (index >= 0) {
         this.pending[index] = next;
@@ -528,7 +615,10 @@ export class AgentProductionRunAttribution implements WorkspaceChangeTracker {
       ...existing,
       ...boundary,
       startedAt: earliestIso([existing.startedAt, boundary.startedAt]),
-      endedAt: latestIsoOptional([existing.endedAt, boundary.endedAt]),
+      // The first explicit completion freezes causal authority. A corrupt or
+      // replayed later completion for the same opaque query must not widen the
+      // interval in which a native decision can revoke a prior write proof.
+      endedAt: earliestIsoOptional([existing.endedAt, boundary.endedAt]),
       sessionId: existing.sessionId ?? boundary.sessionId,
       provider: existing.provider ?? boundary.provider,
       runtime: existing.runtime ?? boundary.runtime,
@@ -931,7 +1021,7 @@ export function productionRunForAttribution(run: ProductionRunV1): AgenticQueryR
 }
 
 function isCompletedProductionRun(run: ProductionRunV1): boolean {
-  return Boolean(run.endedAt && run.endedAt >= run.startedAt);
+  return validCompletedBoundary(run.startedAt, run.endedAt) != null;
 }
 
 function hasWorkspaceAttributionIdentity(run: ProductionRunV1): boolean {
@@ -943,6 +1033,7 @@ function configurableProviderForProductionRun(provider: ProductionRunV1["provide
 }
 
 function boundaryFromProductionRun(run: ProductionRunV1): RunObservationBoundary {
+  const endedAt = validCompletedBoundary(run.startedAt, run.endedAt);
   return {
     runId: run.runId,
     queryId: run.queryId ?? run.correlationId,
@@ -951,7 +1042,7 @@ function boundaryFromProductionRun(run: ProductionRunV1): RunObservationBoundary
     runtime: run.runtime,
     repoKey: run.repositoryKey,
     startedAt: run.startedAt,
-    endedAt: run.endedAt
+    ...(endedAt ? { endedAt } : {})
   };
 }
 
@@ -960,6 +1051,7 @@ function boundaryFromAttributionRun(run: PartialAgenticQueryRun): RunObservation
   if (!startedAt) {
     return undefined;
   }
+  const endedAt = validCompletedBoundary(startedAt, run.endedAt);
   return {
     runId: run.id,
     queryId: run.queryId,
@@ -968,11 +1060,18 @@ function boundaryFromAttributionRun(run: PartialAgenticQueryRun): RunObservation
     runtime: run.serviceName,
     repoKey: run.repoKey,
     startedAt,
-    endedAt: run.endedAt
+    ...(endedAt ? { endedAt } : {})
   };
 }
 
 function boundaryFromOccurrence(occurrence: QueryOccurrenceV1): RunObservationBoundary {
+  const completedAt = typeof occurrence.completedAt === "string"
+    && occurrence.completedAt.trim() !== ""
+    && occurrence.completionEvidence != null
+    && occurrence.completionEvidence !== "inactivity"
+    ? occurrence.completedAt
+    : undefined;
+  const endedAt = validCompletedBoundary(occurrence.startedAt, completedAt);
   return {
     runId: runIdForQuery(occurrence.queryId),
     queryId: occurrence.queryId,
@@ -980,7 +1079,8 @@ function boundaryFromOccurrence(occurrence: QueryOccurrenceV1): RunObservationBo
     provider: occurrence.provider,
     runtime: occurrence.runtime,
     repoKey: occurrence.repositoryKey,
-    startedAt: occurrence.startedAt
+    startedAt: occurrence.startedAt,
+    ...(endedAt ? { endedAt } : {})
   };
 }
 
@@ -999,6 +1099,32 @@ function partialRunFromOccurrence(occurrence: QueryOccurrenceV1): PartialAgentic
     serviceName: occurrence.runtime,
     mode: occurrence.provider === "codex" ? "cli" : occurrence.provider === "claude-code" ? "claude" : "agent",
     repoKey: occurrence.repositoryKey,
+    models: [],
+    tokenUsageSource: "not_reported",
+    costCoverage: "unavailable",
+    modelUsages: [],
+    llmCallCount: 0,
+    toolCallCount: 0,
+    tools: [],
+    warnings: []
+  };
+}
+
+function partialRunFromBoundary(boundary: RunObservationBoundary): PartialAgenticQueryRun {
+  return {
+    schemaVersion: 2,
+    id: boundary.runId,
+    traceId: boundary.queryId,
+    queryId: boundary.queryId,
+    queryStartedAt: boundary.startedAt,
+    chatSessionId: boundary.sessionId,
+    traceRole: "main",
+    initialQueryState: "unavailable",
+    startedAt: boundary.startedAt,
+    ...(boundary.endedAt ? { endedAt: boundary.endedAt, status: "completed" as const } : { status: "running" as const }),
+    serviceName: boundary.runtime,
+    mode: boundary.provider === "codex" ? "cli" : boundary.provider === "claude-code" ? "claude" : "agent",
+    repoKey: boundary.repoKey,
     models: [],
     tokenUsageSource: "not_reported",
     costCoverage: "unavailable",
@@ -1226,10 +1352,14 @@ type ExecutionWriteEvidence = {
   repoKey: string;
   observedAt: string;
   artifactStates: ArtifactStateEvidence[];
+  causalWriteArtifacts: CausalWriteArtifactEvidence[];
+  /** Exact successful pairs natively contradicted in the current node census. */
+  nativeRejectedCausalWriteArtifacts: CausalWriteArtifactEvidence[];
 };
 
 async function executionWriteEvidenceForQuery(
   queryId: string,
+  completedAt: string | undefined,
   storage: AgentStorageClient,
   repositories: AgentRepositoryObservationService
 ): Promise<ExecutionWriteEvidence[]> {
@@ -1241,64 +1371,96 @@ async function executionWriteEvidenceForQuery(
   const sortedRepositories = knownRepositories
     .map((repo) => ({ repoKey: repo.repoKey, root: canonicalPath(repo.root) }))
     .sort((a, b) => b.root.length - a.root.length);
-  for (const node of nodes
+  const executionNodes = nodes
     .map((document) => document.value)
-    .filter((item) =>
-      item.nodeKind === "tool"
-      && item.outcome === "success"
-      && ((item.artifactKeys?.length ?? 0) > 0 || item.toolName === "Write" || item.toolName === "Edit")
-    )) {
+    // An explicit completed-run boundary freezes causal file authority as
+    // well as usage. A delayed receipt is eligible only when its provider
+    // source began on or before that boundary; malformed time fails closed.
+    .filter((node) => executionNodeBeginsAtOrBeforeCompletedBoundary(node, completedAt));
+  for (const node of executionNodes.filter(isSuccessfulSemanticWriteNode)) {
+    // An empty or unreadable source census is never a native rejection. Only
+    // record this marker when this exact successful invocation has a durable
+    // Claude native-permission decision counterpart.
+    const nativelyRejected = hasExactNativePermissionRejectionForExecutionNode(node, executionNodes);
     const repositoryByKey = node.repositoryKey
       ? sortedRepositories.find((candidate) => candidate.repoKey === node.repositoryKey)
       : undefined;
-    if (repositoryByKey) {
-      for (const artifactKey of node.artifactKeys ?? []) {
-        const relativePath = repositories.relativePaths(repositoryByKey.repoKey, [artifactKey])[0];
-        if (!relativePath) {
-          continue;
-        }
-        const absolute = canonicalPath(path.join(repositoryByKey.root, relativePath));
-        const relative = path.relative(repositoryByKey.root, absolute).replace(/\\/g, "/");
-        if (relative === "" || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) {
-          continue;
-        }
-        const artifactState = executionArtifactState(absolute, artifactKey, repositories);
-        if (artifactState) {
-          mergeExecutionWriteState(byRepo, node.queryId, repositoryByKey.repoKey, node.startedAt, artifactState);
-        }
-      }
+    if (
+      !repositoryByKey
+      || !hasAllowlistedWriteArtifactEvidence(node)
+      || (node.artifactKeys?.length ?? 0) === 0
+    ) {
+      continue;
     }
-    for (const content of node.contents ?? []) {
-      if (content.kind !== "tool_input" || content.visibility !== "visible" || !content.text) {
+    for (const artifactKey of node.artifactKeys ?? []) {
+      const relativePath = repositories.relativePaths(repositoryByKey.repoKey, [artifactKey])[0];
+      if (!relativePath) {
         continue;
       }
-      const payload = parseExecutionToolInput(content.text);
-      if (!payload || typeof payload.file_path !== "string") {
+      const absolute = canonicalPath(path.join(repositoryByKey.root, relativePath));
+      const relative = path.relative(repositoryByKey.root, absolute).replace(/\\/g, "/");
+      if (relative === "" || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)) {
         continue;
       }
-      const absolute = canonicalPath(payload.file_path);
-      const repository = sortedRepositories.find((candidate) =>
-        absolute === candidate.root || absolute.startsWith(`${candidate.root}${path.sep}`)
-      );
-      if (!repository) {
+      if (nativelyRejected) {
+        mergeNativeRejectedExecutionWriteArtifact(
+          byRepo,
+          node.queryId,
+          repositoryByKey.repoKey,
+          node.startedAt,
+          artifactKey,
+          node.nodeId
+        );
         continue;
       }
-      const relativePath = path.relative(repository.root, absolute).replace(/\\/g, "/");
-      if (relativePath === "" || relativePath.startsWith("../") || path.isAbsolute(relativePath)) {
-        continue;
+      const artifactState = executionArtifactState(absolute, artifactKey, repositories);
+      if (artifactState) {
+        mergeExecutionWriteState(
+          byRepo,
+          node.queryId,
+          repositoryByKey.repoKey,
+          node.startedAt,
+          artifactState,
+          node.nodeId
+        );
       }
-      const artifactState = executionArtifactState(
-        absolute,
-        repositories.artifactKey(repository.repoKey, relativePath),
-        repositories
-      );
-      if (!artifactState) {
-        continue;
-      }
-      mergeExecutionWriteState(byRepo, queryId, repository.repoKey, node.startedAt, artifactState);
     }
   }
   return [...byRepo.values()];
+}
+
+function executionNodeBeginsAtOrBeforeCompletedBoundary(
+  node: ExecutionNodeAtomV1,
+  completedAt: string | undefined
+): boolean {
+  if (!completedAt) {
+    return true;
+  }
+  const nodeStartedAt = Date.parse(node.startedAt);
+  const boundaryAt = Date.parse(completedAt);
+  return Number.isFinite(nodeStartedAt)
+    && Number.isFinite(boundaryAt)
+    && nodeStartedAt <= boundaryAt;
+}
+
+function isSuccessfulSemanticWriteNode(node: ExecutionNodeAtomV1): boolean {
+  if (node.nodeKind !== "tool" || node.outcome !== "success") {
+    return false;
+  }
+  return isWorkspaceMutationToolName(node.toolName ?? node.name);
+}
+
+function hasAllowlistedWriteArtifactEvidence(node: ExecutionNodeAtomV1): boolean {
+  return node.artifactEvidence === "provider_write_hook"
+    || node.artifactEvidence === "provider_tool_event";
+}
+
+function isWorkspaceMutationToolName(value: string): boolean {
+  return WORKSPACE_MUTATION_TOOL_NAMES.has(normalizedToolName(value));
+}
+
+function normalizedToolName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function mergeExecutionWriteState(
@@ -1306,20 +1468,57 @@ function mergeExecutionWriteState(
   queryId: string,
   repoKey: string,
   observedAt: string,
-  artifactState: ArtifactStateEvidence
+  artifactState: ArtifactStateEvidence,
+  executionNodeId: string
 ): void {
   const existing = byRepo.get(repoKey);
+  const causalWriteArtifact: CausalWriteArtifactEvidence = {
+    artifactKey: artifactState.artifactKey,
+    executionNodeId
+  };
   byRepo.set(repoKey, existing
     ? {
         ...existing,
         observedAt: maxIso(existing.observedAt, observedAt),
-        artifactStates: mergeArtifactStates(existing.artifactStates, [artifactState])
+        artifactStates: mergeArtifactStates(existing.artifactStates, [artifactState]),
+        causalWriteArtifacts: mergeCausalWriteArtifacts(existing.causalWriteArtifacts, [causalWriteArtifact])
+      }
+    : {
+      queryId,
+      repoKey,
+      observedAt,
+      artifactStates: [artifactState],
+      causalWriteArtifacts: [causalWriteArtifact],
+      nativeRejectedCausalWriteArtifacts: []
+    });
+}
+
+function mergeNativeRejectedExecutionWriteArtifact(
+  byRepo: Map<string, ExecutionWriteEvidence>,
+  queryId: string,
+  repoKey: string,
+  observedAt: string,
+  artifactKey: string,
+  executionNodeId: string
+): void {
+  const existing = byRepo.get(repoKey);
+  const causalWriteArtifact: CausalWriteArtifactEvidence = { artifactKey, executionNodeId };
+  byRepo.set(repoKey, existing
+    ? {
+        ...existing,
+        observedAt: maxIso(existing.observedAt, observedAt),
+        nativeRejectedCausalWriteArtifacts: mergeCausalWriteArtifacts(
+          existing.nativeRejectedCausalWriteArtifacts,
+          [causalWriteArtifact]
+        )
       }
     : {
         queryId,
         repoKey,
         observedAt,
-        artifactStates: [artifactState]
+        artifactStates: [],
+        causalWriteArtifacts: [],
+        nativeRejectedCausalWriteArtifacts: [causalWriteArtifact]
       });
 }
 
@@ -1342,15 +1541,6 @@ function executionArtifactState(
       changeKind: "added",
       observedSequence: 0
     };
-  } catch {
-    return undefined;
-  }
-}
-
-function parseExecutionToolInput(text: string): Record<string, unknown> | undefined {
-  try {
-    const parsed = JSON.parse(text);
-    return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : undefined;
   } catch {
     return undefined;
   }
@@ -1392,6 +1582,9 @@ function evidenceFromExecutionWrite(
     observedChangeCount: write.artifactStates.length,
     artifactKeys: write.artifactStates.map((state) => state.artifactKey).sort(),
     causalArtifactKeys: write.artifactStates.map((state) => state.artifactKey).sort(),
+    causalWriteArtifacts: write.causalWriteArtifacts,
+    nativeRejectedCausalWriteArtifacts: write.nativeRejectedCausalWriteArtifacts,
+    causalWriteArtifactsComplete: true,
     baselineArtifactStates: baseline.artifactStates.map((state) => ({ ...state })),
     artifactStates: write.artifactStates.map((state) => ({ ...state })),
     addedLines: 0,
@@ -1404,18 +1597,38 @@ function evidenceFromExecutionWrite(
 
 function mergeExecutionWriteEvidence(current: QueryWorkEvidence, write: ExecutionWriteEvidence): QueryWorkEvidence {
   const artifactStates = mergeArtifactStates(current.artifactStates ?? [], write.artifactStates);
-  const causalArtifactKeys = [...new Set([
-    ...(current.causalArtifactKeys ?? []),
-    ...write.artifactStates.map((state) => state.artifactKey)
-  ])].sort();
+  // Rebuild causal authority from the current source-node census. Retaining a
+  // past successful node after a same-invocation native denial would let an
+  // append-only evidence record outlive the authority that created it.
+  const causalArtifactKeys = write.artifactStates.map((state) => state.artifactKey).sort();
+  const causalWriteArtifacts = write.causalWriteArtifacts;
   return {
     ...current,
     observedChangeCount: artifactStates.length,
     artifactKeys: artifactStates.map((state) => state.artifactKey).sort(),
     causalArtifactKeys,
+    causalWriteArtifacts,
+    nativeRejectedCausalWriteArtifacts: write.nativeRejectedCausalWriteArtifacts,
+    causalWriteArtifactsComplete: true,
     artifactStates,
     firstObservedAt: current.firstObservedAt ?? write.observedAt,
     lastObservedAt: maxIsoOptional(current.lastObservedAt, write.observedAt)
+  };
+}
+
+function withoutExecutionWriteCausalEvidence(current: QueryWorkEvidence): QueryWorkEvidence {
+  return {
+    ...current,
+    // Empty (rather than absent) deliberately records that execution evidence
+    // was revalidated and no longer supports any writer claim. Snapshot state
+    // remains useful diagnostic context, but policy must not treat it as an
+    // unbounded replacement for a retracted causal tool proof.
+    causalArtifactKeys: [],
+    causalWriteArtifacts: [],
+    // Source disappearance is not a native decision. Preserve only a marker
+    // that was previously established by an exact durable native rejection.
+    nativeRejectedCausalWriteArtifacts: current.nativeRejectedCausalWriteArtifacts ?? [],
+    causalWriteArtifactsComplete: true
   };
 }
 
@@ -1450,6 +1663,20 @@ function mergeArtifactStates(
   return [...states.values()].sort((a, b) => a.artifactKey.localeCompare(b.artifactKey));
 }
 
+function mergeCausalWriteArtifacts(
+  existing: CausalWriteArtifactEvidence[],
+  next: CausalWriteArtifactEvidence[]
+): CausalWriteArtifactEvidence[] {
+  const byPair = new Map<string, CausalWriteArtifactEvidence>();
+  for (const item of [...existing, ...next]) {
+    byPair.set(`${item.artifactKey}:${item.executionNodeId}`, item);
+  }
+  return [...byPair.values()].sort((left, right) =>
+    left.artifactKey.localeCompare(right.artifactKey)
+    || left.executionNodeId.localeCompare(right.executionNodeId)
+  );
+}
+
 function gitBlobObjectId(content: string | Buffer): string {
   const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
   return createHash("sha1").update(`blob ${buffer.length}\0`).update(buffer).digest("hex");
@@ -1476,12 +1703,26 @@ function latestIsoOptional(values: (string | undefined)[]): string | undefined {
   return values.filter((value): value is string => value != null && isFiniteIso(value)).sort().at(-1);
 }
 
+function earliestIsoOptional(values: (string | undefined)[]): string | undefined {
+  return values.filter((value): value is string => value != null && isFiniteIso(value)).sort()[0];
+}
+
 function earliestIso(values: string[]): string {
   return values.filter(isFiniteIso).sort()[0] ?? new Date(0).toISOString();
 }
 
 function isFiniteIso(value: string | undefined): value is string {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function validCompletedBoundary(startedAt: string | undefined, endedAt: string | undefined): string | undefined {
+  const startedAtMs = Date.parse(startedAt ?? "");
+  const endedAtMs = Date.parse(endedAt ?? "");
+  return Number.isFinite(startedAtMs)
+    && Number.isFinite(endedAtMs)
+    && endedAtMs >= startedAtMs
+    ? endedAt
+    : undefined;
 }
 
 function sameArtifactState(

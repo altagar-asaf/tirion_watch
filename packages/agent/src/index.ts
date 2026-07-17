@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
+import { dirname, join } from "node:path";
 import {
   ADMIN_CAPABILITIES,
   AGENT_DATABASE_SCHEMA_VERSION,
@@ -18,6 +19,8 @@ import {
   AgentEventKind,
   AgentEventV1,
   AgentLogResponseV1,
+  AgentRuntimeQuiesceRequestV1,
+  AgentRuntimeQuiesceStatusV1,
   AgentStatusV1,
   AgentSupportBundleV1,
   AgentUpgradePreparationV1,
@@ -42,6 +45,7 @@ import {
   parseSourceCapabilityV1,
   publicOwnershipMarkerFor,
   RepositoryActivationRequestV1,
+  isNativePermissionRejectionExecutionNode,
   RepositoryActivationV1,
   ProductionRunV1,
   SafeObservationV1,
@@ -113,6 +117,10 @@ export const DIAGNOSTIC_REFRESH_WAIT_MS = 100;
 export const USAGE_PROJECTION_READ_WAIT_MS = 250;
 export const LIVE_REPOSITORY_OBSERVATION_WINDOW_MS = 30_000;
 export const LIVE_REPOSITORY_OBSERVATION_POLL_MS = 500;
+export const RUNTIME_QUIESCE_MIN_TIMEOUT_MS = 100;
+export const RUNTIME_QUIESCE_MAX_TIMEOUT_MS = 120_000;
+const RUNTIME_QUIESCE_MAX_FIXED_POINT_ROUNDS = 64;
+const RUNTIME_QUIESCE_MAX_PASSES = 8;
 
 export type AgentRuntimeOptions = {
   paths?: AgentPaths;
@@ -175,6 +183,7 @@ export class AgentRuntime {
   private budgetWarnings?: AgentBudgetWarningsService;
   private diagnostics?: AgentDiagnosticsService;
   private readonly sourceConfiguration: SourceConfigurationService;
+  private readonly claudeTranscriptRoot: string;
   private readonly legacyEngineLeases = new Map<string, number>();
   private readonly otlpPort: number | false;
   private readonly initialOwnershipState: OwnershipState;
@@ -203,6 +212,14 @@ export class AgentRuntime {
   private usageReconciliationSweep?: NodeJS.Timeout;
   private usageProjectionTimer?: NodeJS.Timeout;
   private lastLiveMeasurementAtMs?: number;
+  private quiescing = false;
+  // A successful pre-stop barrier remains closed until stop/restart. This is
+  // distinct from `quiescing`, which describes only the bounded drain call.
+  private preStopSealed = false;
+  private inFlightWebhookMutationRequests = 0;
+  private readonly webhookMutationWaiters = new Set<() => void>();
+  private periodicUsageMaintenanceInFlight = 0;
+  private readonly periodicUsageMaintenanceWaiters = new Set<() => void>();
   private usageRebuildRunning = false;
   private usageRebuildRequested = false;
   private productRetentionQueue: Promise<void> = Promise.resolve();
@@ -210,12 +227,20 @@ export class AgentRuntime {
   private usageRebuildQueue: Promise<ProductionRunV1[]> = Promise.resolve([]);
   private readonly runtimeWork = new RuntimeWorkScheduler();
   private readonly usageProjectionQuietMs: number;
+  // An accepted explicit terminal must not wait behind ordinary live enrichment.
+  // This queue contains only already-sanitized terminal evidence; Claude Stop
+  // authority remains exclusively in TelemetryClassification's Stop+closed-root
+  // join before an observation reaches this runtime.
+  private pendingTerminalLiveWebhookObservations: SafeObservationV1[] = [];
   private pendingPriorityLiveWebhookObservations: SafeObservationV1[] = [];
   private pendingLiveWebhookObservations: SafeObservationV1[] = [];
   private pendingWorkspaceEvidenceObservations: SafeObservationV1[] = [];
   private readonly terminalUsageProjectionTimers = new Map<string, NodeJS.Timeout>();
   private readonly recentTerminalUsageSessions = new Map<string, {
     queryId: string;
+    completedAt: string;
+    provider: SafeObservationV1["provider"];
+    runtime: string;
     expiresAt: number;
     authorityTriggered: boolean;
   }>();
@@ -230,12 +255,15 @@ export class AgentRuntime {
     this.paths = options.paths ?? resolveAgentPaths();
     this.now = options.now ?? (() => new Date());
     this.otlpPort = options.otlpPort ?? Number(process.env.TIRION_AGENT_OTLP_PORT ?? 4318);
-    this.sourceConfiguration = new SourceConfigurationService(
-      options.sourceConfigurationPaths ?? resolveSourceConfigurationPaths(
+    const sourceConfigurationPaths = options.sourceConfigurationPaths
+      ?? resolveSourceConfigurationPaths(
         `${this.paths.stateDir}/source-configuration-restore.json`
-      ),
+      );
+    this.sourceConfiguration = new SourceConfigurationService(
+      sourceConfigurationPaths,
       options.codexHookReadinessProbe
     );
+    this.claudeTranscriptRoot = join(dirname(sourceConfigurationPaths.claudeSettingsPath), "projects");
     this.initialOwnershipState = options.initialOwnershipState ?? "agent_full_owner";
     this.configuredOtlpAuthToken = options.otlpAuthToken;
     this.otlpMaxRequestsPerSecond = options.otlpMaxRequestsPerSecond;
@@ -264,6 +292,9 @@ export class AgentRuntime {
         protocolVersion: "1.0"
       });
       this.runtimeWarmupCancelled = false;
+      this.preStopSealed = false;
+      this.inFlightWebhookMutationRequests = 0;
+      this.webhookMutationWaiters.clear();
       this.runtimeWarmup = undefined;
       this.runtimeWarmupState = "starting";
       this.runtimeWarmupLastErrorCode = undefined;
@@ -296,7 +327,17 @@ export class AgentRuntime {
         (event) => this.recordLivePipelineEvent(event)
       );
       this.startedAt = this.now().toISOString();
-      this.server = createServer((request, response) => void this.route(request, response));
+      this.server = createServer((request, response) => {
+        const tracksWebhookMutation = isWebhookMutationRequest(request.method, request.url);
+        if (tracksWebhookMutation) {
+          this.inFlightWebhookMutationRequests += 1;
+        }
+        void this.route(request, response).finally(() => {
+          if (tracksWebhookMutation) {
+            this.finishWebhookMutationRequest();
+          }
+        });
+      });
       await listen(this.server, this.paths.socketPath);
       chmodSync(this.paths.socketPath, 0o600);
       this.workspaceLeaseSweep = setInterval(
@@ -337,7 +378,8 @@ export class AgentRuntime {
           async (workspacePath, artifactPaths) => await this.repositoryObservation?.resolveWorkspaceEvidence(
             workspacePath,
             artifactPaths
-          )
+          ),
+          this.claudeTranscriptRoot
         );
         for (const provider of MEASUREMENT_PROVIDERS) {
           this.otlp.setPromptCapture(provider, await this.promptCaptureEnabled(provider));
@@ -454,6 +496,12 @@ export class AgentRuntime {
         if (!hasCapability(auth, "runtime:control")) {
           return sendError(response, 403, "authorization_denied");
         }
+        // Transitioning a drained usage owner into full ownership starts the
+        // dispatcher and attribution bootstrap. It is therefore a producer
+        // boundary, not an administrative no-op, while pre-stop is active.
+        if (this.quiescing || this.preStopSealed) {
+          return sendError(response, 409, "unsupported_capability");
+        }
         const target = parseOwnershipTarget(await readJsonBody(request));
         const readiness = this.ownershipReadiness().transitions.find((transition) => transition.target === target);
         if (!readiness?.ready) {
@@ -510,6 +558,12 @@ export class AgentRuntime {
         const auth = await this.authenticate(request);
         if (!hasCapability(auth, "sources:manage")) {
           return sendError(response, 403, "authorization_denied");
+        }
+        // Changing this source can start a local telemetry poller. Keep that
+        // producer boundary closed while a pre-stop drain is taking its fixed
+        // point, and after a successful barrier until process exit.
+        if (this.quiescing || this.preStopSealed) {
+          return sendError(response, 409, "unsupported_capability");
         }
         const configuration = parseCopilotSpanDbConfigurationV1(await readJsonBody(request));
         await this.configureCopilotSpanDbSource(configuration);
@@ -1015,9 +1069,10 @@ export class AgentRuntime {
         if (!hasCapability(auth, "diagnostics:read")) {
           return sendError(response, 403, "authorization_denied");
         }
+        const query = diagnosticLogQuery(request.url);
         const result: AgentLogResponseV1 = {
           schemaVersion: 1,
-          events: await this.requireDiagnostics().events(boundedLimit(request.url) ?? 100)
+          events: await this.requireDiagnostics().events(query.limit, query.window)
         };
         return send(response, 200, result);
       }
@@ -1114,6 +1169,14 @@ export class AgentRuntime {
         send(response, 202, { schemaVersion: 1, stopping: true });
         setImmediate(() => void this.stop());
         return;
+      }
+      if (method === "POST" && path === "/v1/runtime/quiesce") {
+        const auth = await this.authenticate(request);
+        if (!hasCapability(auth, "runtime:control")) {
+          return sendError(response, 403, "authorization_denied");
+        }
+        const input = parseRuntimeQuiesceRequest(await readJsonBody(request));
+        return send(response, 200, await this.quiesce(input.timeoutMs));
       }
       return sendError(response, 404, "invalid_request");
     } catch (error) {
@@ -1732,7 +1795,12 @@ export class AgentRuntime {
   }
 
   private requireWebhookDispatch(): ExternalWebhookDispatchService {
-    if (!this.webhookDispatch || this.requireMetadata().ownershipState !== "agent_full_owner") {
+    // Once a pre-stop barrier begins, no management route may introduce fresh
+    // outbox work (notably webhook test/retry) behind its fixed-point check.
+    // Internal projection paths use the private field directly while they are
+    // being drained; this authenticated HTTP writer boundary stays closed
+    // through successful quiesce until stop/restart.
+    if (this.quiescing || this.preStopSealed || !this.webhookDispatch || this.requireMetadata().ownershipState !== "agent_full_owner") {
       throw new Error("unsupported_capability");
     }
     return this.webhookDispatch;
@@ -1799,15 +1867,20 @@ export class AgentRuntime {
   }
 
   private handleVerifiedAttributionChange(change: CommitAttributionChange): void {
-    if (change.kind === "candidate_changed") {
+    if (this.preStopSealed || change.kind === "candidate_changed") {
       return;
     }
     this.emitEvent("attribution_changed");
-    void this.webhookDispatch?.reconcileCommitEvents(change.commitHash).catch(() => undefined);
+    this.runtimeWork.enqueue("webhook_commit_attribution_projection", async () => {
+      await this.webhookDispatch?.reconcileCommitEvents(change.commitHash).catch(() => undefined);
+    });
     this.emitEvent("webhook_changed");
   }
 
   private handleWorkspaceEvidenceBound(evidence: import("@tirion/engine/production").QueryWorkEvidence[]): void {
+    if (this.preStopSealed) {
+      return;
+    }
     const queryIds = new Set(evidence.map((item) => item.queryId));
     this.runtimeWork.enqueue("webhook_evidence_projection", async () => {
       if (this.requireMetadata().ownershipState !== "agent_full_owner") {
@@ -1838,6 +1911,9 @@ export class AgentRuntime {
   }
 
   private scheduleRepositoryObservationRefresh(): void {
+    if (this.preStopSealed) {
+      return;
+    }
     this.repositoryRefreshQueue = this.repositoryRefreshQueue
       .then(() => this.refreshRepositoryObservationIfOwned())
       .catch(async () => {
@@ -1846,6 +1922,9 @@ export class AgentRuntime {
   }
 
   private async expireWorkspaceLeases(): Promise<void> {
+    if (this.preStopSealed) {
+      return;
+    }
     if (!this.repositoryScopes || this.repositoryScopes.pruneExpiredLeases() === 0) {
       return;
     }
@@ -2551,20 +2630,30 @@ export class AgentRuntime {
   }
 
   private scheduleLiveIngestProcessing(observation?: SafeObservationV1): void {
+    if (this.preStopSealed) {
+      return;
+    }
     const hasMeasurementEvidence = !observation || hasLiveMeasurementEvidence(observation);
     if (observation && hasMeasurementEvidence) {
       this.lastLiveMeasurementAtMs = this.now().getTime();
       this.scheduleTerminalUsageProjection(observation);
     }
     if (observation && hasMeasurementEvidence && this.metadata?.ownershipState === "agent_full_owner") {
-      const queue = hasPriorityLiveLifecycleEvidence(observation)
-        ? this.pendingPriorityLiveWebhookObservations
-        : this.pendingLiveWebhookObservations;
+      const terminal = hasImmediateLiveTerminalEvidence(observation);
+      const queue = terminal
+        ? this.pendingTerminalLiveWebhookObservations
+        : hasPriorityLiveLifecycleEvidence(observation)
+          ? this.pendingPriorityLiveWebhookObservations
+          : this.pendingLiveWebhookObservations;
       queue.push(observation);
-      this.runtimeWork.enqueue("webhook_live_projection", async () => {
+      this.runtimeWork.enqueue(terminal ? "webhook_live_terminal_projection" : "webhook_live_projection", async () => {
+        if (terminal) {
+          await this.drainTerminalLiveWebhookProjection();
+          return;
+        }
         await this.drainLiveWebhookProjection();
       });
-      if ((observation.queryOccurrences?.length ?? 0) > 0) {
+      if (requiresWorkspaceEvidenceProjection(observation)) {
         this.pendingWorkspaceEvidenceObservations.push(observation);
         if (hasRepositoryObservationDemand(observation)) {
           this.repositoryObservation?.requestActiveObservationWindow(
@@ -2588,6 +2677,9 @@ export class AgentRuntime {
   }
 
   private enqueueUsageProjection(): void {
+    if (this.preStopSealed) {
+      return;
+    }
     this.runtimeWork.enqueue("usage_projection", async () => {
       await this.queueUsageRebuild().catch(() => []);
     });
@@ -2595,6 +2687,14 @@ export class AgentRuntime {
 
   private scheduleTerminalUsageProjection(observation: SafeObservationV1): void {
     const now = this.now().getTime();
+    const immediatelyProjectedQueryIds = new Set<string>();
+    const enqueueImmediateTerminalProjection = (queryId: string): void => {
+      if (immediatelyProjectedQueryIds.has(queryId)) {
+        return;
+      }
+      immediatelyProjectedQueryIds.add(queryId);
+      this.enqueueTerminalUsageProjection(queryId);
+    };
     for (const [sessionId, state] of this.recentTerminalUsageSessions) {
       if (state.expiresAt <= now) {
         this.recentTerminalUsageSessions.delete(sessionId);
@@ -2607,14 +2707,36 @@ export class AgentRuntime {
       const completedAt = Date.parse(occurrence.completedAt);
       const dueAt = Math.max(now, Number.isFinite(completedAt) ? completedAt + this.usageProjectionQuietMs : now);
       const existingSession = this.recentTerminalUsageSessions.get(occurrence.sessionId);
+      const compatibleExistingSession = existingSession
+        && existingSession.provider === occurrence.provider
+        && existingSession.runtime === occurrence.runtime
+        ? existingSession
+        : undefined;
+      const retainOccurrence = !compatibleExistingSession
+        || completedAt >= Date.parse(compatibleExistingSession.completedAt);
+      const replacesTerminalState = retainOccurrence && (
+        !compatibleExistingSession
+        || compatibleExistingSession.queryId !== occurrence.queryId
+        || compatibleExistingSession.completedAt !== occurrence.completedAt
+      );
       this.recentTerminalUsageSessions.set(occurrence.sessionId, {
-        queryId: occurrence.queryId,
+        queryId: retainOccurrence ? occurrence.queryId : compatibleExistingSession.queryId,
+        completedAt: retainOccurrence ? occurrence.completedAt : compatibleExistingSession.completedAt,
+        provider: retainOccurrence ? occurrence.provider : compatibleExistingSession.provider,
+        runtime: retainOccurrence ? occurrence.runtime : compatibleExistingSession.runtime,
         expiresAt: Math.max(
-          existingSession?.expiresAt ?? 0,
+          compatibleExistingSession?.expiresAt ?? 0,
           dueAt + LIVE_TERMINAL_USAGE_PROJECTION_RETENTION_MS
         ),
-        authorityTriggered: existingSession?.authorityTriggered ?? false
+        authorityTriggered: replacesTerminalState ? false : compatibleExistingSession?.authorityTriggered ?? false
       });
+      // Claude Code's ordinary Stop remains only a classifier-side candidate.
+      // Once TelemetryClassification has emitted its joined closed-root
+      // occurrence, however, kick this query family immediately instead of
+      // spending the terminal deadline in the generic quiet fallback.
+      if (isClassifiedClaudeClosedRootOccurrence(occurrence)) {
+        enqueueImmediateTerminalProjection(occurrence.queryId);
+      }
       if (this.terminalUsageProjectionTimers.has(occurrence.queryId)) {
         continue;
       }
@@ -2625,20 +2747,65 @@ export class AgentRuntime {
       timer.unref?.();
       this.terminalUsageProjectionTimers.set(occurrence.queryId, timer);
     }
-    for (const atom of observation.usageAtoms.filter(isClosedAuthoritativeRunBoundaryAtom)) {
-      if (!atom.sessionId) {
-        continue;
+    const enqueueEligibleTerminalCorrection = (evidence: {
+      queryId?: string;
+      correlationId?: string;
+      sessionId?: string;
+      provider: SafeObservationV1["provider"];
+      runtime: string;
+      startedAt: string;
+      closedAuthoritativeBoundary?: boolean;
+    }): void => {
+      const queryId = evidence.queryId ?? evidence.correlationId;
+      if (!evidence.sessionId || !queryId) {
+        return;
       }
-      const terminal = this.recentTerminalUsageSessions.get(atom.sessionId);
-      if (!terminal || terminal.expiresAt <= now || terminal.authorityTriggered) {
-        continue;
+      const terminal = this.recentTerminalUsageSessions.get(evidence.sessionId);
+      const evidenceStartedAt = Date.parse(evidence.startedAt);
+      const terminalCompletedAt = terminal ? Date.parse(terminal.completedAt) : Number.NaN;
+      if (
+        !terminal
+        || terminal.expiresAt <= now
+        || terminal.queryId !== queryId
+        || terminal.provider !== evidence.provider
+        || terminal.runtime !== evidence.runtime
+        || !Number.isFinite(evidenceStartedAt)
+        || !Number.isFinite(terminalCompletedAt)
+        || evidenceStartedAt > terminalCompletedAt
+      ) {
+        return;
       }
-      terminal.authorityTriggered = true;
-      this.enqueueTerminalUsageProjection(terminal.queryId);
+      if (evidence.closedAuthoritativeBoundary) {
+        if (terminal.authorityTriggered) {
+          return;
+        }
+        terminal.authorityTriggered = true;
+      }
+      enqueueImmediateTerminalProjection(terminal.queryId);
+    };
+    for (const atom of observation.usageAtoms) {
+      enqueueEligibleTerminalCorrection({
+        queryId: atom.queryId,
+        correlationId: atom.correlationId,
+        sessionId: atom.sessionId,
+        provider: atom.provider,
+        runtime: atom.runtime,
+        startedAt: atom.startedAt,
+        closedAuthoritativeBoundary: isClosedAuthoritativeRunBoundaryAtom(atom)
+      });
+    }
+    for (const activity of observation.activityAtoms ?? []) {
+      enqueueEligibleTerminalCorrection(activity);
+    }
+    for (const node of observation.executionNodes ?? []) {
+      enqueueEligibleTerminalCorrection(node);
     }
   }
 
   private enqueueTerminalUsageProjection(queryId: string): void {
+    if (this.preStopSealed) {
+      return;
+    }
     const owner = this.metadata?.ownershipState;
     if (owner !== "agent_usage_owner" && owner !== "agent_full_owner") {
       this.enqueueUsageProjection();
@@ -2686,6 +2853,9 @@ export class AgentRuntime {
   }
 
   private scheduleUsageProjectionAfterQuietPeriod(): void {
+    if (this.preStopSealed) {
+      return;
+    }
     if (this.usageProjectionTimer) {
       clearTimeout(this.usageProjectionTimer);
       this.usageProjectionTimer = undefined;
@@ -2722,7 +2892,29 @@ export class AgentRuntime {
       if (!observation) {
         break;
       }
-      await this.webhookDispatch.observeSafeObservation(observation).catch(() => undefined);
+      // Ordinary live observations need durable admission, but the projection
+      // lane must not inherit receiver HTTP latency. Delivery continues through
+      // the bounded outbox loop while later observations are admitted.
+      await this.webhookDispatch.admitSafeObservation(observation).catch(() => undefined);
+      projected = true;
+    }
+    if (projected) {
+      this.emitEvent("webhook_changed");
+    }
+  }
+
+  private async drainTerminalLiveWebhookProjection(): Promise<void> {
+    if (this.metadata?.ownershipState !== "agent_full_owner" || !this.webhookDispatch) {
+      this.pendingTerminalLiveWebhookObservations = [];
+      return;
+    }
+    let projected = false;
+    for (;;) {
+      const observation = this.pendingTerminalLiveWebhookObservations.shift();
+      if (!observation) {
+        break;
+      }
+      await this.webhookDispatch.admitSafeObservation(observation).catch(() => undefined);
       projected = true;
     }
     if (projected) {
@@ -2740,13 +2932,72 @@ export class AgentRuntime {
     }
   }
 
+  private finishWebhookMutationRequest(): void {
+    this.inFlightWebhookMutationRequests = Math.max(0, this.inFlightWebhookMutationRequests - 1);
+    if (this.inFlightWebhookMutationRequests === 0) {
+      for (const resolve of [...this.webhookMutationWaiters]) {
+        resolve();
+      }
+    }
+  }
+
+  private async waitForWebhookMutationRequests(): Promise<boolean> {
+    if (this.inFlightWebhookMutationRequests === 0) {
+      return true;
+    }
+    await new Promise<void>((resolve) => {
+      const release = () => {
+        this.webhookMutationWaiters.delete(release);
+        resolve();
+      };
+      this.webhookMutationWaiters.add(release);
+      if (this.inFlightWebhookMutationRequests === 0) {
+        release();
+      }
+    });
+    return true;
+  }
+
   private async runPeriodicUsageMaintenance(): Promise<void> {
-    if (this.remainingUsageProjectionQuietMs() > 0) {
-      this.scheduleUsageProjectionAfterQuietPeriod();
+    if (this.quiescing || this.preStopSealed) {
       return;
     }
-    await this.queueUsageRebuild().catch(() => []);
-    await this.applySafeJournalRetention().catch(() => undefined);
+    this.periodicUsageMaintenanceInFlight += 1;
+    try {
+      if (this.quiescing || this.preStopSealed) {
+        return;
+      }
+      if (this.remainingUsageProjectionQuietMs() > 0) {
+        this.scheduleUsageProjectionAfterQuietPeriod();
+        return;
+      }
+      await this.queueUsageRebuild().catch(() => []);
+      await this.applySafeJournalRetention().catch(() => undefined);
+    } finally {
+      this.periodicUsageMaintenanceInFlight = Math.max(0, this.periodicUsageMaintenanceInFlight - 1);
+      if (this.periodicUsageMaintenanceInFlight === 0) {
+        for (const resolve of [...this.periodicUsageMaintenanceWaiters]) {
+          resolve();
+        }
+      }
+    }
+  }
+
+  private async waitForPeriodicUsageMaintenance(): Promise<boolean> {
+    if (this.periodicUsageMaintenanceInFlight === 0) {
+      return true;
+    }
+    await new Promise<void>((resolve) => {
+      const release = () => {
+        this.periodicUsageMaintenanceWaiters.delete(release);
+        resolve();
+      };
+      this.periodicUsageMaintenanceWaiters.add(release);
+      if (this.periodicUsageMaintenanceInFlight === 0) {
+        release();
+      }
+    });
+    return true;
   }
 
   private queueUsageRebuild(): Promise<ProductionRunV1[]> {
@@ -2843,6 +3094,9 @@ export class AgentRuntime {
     runs: ProductionRunV1[],
     options: { reconcileCommitEvents?: boolean; priority?: boolean } = {}
   ): void {
+    if (this.preStopSealed) {
+      return;
+    }
     const priority = options.priority !== false;
     for (const run of runs.filter(isCompletedProductionRun)) {
       const existingPriority = this.pendingPriorityWebhookLifecycleProjectionRuns.get(run.runId);
@@ -2999,6 +3253,9 @@ export class AgentRuntime {
   }
 
   private async applyProductRetention(): Promise<void> {
+    if (this.preStopSealed) {
+      return;
+    }
     const operation = this.productRetentionQueue.then(async () => {
       const owner = this.requireMetadata().ownershipState;
       const now = this.now();
@@ -3021,6 +3278,212 @@ export class AgentRuntime {
     });
     this.productRetentionQueue = operation.catch(() => undefined);
     return await operation;
+  }
+
+  /**
+   * A sealed-producer pre-stop barrier.  It deliberately does not share
+   * `stop()` because ordinary shutdown must retain retryable outbox evidence
+   * for a later process rather than turn a best-effort exit into a flush.
+  */
+  private async quiesce(timeoutMs: number): Promise<AgentRuntimeQuiesceStatusV1> {
+    if (this.quiescing) {
+      return {
+        schemaVersion: 1,
+        state: "timed_out",
+        elapsedMs: 0,
+        telemetryIngressDrained: false,
+        runtimeWorkDrained: false,
+        webhookDrained: false
+      };
+    }
+    const wasPreStopSealed = this.preStopSealed;
+    let completed = false;
+    this.quiescing = true;
+    try {
+      const startedAtMs = Date.now();
+      const deadlineMs = startedAtMs + timeoutMs;
+      let telemetryIngressDrained = !this.otlp && !this.copilotSpanDb;
+      let runtimeWorkDrained = false;
+      let webhookDrained = !this.webhookDispatch;
+      const status = (state: AgentRuntimeQuiesceStatusV1["state"]): AgentRuntimeQuiesceStatusV1 => ({
+        schemaVersion: 1,
+        state,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        telemetryIngressDrained,
+        runtimeWorkDrained,
+        webhookDrained
+      });
+
+      const initialIngressBudgetMs = remainingQuiesceBudgetMs(deadlineMs);
+      if (initialIngressBudgetMs <= 0) {
+        return status("timed_out");
+      }
+      // Close OTLP/provider-hook and local span-DB producers together before
+      // observing any fixed point. Starting both seals synchronously matters:
+      // a long OTLP drain must not leave the independently polled span DB open.
+      // A failure deliberately reopens only when this call owned the seal; a
+      // previous successful quiesce must remain closed.
+      const initialIngressSeal = Promise.all([
+        this.otlp?.sealForQuiesce(initialIngressBudgetMs) ?? Promise.resolve(true),
+        this.copilotSpanDb?.sealForQuiesce(initialIngressBudgetMs) ?? Promise.resolve(true)
+      ]).then(([otlpDrained, spanDbDrained]) => otlpDrained && spanDbDrained);
+      telemetryIngressDrained = await resolveBeforeQuiesceDeadline(initialIngressSeal, deadlineMs) === true;
+      if (!telemetryIngressDrained) {
+        return status("timed_out");
+      }
+
+      // A webhook test/retry request that crossed the HTTP boundary just
+      // before `quiescing` became true can still be awaiting its outbox write.
+      // Wait for that request itself before asking the dispatcher for a stable
+      // queue, rather than treating its later write as a new unseen producer.
+      const webhookMutationResult = await resolveBeforeQuiesceDeadline(
+        this.waitForWebhookMutationRequests(),
+        deadlineMs
+      );
+      if (webhookMutationResult !== true) {
+        return status("timed_out");
+      }
+
+      const periodicResult = await resolveBeforeQuiesceDeadline(
+        this.waitForPeriodicUsageMaintenance(),
+        deadlineMs
+      );
+      if (periodicResult !== true) {
+        return status("timed_out");
+      }
+
+      for (let pass = 0; pass < RUNTIME_QUIESCE_MAX_PASSES; pass += 1) {
+        const ingressBudgetMs = remainingQuiesceBudgetMs(deadlineMs);
+        if (ingressBudgetMs <= 0) {
+          return status("timed_out");
+        }
+        const ingressDrain = Promise.all([
+          this.otlp?.drainAcceptedWork(ingressBudgetMs) ?? Promise.resolve(true),
+          this.copilotSpanDb?.drainAcceptedWork(ingressBudgetMs) ?? Promise.resolve(true)
+        ]).then(([otlpDrained, spanDbDrained]) => otlpDrained && spanDbDrained);
+        telemetryIngressDrained = await resolveBeforeQuiesceDeadline(ingressDrain, deadlineMs) === true;
+        if (!telemetryIngressDrained) {
+          return status("timed_out");
+        }
+
+        this.forceQueuedProjectionWorkForQuiesce();
+        const runtimeResult = await resolveBeforeQuiesceDeadline(
+          this.runtimeWork.drainToFixedPoint(RUNTIME_QUIESCE_MAX_FIXED_POINT_ROUNDS),
+          deadlineMs
+        );
+        runtimeWorkDrained = runtimeResult === true && this.runtimePipelineIsQuiescent();
+        if (!runtimeWorkDrained) {
+          return status("timed_out");
+        }
+
+        const otlpIngressGenerationBeforeWebhook = this.otlp?.acceptedWorkGeneration() ?? 0;
+        const spanDbIngressGenerationBeforeWebhook = this.copilotSpanDb?.acceptedWorkGeneration() ?? 0;
+        const runtimeGenerationBeforeWebhook = this.runtimeWork.workGeneration();
+        const webhookResult = this.webhookDispatch
+          ? await resolveBeforeQuiesceDeadline(this.webhookDispatch.drainForQuiesce(), deadlineMs)
+          : true;
+        webhookDrained = webhookResult === true;
+        if (!webhookDrained) {
+          return status("timed_out");
+        }
+
+        // dispatchAccepted intentionally keeps OTLP acknowledgement independent
+        // from downstream projection. A receipt or runtime lane created while
+        // delivery is active can enqueue a fresh outbox row after this delivery
+        // pass. Only a joint ingress/runtime generation fixed point may exit;
+        // otherwise the bounded outer loop performs another full delivery pass.
+        const finalIngressBudgetMs = remainingQuiesceBudgetMs(deadlineMs);
+        if (finalIngressBudgetMs <= 0) {
+          return status("timed_out");
+        }
+        const finalIngressDrain = Promise.all([
+          this.otlp?.drainAcceptedWork(finalIngressBudgetMs) ?? Promise.resolve(true),
+          this.copilotSpanDb?.drainAcceptedWork(finalIngressBudgetMs) ?? Promise.resolve(true)
+        ]).then(([otlpDrained, spanDbDrained]) => otlpDrained && spanDbDrained);
+        telemetryIngressDrained = await resolveBeforeQuiesceDeadline(finalIngressDrain, deadlineMs) === true;
+        const otlpIngressStable = (this.otlp?.acceptedWorkGeneration() ?? 0) === otlpIngressGenerationBeforeWebhook;
+        const spanDbIngressStable = (this.copilotSpanDb?.acceptedWorkGeneration() ?? 0) === spanDbIngressGenerationBeforeWebhook;
+        const runtimeStable = this.runtimeWork.workGeneration() === runtimeGenerationBeforeWebhook;
+        const ingressSeal = this.otlp?.ingressSealStatus();
+        const spanDbIngressSeal = this.copilotSpanDb?.ingressSealStatus();
+        if (
+          telemetryIngressDrained
+          && otlpIngressStable
+          && spanDbIngressStable
+          && runtimeStable
+          && (ingressSeal == null || (ingressSeal.sealed && ingressSeal.postSealRequestCount === 0))
+          && (spanDbIngressSeal == null || spanDbIngressSeal.sealed)
+          && this.runtimePipelineIsQuiescent()
+        ) {
+          completed = true;
+          return status("drained");
+        }
+      }
+      return status("timed_out");
+    } finally {
+      this.quiescing = false;
+      if (completed) {
+        this.preStopSealed = true;
+      } else if (!wasPreStopSealed) {
+        this.otlp?.unsealAfterFailedQuiesce();
+        this.copilotSpanDb?.unsealAfterFailedQuiesce();
+      }
+    }
+  }
+
+  private forceQueuedProjectionWorkForQuiesce(): void {
+    if (this.usageProjectionTimer) {
+      clearTimeout(this.usageProjectionTimer);
+      this.usageProjectionTimer = undefined;
+    }
+    this.enqueueUsageProjection();
+    for (const [queryId, timer] of this.terminalUsageProjectionTimers) {
+      clearTimeout(timer);
+      this.terminalUsageProjectionTimers.delete(queryId);
+      this.enqueueTerminalUsageProjection(queryId);
+    }
+    if (this.pendingTerminalLiveWebhookObservations.length > 0) {
+      this.runtimeWork.enqueue("webhook_live_terminal_projection", async () => {
+        await this.drainTerminalLiveWebhookProjection();
+      });
+    }
+    if (this.pendingPriorityLiveWebhookObservations.length > 0 || this.pendingLiveWebhookObservations.length > 0) {
+      this.runtimeWork.enqueue("webhook_live_projection", async () => {
+        await this.drainLiveWebhookProjection();
+      });
+    }
+    if (this.pendingWorkspaceEvidenceObservations.length > 0) {
+      this.runtimeWork.enqueue("workspace_evidence_projection", async () => {
+        await this.drainLiveWorkspaceEvidenceProjection();
+      });
+    }
+    if (this.pendingPriorityWebhookLifecycleProjectionRuns.size > 0 || this.pendingWebhookLifecycleCommitReconcile) {
+      this.runtimeWork.enqueue("webhook_lifecycle_priority_projection", async () => {
+        await this.drainWebhookLifecycleProjection(true);
+      });
+    }
+    if (this.pendingHistoricalWebhookLifecycleProjectionRuns.size > 0) {
+      this.runtimeWork.enqueue("webhook_lifecycle_projection", async () => {
+        await this.drainWebhookLifecycleProjection(false);
+      });
+    }
+  }
+
+  private runtimePipelineIsQuiescent(): boolean {
+    return this.runtimeWork.isIdle()
+      && !this.usageProjectionTimer
+      && this.terminalUsageProjectionTimers.size === 0
+      && this.pendingTerminalLiveWebhookObservations.length === 0
+      && this.pendingPriorityLiveWebhookObservations.length === 0
+      && this.pendingLiveWebhookObservations.length === 0
+      && this.pendingWorkspaceEvidenceObservations.length === 0
+      && this.pendingPriorityWebhookLifecycleProjectionRuns.size === 0
+      && this.pendingHistoricalWebhookLifecycleProjectionRuns.size === 0
+      && this.webhookLifecycleProjectionInFlight === 0
+      && !this.pendingWebhookLifecycleCommitReconcile
+      && this.periodicUsageMaintenanceInFlight === 0
+      && !this.usageRebuildRunning
+      && !this.usageRebuildRequested;
   }
 
   private async closeResources(): Promise<void> {
@@ -3061,6 +3524,7 @@ export class AgentRuntime {
     }
     this.terminalUsageProjectionTimers.clear();
     this.recentTerminalUsageSessions.clear();
+    this.pendingTerminalLiveWebhookObservations = [];
     this.usageRebuildRequested = false;
     await this.productRetentionQueue.catch(() => undefined);
     await this.repositoryRefreshQueue.catch(() => undefined);
@@ -3332,6 +3796,14 @@ function bearerCredential(request: IncomingMessage): string | undefined {
   return header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
 }
 
+function isWebhookMutationRequest(method: string | undefined, requestUrl: string | undefined): boolean {
+  if (method !== "POST" && method !== "DELETE") {
+    return false;
+  }
+  const path = requestUrl?.split("?", 1)[0] ?? "/";
+  return path.startsWith("/v1/webhook/");
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -3557,6 +4029,53 @@ function parseClearAgentDataRequest(value: unknown): void {
   }
 }
 
+function parseRuntimeQuiesceRequest(value: unknown): AgentRuntimeQuiesceRequestV1 {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("invalid_request");
+  }
+  const record = value as Record<string, unknown>;
+  const timeoutMs = record.timeoutMs;
+  if (
+    Object.keys(record).some((key) => !["schemaVersion", "timeoutMs"].includes(key))
+    || record.schemaVersion !== 1
+    || typeof timeoutMs !== "number"
+    || !Number.isSafeInteger(timeoutMs)
+    || timeoutMs < RUNTIME_QUIESCE_MIN_TIMEOUT_MS
+    || timeoutMs > RUNTIME_QUIESCE_MAX_TIMEOUT_MS
+  ) {
+    throw new Error("invalid_request");
+  }
+  return { schemaVersion: 1, timeoutMs };
+}
+
+function remainingQuiesceBudgetMs(deadlineMs: number): number {
+  return Math.max(0, deadlineMs - Date.now());
+}
+
+async function resolveBeforeQuiesceDeadline(
+  operation: Promise<boolean>,
+  deadlineMs: number
+): Promise<boolean | undefined> {
+  const remainingMs = remainingQuiesceBudgetMs(deadlineMs);
+  if (remainingMs <= 0) {
+    return undefined;
+  }
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), remainingMs);
+        timer.unref?.();
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 function readOrCreateBootstrapToken(path: string): string {
   if (existsSync(path)) {
     return readFileSync(path, "utf8").trim();
@@ -3622,9 +4141,28 @@ function hasLiveMeasurementEvidence(observation: SafeObservationV1): boolean {
     || observation.usageAtoms.length > 0;
 }
 
+/**
+ * Completed-run causal evidence must be re-censused when an exact native
+ * Claude decision arrives without a lifecycle occurrence. Ordinary activity
+ * remains off this lane; the narrow decision predicate prevents broad
+ * workspace work for every telemetry envelope.
+ */
+function requiresWorkspaceEvidenceProjection(observation: SafeObservationV1): boolean {
+  return (observation.queryOccurrences?.length ?? 0) > 0
+    || Boolean(observation.executionNodes?.some(isNativePermissionRejectionExecutionNode));
+}
+
 function hasPriorityLiveLifecycleEvidence(observation: SafeObservationV1): boolean {
   return Boolean(observation.queryOccurrences?.some((occurrence) =>
     occurrence.lifecycleVisibility !== "internal"));
+}
+
+function hasImmediateLiveTerminalEvidence(observation: SafeObservationV1): boolean {
+  return Boolean(observation.queryOccurrences?.some((occurrence) =>
+    occurrence.provider === "claude-code"
+      ? isClassifiedClaudeClosedRootOccurrence(occurrence)
+      : isExplicitTerminalOccurrence(occurrence)))
+    || observation.usageAtoms.some(isClosedAuthoritativeRunBoundaryAtom);
 }
 
 function isExplicitTerminalOccurrence(
@@ -3635,6 +4173,17 @@ function isExplicitTerminalOccurrence(
     && occurrence.lifecycleVisibility !== "internal"
     && occurrence.completionEvidence != null
     && occurrence.completionEvidence !== "inactivity";
+}
+
+function isClassifiedClaudeClosedRootOccurrence(
+  occurrence: NonNullable<SafeObservationV1["queryOccurrences"]>[number]
+): occurrence is NonNullable<SafeObservationV1["queryOccurrences"]>[number] & { completedAt: string } {
+  return occurrence.provider === "claude-code"
+    && occurrence.completionEvidence === "closed_root_span"
+    // The classifier stamps this only after the exact Claude Stop/closed-root
+    // join. A generic provider root span must not gain terminal authority here.
+    && occurrence.evidence === "submission_hook"
+    && isExplicitTerminalOccurrence(occurrence);
 }
 
 function hasRepositoryObservationDemand(observation: SafeObservationV1): boolean {
@@ -3685,6 +4234,52 @@ function boundedLimit(url?: string): number | undefined {
   }
   const value = Number(raw);
   return Number.isSafeInteger(value) && value >= 0 && value <= 1000 ? value : undefined;
+}
+
+function diagnosticLogQuery(url?: string): {
+  limit: number;
+  window?: { since?: string; until?: string };
+} {
+  const parameters = new URL(url ?? "/v1/logs", "http://local").searchParams;
+  const supported = new Set(["limit", "since", "until"]);
+  if ([...parameters.keys()].some((name) => !supported.has(name))) {
+    throw new Error("invalid_request");
+  }
+  for (const name of ["limit", "since", "until"]) {
+    if (parameters.getAll(name).length > 1) {
+      throw new Error("invalid_request");
+    }
+  }
+  const rawLimit = parameters.get("limit");
+  const parsedLimit = rawLimit == null ? 100 : boundedLimit(url);
+  if (parsedLimit == null || parsedLimit <= 0 || rawLimit === "") {
+    throw new Error("invalid_request");
+  }
+  const since = diagnosticUtcBound(parameters.get("since"));
+  const until = diagnosticUtcBound(parameters.get("until"));
+  if (since && until && since > until) {
+    throw new Error("invalid_request");
+  }
+  return {
+    limit: parsedLimit,
+    ...(since || until ? { window: { ...(since ? { since } : {}), ...(until ? { until } : {}) } } : {})
+  };
+}
+
+function diagnosticUtcBound(raw: string | null): string | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/.exec(raw);
+  if (!match) {
+    throw new Error("invalid_request");
+  }
+  const normalized = `${match[1]}.${(match[2] ?? "").padEnd(3, "0")}Z`;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== normalized) {
+    throw new Error("invalid_request");
+  }
+  return normalized;
 }
 
 function providerActivationScore(status: ProviderSourceStatusV1): number {

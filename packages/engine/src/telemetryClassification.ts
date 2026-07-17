@@ -4,6 +4,7 @@ import type {
   ExecutionNodeAtomV1,
   ExecutionNodeContentV1,
   QueryOccurrenceV1,
+  RunCompletionFailureCategory,
   SafeActivityAtomV1,
   SensitiveAuditEvidenceV1,
   SafeObservationV1,
@@ -11,6 +12,7 @@ import type {
   SafeUsageAuthority,
   SourceCapabilityV1,
   TelemetrySignal,
+  UsagePurposeV1,
   WebhookEvidenceBasisV1
 } from "@tirion/agent-contract";
 import { resolveModelProvider } from "./modelProviderResolution";
@@ -40,13 +42,93 @@ export const OTLP_MAX_SCOPES_PER_RESOURCE = 128;
 export const OTLP_MAX_RECORDS = 10_000;
 export const OTLP_MAX_ATTRIBUTES = 2_048;
 const MAX_ACTIVE_PROVIDER_QUERIES = 1_024;
+const MAX_CLAUDE_BACKGROUND_ROOT_DIAGNOSTIC_COUNT = 8;
 const CODEX_HOOK_RECONCILIATION_MS = 15_000;
+const TIRION_CLAUDE_SUBMISSION_ATTEMPT_FIELD = "tirion_claude_submission_attempt_id";
 
 type ProviderHookSource = Extract<SafeObservationV1["provider"], "claude-code" | "codex" | "cursor">;
 type ActiveProviderQuery = {
   query: string;
   startedAt: string;
 };
+type ClaudeQueryIdentity = {
+  query: string;
+  session: string;
+};
+type ClaudeRequestIdentity = ClaudeQueryIdentity & {
+  usagePurpose?: UsagePurposeV1;
+};
+type ProviderTelemetryIdentity = ClaudeRequestIdentity & {
+  request: string;
+};
+type ClaudeCorrelation<T> =
+  | { state: "resolved"; value: T }
+  | { state: "conflict" };
+type ClaudeUsageOwnerCorrelation =
+  | { state: "resolved"; value: string }
+  | { state: "conflict"; activityIds: string[] };
+type ClaudeStopCandidate = ActiveProviderQuery & {
+  session: string;
+  stoppedAt: string;
+};
+type ClaudeClosedInteraction = ClaudeQueryIdentity & {
+  completedAt: string;
+  nativePrompt?: string;
+};
+type ClaudeAcceptedSubmission = ActiveProviderQuery & {
+  session: string;
+};
+type ClaudeCompletedSubmission = ClaudeAcceptedSubmission & {
+  terminalKind: "closed_root" | "stop_failure";
+  completedAt: string;
+  failureCategory?: RunCompletionFailureCategory;
+};
+export type ClaudeTranscriptTailUnavailableReason =
+  | "transcript_locator_invalid"
+  | "transcript_trust_rejected"
+  | "transcript_read_unavailable"
+  | "transcript_read_unstable";
+export type ClaudeTranscriptTailInput =
+  | { state: "available"; tail: string; truncated: boolean }
+  | {
+      state: "unavailable";
+      /** Fixed non-content reason supplied by the trusted transcript reader. */
+      diagnosticReason?: ClaudeTranscriptTailUnavailableReason;
+    };
+export type ClaudeSubmissionProvenanceDiagnosticReason =
+  | ClaudeTranscriptTailUnavailableReason
+  | "transcript_tail_exceeded"
+  | "hook_identity_unavailable"
+  | "transcript_candidate_missing"
+  | "idless_candidate_stale"
+  | "prompt_digest_mismatch"
+  | "prompt_identity_conflict"
+  | "candidate_ambiguous"
+  | "transcript_origin_kind_missing"
+  | "transcript_origin_kind_unrecognized"
+  | "transcript_prompt_source_missing"
+  | "transcript_prompt_source_unrecognized"
+  | "transcript_origin_prompt_source_incompatible"
+  /** Retained only to safely reduce diagnostics from older in-memory attempts. */
+  | "origin_not_human_typed"
+  | "malformed_provenance";
+type ClaudeSubmissionProvenance =
+  | {
+      state: "resolved";
+      originKind: "human" | "task-notification";
+      promptSource: "typed" | "system";
+      transcriptPromptId: string;
+      transcriptRecordKey?: string;
+      transcriptReservationKey?: string;
+    }
+  | {
+      state: "unavailable";
+      diagnosticReason?: ClaudeSubmissionProvenanceDiagnosticReason;
+    }
+  | {
+      state: "ambiguous";
+      diagnosticReason?: ClaudeSubmissionProvenanceDiagnosticReason;
+    };
 type ActiveCodexQuery = ActiveProviderQuery & {
   session: string;
   queryBasis: "hook" | "explicit" | "fallback";
@@ -61,6 +143,29 @@ export class DefaultAgentPrivacyGuard {
   private readonly codexQueriesBySession = new Map<string, ActiveCodexQuery>();
   private readonly codexQueriesByQuery = new Map<string, ActiveCodexQuery>();
   private readonly claudeQueriesBySession = new Map<string, { query: string; startedAt: string }>();
+  private readonly claudeSubmissionHooksBySession = new Map<string, ActiveProviderQuery>();
+  private readonly claudeQueriesByPrompt = new Map<string, ClaudeCorrelation<ClaudeQueryIdentity>>();
+  private readonly claudeQueriesByTrace = new Map<string, ClaudeCorrelation<ClaudeQueryIdentity>>();
+  private readonly claudeQueriesByRequest = new Map<string, ClaudeCorrelation<ClaudeRequestIdentity>>();
+  private readonly claudeNativePromptsByTrace = new Map<string, ClaudeCorrelation<string>>();
+  private readonly claudeTraceParents = new Map<string, ClaudeCorrelation<string>>();
+  private readonly claudeTraceToolActivities = new Map<string, ClaudeCorrelation<string>>();
+  private readonly claudeUsageOwnersByRequest = new Map<string, ClaudeUsageOwnerCorrelation>();
+  private readonly claudeAcceptedSubmissionsByIdentity = new Map<string, ClaudeAcceptedSubmission>();
+  private readonly claudeStopCandidatesByIdentity = new Map<string, ClaudeStopCandidate>();
+  private readonly claudeClosedInteractionsByIdentity = new Map<string, ClaudeClosedInteraction>();
+  private readonly claudeContinuationAuthorizedByIdentity = new Map<string, true>();
+  private readonly claudeTaskNotificationTargetBySession = new Map<string, ClaudeAcceptedSubmission>();
+  private readonly claudeContinuationFloorsByIdentity = new Map<string, string>();
+  private readonly claudeBackgroundPausedNativePrompts = new Map<string, ClaudeQueryIdentity>();
+  // This exists solely to make an incomplete background-root boundary visible
+  // at a later SessionEnd. Its keys are opaque, and it must never be terminal authority.
+  private readonly claudeBackgroundRootsAwaitingTerminalByIdentity = new Map<string, true>();
+  private readonly claudeCompletedSubmissionsByIdentity = new Map<string, ClaudeCompletedSubmission>();
+  private readonly claudeLatestCompletedBySession = new Map<string, ClaudeCompletedSubmission>();
+  private readonly claudeCompletedPromptAliases = new Map<string, ClaudeQueryIdentity>();
+  private readonly claudeConsumedTranscriptRows = new Set<string>();
+  private readonly claudeTranscriptRowReservations = new Map<string, string>();
   private readonly claudeSubagentStarts = new Map<string, string>();
   private readonly cursorTurnsByGeneration = new Map<string, ActiveCursorTurn>();
   private readonly cursorOpenGenerationBySession = new Map<string, string>();
@@ -72,6 +177,65 @@ export class DefaultAgentPrivacyGuard {
     private readonly capturePrompts: (provider: SafeObservationV1["provider"]) => boolean = () => false,
     private readonly captureSensitiveAuditEvidence: () => boolean = () => false
   ) {}
+
+  annotateClaudeProviderHook(
+    raw: unknown,
+    transcript: ClaudeTranscriptTailInput,
+    observedAt: string
+  ): unknown {
+    if (!isRecord(raw)) {
+      return raw;
+    }
+    const reservationKey = claudeSubmissionReservationKey(raw, observedAt);
+    const provenance = resolveClaudeSubmissionProvenance(
+      raw,
+      transcript,
+      observedAt,
+      this.claudeConsumedTranscriptRows,
+      this.claudeTranscriptRowReservations,
+      reservationKey
+    );
+    const promptDigest = claudeSubmissionHookPromptDigest(raw);
+    return {
+      ...raw,
+      ...(promptDigest ? { [TIRION_CLAUDE_PROMPT_DIGEST_FIELD]: promptDigest } : {}),
+      tirion_claude_submission_provenance: provenance
+    };
+  }
+
+  commitClaudeTranscriptProvenance(raw: unknown): void {
+    if (!isRecord(raw) || !isRecord(raw.tirion_claude_submission_provenance)) {
+      return;
+    }
+    const provenance = raw.tirion_claude_submission_provenance;
+    const transcriptRecordKey = boundedOpaqueText(firstText(provenance.transcriptRecordKey));
+    if (provenance.state !== "resolved" || !transcriptRecordKey) {
+      return;
+    }
+    const reservationKey = boundedOpaqueText(firstText(provenance.transcriptReservationKey));
+    const reservedBy = this.claudeTranscriptRowReservations.get(transcriptRecordKey);
+    if (!reservationKey || (reservedBy && reservedBy !== reservationKey)) {
+      return;
+    }
+    this.claudeTranscriptRowReservations.delete(transcriptRecordKey);
+    this.claudeConsumedTranscriptRows.add(transcriptRecordKey);
+    pruneInsertionOrderedSet(this.claudeConsumedTranscriptRows, MAX_ACTIVE_PROVIDER_QUERIES);
+  }
+
+  releaseClaudeTranscriptProvenance(raw: unknown): void {
+    if (!isRecord(raw) || !isRecord(raw.tirion_claude_submission_provenance)) {
+      return;
+    }
+    const provenance = raw.tirion_claude_submission_provenance;
+    const transcriptRecordKey = boundedOpaqueText(firstText(provenance.transcriptRecordKey));
+    if (!transcriptRecordKey) {
+      return;
+    }
+    const reservationKey = boundedOpaqueText(firstText(provenance.transcriptReservationKey));
+    if (reservationKey && this.claudeTranscriptRowReservations.get(transcriptRecordKey) === reservationKey) {
+      this.claudeTranscriptRowReservations.delete(transcriptRecordKey);
+    }
+  }
 
   sanitizeOtlpEnvelope(raw: unknown, signal: TelemetrySignal, observedAt: string): PrivacyApprovedOtlpMetadata {
     if (!isRecord(raw)) {
@@ -107,8 +271,30 @@ export class DefaultAgentPrivacyGuard {
     }
     return resourceItems(raw, signal).flatMap((resource) => {
       const resourceAttributes = otlpAttributes(isRecord(resource.resource) ? resource.resource.attributes : undefined);
-      const records = usageRecords(resource, signal);
-      const owningTools = owningToolActivityIds(classification.provider, records, resourceAttributes);
+      // A native Claude permission decision can carry copied model, usage, or
+      // billing attributes, but it is not an executed request. Exclude it
+      // before identity, ownership, and usage processing so it cannot become
+      // an accounting or context atom through any path.
+      const records = usageRecords(resource, signal).filter((record) => {
+        if (classification.provider !== "claude-code") {
+          return true;
+        }
+        const attributes = recordAttributes(resourceAttributes, record);
+        const name = firstText(record.name, attributes["event.name"]) ?? "";
+        return !isClaudeToolDecisionEventName(normalizedName(name));
+      });
+      const owningTools = owningToolActivityIds(
+        classification.provider,
+        signal,
+        records,
+        resourceAttributes,
+        classification.provider === "claude-code" && signal === "traces"
+          ? {
+              parents: this.claudeTraceParents,
+              toolActivities: this.claudeTraceToolActivities
+            }
+          : undefined
+      );
       return records.flatMap((record) => {
         const attributes = recordAttributes(resourceAttributes, record);
         const usage = tokenUsage(attributes);
@@ -117,7 +303,7 @@ export class DefaultAgentPrivacyGuard {
         if (!hasUsage(usage) && reportedNanoUsd == null) {
           return [];
         }
-        const providerScopedIdentity = providerIdentity(classification.provider, record, attributes, name);
+        const providerScopedIdentity = this.telemetryIdentity(classification.provider, record, attributes, name);
         const codexPromptIdentity = this.codexActivityIdentity(classification.provider, attributes);
         const identity = classification.provider === "codex" && signal === "traces"
           ? mergeCodexTraceIdentity(providerScopedIdentity, codexPromptIdentity)
@@ -150,6 +336,12 @@ export class DefaultAgentPrivacyGuard {
         const queryId = opaqueHash("qry", `${classification.provider}|${identity.query}`);
         const sessionId = opaqueHash("ses", `${classification.provider}|${identity.session}`);
         const requestId = opaqueHash("req", `${classification.provider}|${identity.request}`);
+        const observedOwningActivityId = owningTools.get(
+          owningToolRecordKey(classification.provider, signal, record)
+        );
+        const ownership = classification.provider === "claude-code"
+          ? this.claudeActivityOwnershipForRequest(requestId, observedOwningActivityId)
+          : { owningActivityId: observedOwningActivityId };
         const atomIdentity = [
           classification.provider,
           identity.query,
@@ -165,7 +357,7 @@ export class DefaultAgentPrivacyGuard {
           queryId,
           sessionId,
           requestId,
-          owningActivityId: owningTools.get(firstText(record.spanId) ?? ""),
+          ...ownership,
           signal,
           sourceId: classification.sourceId,
           profileVersion: classification.profileVersion,
@@ -173,6 +365,7 @@ export class DefaultAgentPrivacyGuard {
           runtime: classification.runtime,
           authority,
           completionMode: completionModeFor(classification.provider, signal, name),
+          ...(identity.usagePurpose ? { usagePurpose: identity.usagePurpose } : {}),
           billingContext: billingContextFrom(classification.provider, attributes, model),
           providerReportedNanoUsd: reportedNanoUsd,
           model,
@@ -202,6 +395,8 @@ export class DefaultAgentPrivacyGuard {
       return usageRecords(resource, signal).flatMap((record): SafeActivityAtomV1[] => {
         const attributes = recordAttributes(resourceAttributes, record);
         const name = firstText(record.name, attributes["event.name"]) ?? "";
+        const isClaudeToolDecision = classification.provider === "claude-code"
+          && isClaudeToolDecisionEventName(normalizedName(name));
         const codexToolCallId = classification.provider === "codex"
           && normalizedName(name) === "codex.tool_result"
           ? firstText(attributes["call_id"], attributes["tool.call.id"], attributes["gen_ai.tool.call.id"])
@@ -212,7 +407,7 @@ export class DefaultAgentPrivacyGuard {
         if (!descriptor) {
           return [];
         }
-        const providerScopedIdentity = providerIdentity(classification.provider, record, attributes, name);
+        const providerScopedIdentity = this.telemetryIdentity(classification.provider, record, attributes, name);
         const codexPromptIdentity = this.codexActivityIdentity(classification.provider, attributes);
         const identity = classification.provider === "codex"
           ? mergeCodexTraceIdentity(providerScopedIdentity, codexPromptIdentity)
@@ -224,10 +419,10 @@ export class DefaultAgentPrivacyGuard {
           firstText(attributes["event.timestamp"], record.startTimeUnixNano, record.timeUnixNano),
           observedAt
         );
-        const endedAt = optionalTimestampToIso(firstText(record.endTimeUnixNano, record.timeUnixNano));
         const traceId = firstText(record.traceId) ?? identity.query;
+        const toolUseId = firstText(attributes["tool_use_id"]);
         const spanId = firstText(
-          attributes["tool_use_id"],
+          toolUseId,
           codexToolCallId,
           attributes["call_id"],
           attributes["tool.call.id"],
@@ -235,47 +430,70 @@ export class DefaultAgentPrivacyGuard {
         )
           ?? `${descriptor.name}|${startedAt}`;
         const requestId = opaqueHash("req", `${classification.provider}|${spanId}`);
-        const durationMs = nonnegativeInteger(firstText(attributes["duration_ms"]))
-          ?? durationBetween(startedAt, endedAt);
-        const resultSizeBytes = nonnegativeInteger(firstText(
-          attributes["output_length"],
-          attributes["result_size_bytes"],
-          attributes["result_bytes"]
-        ));
-        const providerReportedResultTokens = nonnegativeInteger(firstText(
-          attributes["tool_token_count"],
-          attributes["result_tokens"]
-        ));
+        const rawEndedAt = optionalTimestampToIso(firstText(record.endTimeUnixNano, record.timeUnixNano));
+        const endedAt = isClaudeToolDecision ? undefined : rawEndedAt;
+        // A permission decision is not an execution result. Retain only its
+        // timestamp and safe outcome, never a duration or result measurement.
+        const durationMs = isClaudeToolDecision
+          ? undefined
+          : nonnegativeInteger(firstText(attributes["duration_ms"]))
+            ?? durationBetween(startedAt, rawEndedAt);
+        const resultSizeBytes = isClaudeToolDecision
+          ? undefined
+          : nonnegativeInteger(firstText(
+              attributes["output_length"],
+              attributes["result_size_bytes"],
+              attributes["result_bytes"]
+            ));
+        const providerReportedResultTokens = isClaudeToolDecision
+          ? undefined
+          : nonnegativeInteger(firstText(
+              attributes["tool_token_count"],
+              attributes["result_tokens"]
+            ));
+        const outcome = providerActivityOutcome(
+          classification.provider,
+          name,
+          descriptor.name,
+          record,
+          attributes
+        );
+        // Claude emits a permission decision for the same tool_use_id as the
+        // eventual tool result or hook. Keep it as separately addressable
+        // evidence; requestId still joins the evidence into one semantic tool.
+        const activityId = isClaudeToolDecision
+          ? nativeClaudeToolDecisionActivityId(traceId, spanId)
+          : activityIdFor(classification.provider, traceId, spanId);
         return [{
           schemaVersion: 1,
-          activityId: activityIdFor(classification.provider, traceId, spanId),
+          activityId,
           queryId: opaqueHash("qry", `${classification.provider}|${identity.query}`),
           sessionId: opaqueHash("ses", `${classification.provider}|${identity.session}`),
           requestId,
+          ...(classification.provider === "claude-code" && toolUseId ? {
+            invocationId: opaqueHash("invocation", `${classification.provider}|${toolUseId}`)
+          } : {}),
           provider: classification.provider,
           runtime: classification.runtime,
           kind: descriptor.kind,
           name: descriptor.name,
-          outcome: providerActivityOutcome(
-            classification.provider,
-            name,
-            descriptor.name,
-            record,
-            attributes
-          ),
-          durationMs,
-          resultSizeBytes,
-          providerReportedResultTokens,
+          outcome,
+          ...(isClaudeToolDecision && outcome === "rejected"
+            ? { outcomeAuthority: "native_permission_decision" as const }
+            : {}),
+          ...(durationMs != null ? { durationMs } : {}),
+          ...(resultSizeBytes != null ? { resultSizeBytes } : {}),
+          ...(providerReportedResultTokens != null ? { providerReportedResultTokens } : {}),
           evidenceBasis: signal === "traces" ? "trace_span" : "otel_event",
           evidenceSourceId: classification.sourceId,
           evidenceProfileVersion: classification.profileVersion,
           identityConfidence: "medium",
           timingConfidence: "medium",
-          ...(this.captureSensitiveAuditEvidence() && classification.provider !== "codex"
+          ...(this.captureSensitiveAuditEvidence() && classification.provider !== "codex" && !isClaudeToolDecision
             ? { sensitiveAuditEvidence: sensitiveAuditEvidence(attributes, startedAt, descriptor) }
             : {}),
           startedAt,
-          endedAt: endedAt && endedAt >= startedAt ? endedAt : undefined
+          ...(endedAt && endedAt >= startedAt ? { endedAt } : {})
         }];
       });
     });
@@ -296,7 +514,9 @@ export class DefaultAgentPrivacyGuard {
         const attributes = recordAttributes(resourceAttributes, record);
         const name = firstText(record.name, attributes["event.name"]) ?? "";
         const normalized = normalizedName(name);
-        const identity = providerIdentity(classification.provider, record, attributes, name)
+        const isClaudeToolDecision = classification.provider === "claude-code"
+          && isClaudeToolDecisionEventName(normalized);
+        const identity = this.telemetryIdentity(classification.provider, record, attributes, name)
           ?? this.codexActivityIdentity(classification.provider, attributes);
         if (!identity) {
           return [];
@@ -344,6 +564,7 @@ export class DefaultAgentPrivacyGuard {
         }
         const spanId = firstText(record.spanId);
         const traceId = firstText(record.traceId) ?? identity.request;
+        const toolUseId = firstText(attributes["tool_use_id"]);
         const model = safeModel(firstText(
           attributes["gen_ai.request.model"],
           attributes["gen_ai.response.model"],
@@ -358,31 +579,62 @@ export class DefaultAgentPrivacyGuard {
         if (!descriptor && !hasCustomerLlmEvidence) {
           return [];
         }
-        const nodeId = executionNodeId(classification.provider, queryId, traceId, spanId, startedAt, normalized || "event");
+        const nodeId = isClaudeToolDecision
+          ? nativeClaudeToolDecisionExecutionNodeId(queryId, traceId, toolUseId ?? spanId ?? startedAt)
+          : executionNodeId(classification.provider, queryId, traceId, spanId, startedAt, normalized || "event");
         const parentSpanId = firstText(record.parentSpanId);
         const parentNodeId = parentSpanId
           ? executionNodeId(classification.provider, queryId, traceId, parentSpanId)
           : promptNodeId(queryId);
-        const endedAt = optionalTimestampToIso(firstText(record.endTimeUnixNano, record.timeUnixNano));
+        const rawEndedAt = optionalTimestampToIso(firstText(record.endTimeUnixNano, record.timeUnixNano));
+        const endedAt = isClaudeToolDecision ? undefined : rawEndedAt;
+        const durationMs = isClaudeToolDecision
+          ? undefined
+          : nonnegativeInteger(firstText(attributes["duration_ms"])) ?? durationBetween(startedAt, rawEndedAt);
+        const outcome = descriptor
+          ? providerActivityOutcome(
+              classification.provider,
+              name,
+              descriptor.name,
+              record,
+              attributes
+            )
+          : explicitLlmOutcome(record, attributes, endedAt);
         return [{
           schemaVersion: 1,
           nodeId,
           queryId,
           sessionId,
           requestId,
+          ...(toolUseId ? {
+            // `requestId` deliberately remains the telemetry request identity.
+            // Claude's tool decision and PostToolUse hook use different request
+            // surfaces, so artifact authority joins them only on this opaque
+            // provider tool-use identity.
+            invocationId: opaqueHash("invocation", `${classification.provider}|${toolUseId}`)
+          } : {}),
           provider: classification.provider,
           runtime: classification.runtime,
           signal,
           nodeKind: descriptor ? executionNodeKindForActivity(descriptor.kind) : "llm_request",
           name: descriptor?.name ?? executionNodeDisplayName(classification.provider, name, model),
           parentNodeId: nodeId === promptNodeId(queryId) ? undefined : parentNodeId,
-          outcome: descriptor ? activityOutcome(record, attributes) : endedAt ? "success" : "unknown",
+          outcome,
+          ...(isClaudeToolDecision && outcome === "rejected"
+            ? { outcomeAuthority: "native_permission_decision" as const }
+            : {}),
           startedAt,
-          endedAt: endedAt && endedAt >= startedAt ? endedAt : undefined,
-          durationMs: nonnegativeInteger(firstText(attributes["duration_ms"])) ?? durationBetween(startedAt, endedAt),
-          model,
+          ...(endedAt && endedAt >= startedAt ? { endedAt } : {}),
+          ...(durationMs != null ? { durationMs } : {}),
           toolName: descriptor?.name,
-          ...usage
+          // A native Claude permission decision is activity evidence only. It
+          // must not retain model, token, or request-purpose/context fields
+          // that make the decision look like an executed LLM request.
+          ...(isClaudeToolDecision ? {} : {
+            model,
+            ...(identity.usagePurpose ? { usagePurpose: identity.usagePurpose } : {}),
+            ...usage
+          })
         }];
       });
     });
@@ -402,10 +654,17 @@ export class DefaultAgentPrivacyGuard {
       return usageRecords(resource, signal).flatMap((record) => {
         const attributes = recordAttributes(resourceAttributes, record);
         const name = normalizedName(firstText(record.name, attributes["event.name"]) ?? "");
+        if (
+          classification.provider === "claude-code"
+          && signal === "traces"
+          && name === "claude_code.interaction"
+        ) {
+          return this.sanitizeClaudeClosedInteraction(record, attributes, classification);
+        }
         if (!isProviderPromptEvent(classification.provider, name) && !isProviderRootRunStart(classification.provider, signal, name)) {
           return [];
         }
-        const identity = providerIdentity(classification.provider, record, attributes, name);
+        const identity = this.telemetryIdentity(classification.provider, record, attributes, name);
         if (!identity) {
           return [];
         }
@@ -429,6 +688,16 @@ export class DefaultAgentPrivacyGuard {
           lifecycleVisibility = this.isInternalCodexIdentity(active) ? "internal" : undefined;
         } else if (classification.provider === "claude-code") {
           this.rememberClaudeQuery(identity.session, { query: identity.query, startedAt });
+          const accepted = this.claudeAcceptedSubmissionsByIdentity.get(
+            claudeQueryIdentityKey(identity.session, identity.query)
+          );
+          const remembered = this.claudeQueriesBySession.get(identity.session);
+          const authoritative = accepted
+            ?? (remembered?.query === identity.query ? { ...remembered, session: identity.session } : undefined);
+          if (authoritative) {
+            occurrenceQuery = authoritative.query;
+            occurrenceStartedAt = authoritative.startedAt;
+          }
         }
         return [{
           schemaVersion: 1,
@@ -458,6 +727,28 @@ export class DefaultAgentPrivacyGuard {
       : provider === "codex"
         ? this.sanitizeCodexHookObservation(raw, observedAt)
         : this.sanitizeCursorHookObservation(raw, observedAt);
+  }
+
+  countClaudeBackgroundRootsAwaitingTerminal(session: unknown): number {
+    const safeSession = typeof session === "string" ? boundedOpaqueText(session) : undefined;
+    if (!safeSession) {
+      return 0;
+    }
+    let count = 0;
+    for (const submission of this.claudeAcceptedSubmissionsByIdentity.values()) {
+      if (
+        submission.session === safeSession
+        && this.claudeBackgroundRootsAwaitingTerminalByIdentity.has(
+          claudeBackgroundRootTerminalKey(submission.session, submission.query)
+        )
+      ) {
+        count += 1;
+        if (count >= MAX_CLAUDE_BACKGROUND_ROOT_DIAGNOSTIC_COUNT) {
+          return MAX_CLAUDE_BACKGROUND_ROOT_DIAGNOSTIC_COUNT;
+        }
+      }
+    }
+    return count;
   }
 
   private sanitizeCodexLogUsageAtoms(
@@ -709,14 +1000,430 @@ export class DefaultAgentPrivacyGuard {
     return identity?.session ? this.codexQueriesBySession.get(identity.session) : undefined;
   }
 
+  private telemetryIdentity(
+    provider: SafeObservationV1["provider"],
+    record: Record<string, unknown>,
+    attributes: Record<string, unknown>,
+    name: string
+  ): ProviderTelemetryIdentity | undefined {
+    return provider === "claude-code"
+      ? this.claudeTelemetryIdentity(record, attributes)
+      : providerIdentity(provider, record, attributes, name);
+  }
+
+  private claudeTelemetryIdentity(
+    record: Record<string, unknown>,
+    attributes: Record<string, unknown>
+  ): ProviderTelemetryIdentity | undefined {
+    const prompt = firstText(attributes["prompt.id"], attributes["prompt_id"]);
+    const session = firstText(
+      attributes["session.id"],
+      attributes["session_id"],
+      attributes["gen_ai.conversation.id"]
+    );
+    const trace = firstText(record.traceId);
+    const request = firstText(
+      attributes["request_id"],
+      attributes["request.id"],
+      attributes["gen_ai.response.id"]
+    );
+    const promptCorrelation = prompt ? this.claudeQueriesByPrompt.get(prompt) : undefined;
+    const traceCorrelation = trace ? this.claudeQueriesByTrace.get(trace) : undefined;
+    const requestCorrelation = request ? this.claudeQueriesByRequest.get(request) : undefined;
+    if (
+      promptCorrelation?.state === "conflict"
+      || traceCorrelation?.state === "conflict"
+      || requestCorrelation?.state === "conflict"
+    ) {
+      return undefined;
+    }
+
+    const candidates: ClaudeQueryIdentity[] = [];
+    if (prompt && session) {
+      if (promptCorrelation?.state === "resolved") {
+        if (promptCorrelation.value.session !== session) {
+          setBoundedMap(this.claudeQueriesByPrompt, prompt, { state: "conflict" });
+          return undefined;
+        }
+        candidates.push(promptCorrelation.value);
+      } else {
+        const activeSubmission = this.claudeSubmissionHooksBySession.get(session);
+        const continuationAuthorized = activeSubmission
+          ? this.claudeContinuationAuthorizedByIdentity.has(
+              claudeQueryIdentityKey(session, activeSubmission.query)
+            )
+          : false;
+        candidates.push({
+          query: activeSubmission
+            && (activeSubmission.query === prompt || continuationAuthorized)
+            ? activeSubmission.query
+            : prompt,
+          session
+        });
+      }
+    }
+    if (promptCorrelation?.state === "resolved") {
+      candidates.push(promptCorrelation.value);
+    }
+    if (traceCorrelation?.state === "resolved") {
+      candidates.push(traceCorrelation.value);
+    }
+    if (requestCorrelation?.state === "resolved") {
+      candidates.push(requestCorrelation.value);
+    }
+    const hasExactCorrelation = promptCorrelation?.state === "resolved"
+      || traceCorrelation?.state === "resolved"
+      || requestCorrelation?.state === "resolved";
+    const activeSession = session && !prompt && !hasExactCorrelation
+      ? this.claudeSubmissionHooksBySession.get(session) ?? this.claudeQueriesBySession.get(session)
+      : undefined;
+    if (activeSession && session) {
+      candidates.push({ query: activeSession.query, session });
+    }
+    const identity = candidates[0];
+    if (!identity) {
+      return undefined;
+    }
+    if (candidates.some((candidate) => !sameClaudeQueryIdentity(candidate, identity))) {
+      if (prompt) setBoundedMap(this.claudeQueriesByPrompt, prompt, { state: "conflict" });
+      if (trace) setBoundedMap(this.claudeQueriesByTrace, trace, { state: "conflict" });
+      if (request) setBoundedMap(this.claudeQueriesByRequest, request, { state: "conflict" });
+      return undefined;
+    }
+
+    if (
+      prompt
+      && rememberClaudeQueryCorrelation(this.claudeQueriesByPrompt, prompt, identity).state === "conflict"
+    ) {
+      return undefined;
+    }
+    if (
+      trace
+      && rememberClaudeQueryCorrelation(this.claudeQueriesByTrace, trace, identity).state === "conflict"
+    ) {
+      return undefined;
+    }
+    if (prompt && trace) {
+      rememberExactStringCorrelation(this.claudeNativePromptsByTrace, trace, prompt);
+      if (this.claudeNativePromptsByTrace.get(trace)?.state === "conflict") {
+        return undefined;
+      }
+    }
+
+    const querySourcePurpose = claudeUsagePurpose(attributes["query_source"]);
+    const operationPurpose = claudeOperationUsagePurpose(attributes["operation.name"]);
+    if (querySourcePurpose && operationPurpose && querySourcePurpose !== operationPurpose) {
+      if (request) setBoundedMap(this.claudeQueriesByRequest, request, { state: "conflict" });
+      return undefined;
+    }
+    const sourcePurpose = querySourcePurpose ?? operationPurpose;
+    let usagePurpose = requestCorrelation?.state === "resolved"
+      ? requestCorrelation.value.usagePurpose
+      : undefined;
+    if (sourcePurpose && usagePurpose && sourcePurpose !== usagePurpose) {
+      if (request) setBoundedMap(this.claudeQueriesByRequest, request, { state: "conflict" });
+      return undefined;
+    }
+    usagePurpose ??= sourcePurpose;
+    if (request) {
+      const rememberedRequest = rememberClaudeRequestCorrelation(
+        this.claudeQueriesByRequest,
+        request,
+        { ...identity, ...(usagePurpose ? { usagePurpose } : {}) }
+      );
+      if (rememberedRequest.state === "conflict") {
+        return undefined;
+      }
+      usagePurpose = rememberedRequest.value.usagePurpose;
+    }
+
+    const eventSequence = firstText(attributes["event.sequence"]);
+    return {
+      ...identity,
+      request: request
+        ?? firstText(
+          record.spanId,
+          trace,
+          eventSequence && `${identity.session}|${eventSequence}`
+        )
+        ?? identity.query,
+      ...(usagePurpose ? { usagePurpose } : {})
+    };
+  }
+
+  private sanitizeClaudeClosedInteraction(
+    record: Record<string, unknown>,
+    attributes: Record<string, unknown>,
+    classification: ReturnType<DefaultTelemetryClassification["classify"]>
+  ): QueryOccurrenceV1[] {
+    const completedAt = optionalTimestampToIso(firstText(record.endTimeUnixNano));
+    if (!completedAt) {
+      return [];
+    }
+    const identity = this.claudeTelemetryIdentity(record, attributes);
+    if (!identity) {
+      return [];
+    }
+    const identityKey = claudeQueryIdentityKey(identity.session, identity.query);
+    if (this.claudeCompletedSubmissionsByIdentity.has(identityKey)) {
+      return [];
+    }
+    const continuationFloor = this.claudeContinuationFloorsByIdentity.get(identityKey);
+    if (continuationFloor && completedAt <= continuationFloor) {
+      return [];
+    }
+    const trace = firstText(record.traceId);
+    const nativePromptCorrelation = trace ? this.claudeNativePromptsByTrace.get(trace) : undefined;
+    const nativePrompt = nativePromptCorrelation?.state === "resolved"
+      ? nativePromptCorrelation.value
+      : undefined;
+    if (nativePrompt) {
+      const pausedKey = claudeNativePromptIdentityKey(identity.session, nativePrompt);
+      const pausedIdentity = this.claudeBackgroundPausedNativePrompts.get(pausedKey);
+      if (pausedIdentity && sameClaudeQueryIdentity(pausedIdentity, identity)) {
+        this.claudeBackgroundPausedNativePrompts.delete(pausedKey);
+        if (this.claudeClosedInteractionsByIdentity.get(identityKey)?.nativePrompt === nativePrompt) {
+          this.claudeClosedInteractionsByIdentity.delete(identityKey);
+        }
+        return [];
+      }
+    }
+    const closed = {
+      query: identity.query,
+      session: identity.session,
+      completedAt,
+      ...(nativePrompt ? { nativePrompt } : {})
+    };
+    setBoundedMap(this.claudeClosedInteractionsByIdentity, identityKey, closed);
+    const accepted = this.claudeAcceptedSubmissionsByIdentity.get(identityKey);
+    if (accepted) {
+      this.releaseClaudeSubmission(accepted);
+    }
+    const candidate = this.claudeStopCandidatesByIdentity.get(identityKey);
+    if (
+      !candidate
+      || candidate.session !== identity.session
+      || !timestampAtOrAfterWithin(completedAt, candidate.stoppedAt, 5_000)
+    ) {
+      return [];
+    }
+    this.claudeStopCandidatesByIdentity.delete(identityKey);
+    this.claudeClosedInteractionsByIdentity.delete(identityKey);
+    const completed = this.completeClaudeSubmission({
+      query: identity.query,
+      session: identity.session,
+      startedAt: candidate.startedAt
+    }, "closed_root", completedAt);
+    if (!completed) {
+      return [];
+    }
+    return [claudeCompletedOccurrence(candidate, completedAt, classification)];
+  }
+
   private rememberClaudeQuery(session: string, query: { query: string; startedAt: string }): void {
-    rememberSessionQuery(this.claudeQueriesBySession, session, query);
+    const hookAuthoritative = this.claudeSubmissionHooksBySession.get(session);
+    if (hookAuthoritative && hookAuthoritative.query !== query.query) {
+      return;
+    }
+    const current = this.claudeQueriesBySession.get(session);
+    rememberSessionQuery(
+      this.claudeQueriesBySession,
+      session,
+      current?.query === query.query ? current : query
+    );
+  }
+
+  private claudeActivityOwnershipForRequest(
+    requestId: string,
+    observedOwningActivityId: string | undefined
+  ): Pick<SafeUsageAtomV1, "owningActivityId" | "ownershipConflictActivityIds"> {
+    const current = this.claudeUsageOwnersByRequest.get(requestId);
+    if (current?.state === "conflict") {
+      const activityIds = boundedOpaqueIds([
+        ...current.activityIds,
+        ...(observedOwningActivityId ? [observedOwningActivityId] : [])
+      ]);
+      setBoundedMap(this.claudeUsageOwnersByRequest, requestId, { state: "conflict", activityIds });
+      return { ownershipConflictActivityIds: activityIds };
+    }
+    if (
+      current?.state === "resolved"
+      && observedOwningActivityId
+      && current.value !== observedOwningActivityId
+    ) {
+      const activityIds = boundedOpaqueIds([current.value, observedOwningActivityId]);
+      setBoundedMap(this.claudeUsageOwnersByRequest, requestId, { state: "conflict", activityIds });
+      return { ownershipConflictActivityIds: activityIds };
+    }
+    if (observedOwningActivityId) {
+      setBoundedMap(this.claudeUsageOwnersByRequest, requestId, {
+        state: "resolved",
+        value: observedOwningActivityId
+      });
+      return { owningActivityId: observedOwningActivityId };
+    }
+    return current?.state === "resolved" ? { owningActivityId: current.value } : {};
+  }
+
+  private knownClaudePromptIdentity(prompt: string, session: string): ClaudeQueryIdentity | undefined {
+    const completedAlias = this.claudeCompletedPromptAliases.get(prompt);
+    if (completedAlias) {
+      return completedAlias.session === session ? completedAlias : undefined;
+    }
+    const correlation = this.claudeQueriesByPrompt.get(prompt);
+    if (correlation?.state === "conflict") {
+      return undefined;
+    }
+    if (correlation?.state === "resolved") {
+      return correlation.value.session === session ? correlation.value : undefined;
+    }
+    return { query: prompt, session };
+  }
+
+  private rememberClaudeTaskNotification(
+    raw: Record<string, unknown>,
+    session: string,
+    provenance: Extract<ClaudeSubmissionProvenance, { state: "resolved" }>,
+    observedAt: string
+  ): void {
+    const explicitTarget = this.claudeTaskNotificationTargetBySession.get(session);
+    const target = explicitTarget
+      ?? this.claudeLatestCompletedBySession.get(session);
+    if (!target) {
+      return;
+    }
+    const identity = { query: target.query, session };
+    const aliases = [...new Set([
+      firstText(raw.prompt_id, raw.turn_id),
+      provenance.transcriptPromptId
+    ].filter((value): value is string => Boolean(value)))];
+    if (!this.rememberClaudePromptAliases(aliases, identity)) {
+      return;
+    }
+    if (explicitTarget) {
+      const identityKey = claudeQueryIdentityKey(session, explicitTarget.query);
+      const currentFloor = this.claudeContinuationFloorsByIdentity.get(identityKey);
+      const continuationFloor = currentFloor && currentFloor >= observedAt ? currentFloor : observedAt;
+      setBoundedMap(this.claudeContinuationFloorsByIdentity, identityKey, continuationFloor);
+      const candidate = this.claudeStopCandidatesByIdentity.get(identityKey);
+      if (candidate && candidate.stoppedAt <= observedAt) {
+        this.claudeStopCandidatesByIdentity.delete(identityKey);
+      }
+      const closed = this.claudeClosedInteractionsByIdentity.get(identityKey);
+      if (closed && closed.completedAt <= continuationFloor) {
+        this.claudeClosedInteractionsByIdentity.delete(identityKey);
+      }
+      const active = this.claudeSubmissionHooksBySession.get(session);
+      if (!active || active.query === explicitTarget.query) {
+        this.activateClaudeSubmission(explicitTarget);
+      }
+    }
+    this.rememberClaudeQuery(session, {
+      query: target.query,
+      startedAt: target.startedAt
+    });
+  }
+
+  private rememberClaudePromptAliases(
+    aliases: readonly string[],
+    identity: ClaudeQueryIdentity
+  ): boolean {
+    const hasConflict = aliases.some((alias) => {
+      const completed = this.claudeCompletedPromptAliases.get(alias);
+      const current = this.claudeQueriesByPrompt.get(alias);
+      return Boolean(completed && !sameClaudeQueryIdentity(completed, identity))
+        || current?.state === "conflict"
+        || Boolean(
+          current?.state === "resolved"
+          && !sameClaudeQueryIdentity(current.value, identity)
+        );
+    });
+    if (hasConflict) {
+      for (const alias of aliases) {
+        setBoundedMap(this.claudeQueriesByPrompt, alias, { state: "conflict" });
+      }
+      return false;
+    }
+    for (const alias of aliases) {
+      rememberClaudeQueryCorrelation(this.claudeQueriesByPrompt, alias, identity);
+    }
+    return true;
+  }
+
+  private rememberClaudeAcceptedSubmission(submission: ClaudeAcceptedSubmission): ClaudeAcceptedSubmission {
+    const identityKey = claudeQueryIdentityKey(submission.session, submission.query);
+    const current = this.claudeAcceptedSubmissionsByIdentity.get(identityKey);
+    const accepted = current ?? submission;
+    setBoundedMap(this.claudeAcceptedSubmissionsByIdentity, identityKey, accepted);
+    return accepted;
+  }
+
+  private activateClaudeSubmission(submission: ClaudeAcceptedSubmission): void {
+    rememberSessionQuery(this.claudeSubmissionHooksBySession, submission.session, submission);
+    rememberSessionQuery(this.claudeQueriesBySession, submission.session, submission);
+  }
+
+  private releaseClaudeSubmission(submission: ClaudeAcceptedSubmission): void {
+    if (this.claudeSubmissionHooksBySession.get(submission.session)?.query === submission.query) {
+      this.claudeSubmissionHooksBySession.delete(submission.session);
+    }
+    if (this.claudeQueriesBySession.get(submission.session)?.query === submission.query) {
+      this.claudeQueriesBySession.delete(submission.session);
+    }
+  }
+
+  private claudeSubmissionHasPendingTerminalHalf(identity: ClaudeQueryIdentity): boolean {
+    const identityKey = claudeQueryIdentityKey(identity.session, identity.query);
+    return this.claudeStopCandidatesByIdentity.has(identityKey)
+      || this.claudeClosedInteractionsByIdentity.has(identityKey);
+  }
+
+  private completeClaudeSubmission(
+    submission: ClaudeAcceptedSubmission,
+    terminalKind: ClaudeCompletedSubmission["terminalKind"],
+    completedAt: string,
+    failureCategory?: RunCompletionFailureCategory
+  ): ClaudeCompletedSubmission | undefined {
+    const identityKey = claudeQueryIdentityKey(submission.session, submission.query);
+    if (this.claudeCompletedSubmissionsByIdentity.has(identityKey)) {
+      return undefined;
+    }
+    const completed: ClaudeCompletedSubmission = {
+      ...submission,
+      terminalKind,
+      completedAt,
+      ...(failureCategory ? { failureCategory } : {})
+    };
+    setBoundedMap(this.claudeCompletedSubmissionsByIdentity, identityKey, completed);
+    setBoundedMap(this.claudeLatestCompletedBySession, submission.session, completed);
+    const identity = { query: submission.query, session: submission.session };
+    setBoundedMap(this.claudeCompletedPromptAliases, submission.query, identity);
+    for (const [prompt, correlation] of this.claudeQueriesByPrompt) {
+      if (
+        correlation.state === "resolved"
+        && sameClaudeQueryIdentity(correlation.value, identity)
+      ) {
+        setBoundedMap(this.claudeCompletedPromptAliases, prompt, identity);
+      }
+    }
+    this.claudeContinuationAuthorizedByIdentity.delete(identityKey);
+    this.claudeContinuationFloorsByIdentity.delete(identityKey);
+    this.claudeBackgroundRootsAwaitingTerminalByIdentity.delete(
+      claudeBackgroundRootTerminalKey(submission.session, submission.query)
+    );
+    for (const [pausedKey, pausedIdentity] of this.claudeBackgroundPausedNativePrompts) {
+      if (sameClaudeQueryIdentity(pausedIdentity, identity)) {
+        this.claudeBackgroundPausedNativePrompts.delete(pausedKey);
+      }
+    }
+    this.releaseClaudeSubmission(submission);
+    return completed;
   }
 
   private codexActivityIdentity(
     provider: SafeObservationV1["provider"],
     attributes: Record<string, unknown>
-  ): { query: string; session: string; request: string } | undefined {
+  ): ProviderTelemetryIdentity | undefined {
     if (provider !== "codex") {
       return undefined;
     }
@@ -756,8 +1463,102 @@ export class DefaultAgentPrivacyGuard {
       if (!session) {
         return undefined;
       }
-      const query = firstText(raw.prompt_id, raw.turn_id) ?? `${session}|${observedAt}`;
-      this.rememberClaudeQuery(session, { query, startedAt: observedAt });
+      const provenance = claudeSubmissionProvenance(raw);
+      if (provenance && provenance.state !== "resolved") {
+        return undefined;
+      }
+      if (
+        provenance?.state === "resolved"
+        && provenance.originKind === "task-notification"
+        && provenance.promptSource === "system"
+      ) {
+        this.rememberClaudeTaskNotification(raw, session, provenance, observedAt);
+        return undefined;
+      }
+      if (
+        provenance?.state === "resolved"
+        && (provenance.originKind !== "human" || provenance.promptSource !== "typed")
+      ) {
+        return undefined;
+      }
+      const rawQuery = firstText(raw.prompt_id, raw.turn_id);
+      const explicitQuery = provenance?.state === "resolved"
+        ? provenance.transcriptPromptId
+        : rawQuery;
+      const activeSubmission = this.claudeSubmissionHooksBySession.get(session);
+      if (activeSubmission && !explicitQuery) {
+        return undefined;
+      }
+      const explicitIdentity = explicitQuery
+        ? this.knownClaudePromptIdentity(explicitQuery, session)
+        : undefined;
+      if (
+        explicitQuery
+        && explicitIdentity
+        && (
+          this.claudeCompletedSubmissionsByIdentity.has(
+            claudeQueryIdentityKey(explicitIdentity.session, explicitIdentity.query)
+          )
+          || (
+            this.claudeAcceptedSubmissionsByIdentity.has(
+              claudeQueryIdentityKey(explicitIdentity.session, explicitIdentity.query)
+            )
+            && this.claudeSubmissionHasPendingTerminalHalf(explicitIdentity)
+          )
+        )
+      ) {
+        return undefined;
+      }
+      if (
+        activeSubmission
+        && explicitIdentity
+        && explicitIdentity.query !== activeSubmission.query
+        && this.claudeAcceptedSubmissionsByIdentity.has(
+          claudeQueryIdentityKey(explicitIdentity.session, explicitIdentity.query)
+        )
+      ) {
+        return undefined;
+      }
+      const activeIdentityKey = activeSubmission
+        ? claudeQueryIdentityKey(session, activeSubmission.query)
+        : undefined;
+      const distinctExplicitPrompt = Boolean(
+        activeSubmission
+        && explicitQuery
+        && explicitQuery !== activeSubmission.query
+      );
+      const continuationAuthorized = activeIdentityKey
+        ? provenance == null && this.claudeContinuationAuthorizedByIdentity.has(activeIdentityKey)
+        : false;
+      if (
+        distinctExplicitPrompt
+        && !continuationAuthorized
+        && explicitIdentity?.query === activeSubmission?.query
+      ) {
+        return undefined;
+      }
+      const foldIntoActive = Boolean(
+        activeSubmission
+        && (!distinctExplicitPrompt || continuationAuthorized)
+      );
+      const query = foldIntoActive
+        ? activeSubmission?.query ?? `${session}|${observedAt}`
+        : explicitIdentity?.query
+        ?? explicitQuery
+        ?? `${session}|${observedAt}`;
+      const startedAt = foldIntoActive ? activeSubmission?.startedAt ?? observedAt : observedAt;
+      const promptAliases = [...new Set([explicitQuery, rawQuery].filter((value): value is string => Boolean(value)))];
+      if (!this.rememberClaudePromptAliases(promptAliases, { query, session })) {
+        return undefined;
+      }
+      if (distinctExplicitPrompt && continuationAuthorized && activeIdentityKey) {
+        this.claudeContinuationAuthorizedByIdentity.delete(activeIdentityKey);
+      }
+      const accepted = this.rememberClaudeAcceptedSubmission({ query, session, startedAt });
+      this.activateClaudeSubmission(accepted);
+      if (this.claudeSubmissionHasPendingTerminalHalf({ query, session })) {
+        this.releaseClaudeSubmission(accepted);
+      }
       return promptHookObservation({
         provider: "claude-code",
         sourceId: "hook_claude_code_lifecycle",
@@ -765,13 +1566,85 @@ export class DefaultAgentPrivacyGuard {
         observedAt,
         query,
         session,
+        startedAt: accepted.startedAt,
         evidence: "submission_hook"
       });
     }
     if (eventName === "stop") {
       const session = firstText(raw.session_id);
-      const current = session ? this.claudeQueriesBySession.get(session) : undefined;
-      if (!session || !current) {
+      const prompt = firstText(raw.prompt_id);
+      const promptIdentity = session && prompt ? this.knownClaudePromptIdentity(prompt, session) : undefined;
+      const active = session ? this.claudeSubmissionHooksBySession.get(session) : undefined;
+      const targetIdentity = session
+        ? prompt
+          ? promptIdentity
+          : active ? { query: active.query, session } : undefined
+        : undefined;
+      if (!session || !targetIdentity) {
+        return undefined;
+      }
+      const identityKey = claudeQueryIdentityKey(targetIdentity.session, targetIdentity.query);
+      const current = this.claudeAcceptedSubmissionsByIdentity.get(identityKey);
+      if (!current || this.claudeCompletedSubmissionsByIdentity.has(identityKey)) {
+        return undefined;
+      }
+      if (hasProviderWorkItems(raw.background_tasks) || hasProviderWorkItems(raw.session_crons)) {
+        this.claudeStopCandidatesByIdentity.delete(identityKey);
+        setBoundedMap(
+          this.claudeBackgroundRootsAwaitingTerminalByIdentity,
+          claudeBackgroundRootTerminalKey(current.session, current.query),
+          true
+        );
+        setBoundedMap(this.claudeTaskNotificationTargetBySession, session, current);
+        if (prompt) {
+          setBoundedMap(this.claudeContinuationAuthorizedByIdentity, identityKey, true);
+        }
+        const closed = this.claudeClosedInteractionsByIdentity.get(identityKey);
+        this.claudeClosedInteractionsByIdentity.delete(identityKey);
+        if (prompt && closed?.nativePrompt !== prompt) {
+          setBoundedMap(
+            this.claudeBackgroundPausedNativePrompts,
+            claudeNativePromptIdentityKey(session, prompt),
+            targetIdentity
+          );
+        }
+        const activeSubmission = this.claudeSubmissionHooksBySession.get(session);
+        if (!activeSubmission || activeSubmission.query === current.query) {
+          this.activateClaudeSubmission(current);
+        }
+        return undefined;
+      }
+      const continuationFloor = this.claudeContinuationFloorsByIdentity.get(identityKey);
+      if (continuationFloor && observedAt <= continuationFloor) {
+        return undefined;
+      }
+      this.claudeContinuationAuthorizedByIdentity.delete(identityKey);
+      this.claudeContinuationFloorsByIdentity.delete(identityKey);
+      if (prompt) {
+        this.claudeBackgroundPausedNativePrompts.delete(
+          claudeNativePromptIdentityKey(session, prompt)
+        );
+      }
+      const candidate = {
+        query: current.query,
+        session,
+        startedAt: current.startedAt,
+        stoppedAt: observedAt
+      };
+      setBoundedMap(this.claudeStopCandidatesByIdentity, identityKey, candidate);
+      this.releaseClaudeSubmission(current);
+      const closed = this.claudeClosedInteractionsByIdentity.get(identityKey);
+      if (!closed || closed.session !== session) {
+        return undefined;
+      }
+      if (!timestampAtOrAfterWithin(closed.completedAt, observedAt, 5_000)) {
+        this.claudeClosedInteractionsByIdentity.delete(identityKey);
+        return undefined;
+      }
+      this.claudeStopCandidatesByIdentity.delete(identityKey);
+      this.claudeClosedInteractionsByIdentity.delete(identityKey);
+      const completed = this.completeClaudeSubmission(current, "closed_root", closed.completedAt);
+      if (!completed) {
         return undefined;
       }
       return completionHookObservation({
@@ -782,7 +1655,75 @@ export class DefaultAgentPrivacyGuard {
         query: current.query,
         session,
         startedAt: current.startedAt,
-        completionEvidence: "stop_hook"
+        completedAt: closed.completedAt,
+        completionEvidence: "closed_root_span",
+        observationIdentity: `claude-code|closed_interaction|${session}|${current.query}|${closed.completedAt}`
+      });
+    }
+    if (eventName === "stopfailure") {
+      const session = firstText(raw.session_id);
+      const prompt = firstText(raw.prompt_id);
+      const promptIdentity = session && prompt ? this.knownClaudePromptIdentity(prompt, session) : undefined;
+      const failureCategory = claudeStopFailureCategory(raw.error);
+      if (
+        !session
+        || !prompt
+        || !promptIdentity
+        || !failureCategory
+      ) {
+        return undefined;
+      }
+      const identityKey = claudeQueryIdentityKey(promptIdentity.session, promptIdentity.query);
+      let completed = this.claudeCompletedSubmissionsByIdentity.get(identityKey);
+      if (completed) {
+        if (completed.terminalKind !== "stop_failure" || !completed.failureCategory) {
+          return undefined;
+        }
+        const enrichedCategory = monotonicClaudeFailureCategory(
+          completed.failureCategory,
+          failureCategory
+        );
+        if (!enrichedCategory) {
+          return undefined;
+        }
+        if (enrichedCategory !== completed.failureCategory) {
+          completed = { ...completed, failureCategory: enrichedCategory };
+          setBoundedMap(this.claudeCompletedSubmissionsByIdentity, identityKey, completed);
+        }
+      } else {
+        const accepted = this.claudeAcceptedSubmissionsByIdentity.get(identityKey);
+        if (!accepted) {
+          return undefined;
+        }
+        this.claudeStopCandidatesByIdentity.delete(identityKey);
+        this.claudeClosedInteractionsByIdentity.delete(identityKey);
+        completed = this.completeClaudeSubmission(
+          accepted,
+          "stop_failure",
+          observedAt,
+          failureCategory
+        );
+        if (!completed) {
+          return undefined;
+        }
+      }
+      const effectiveFailureCategory = completed.failureCategory;
+      if (!effectiveFailureCategory) {
+        return undefined;
+      }
+      return completionHookObservation({
+        provider: "claude-code",
+        sourceId: "hook_claude_code_lifecycle",
+        profileVersion: "claude-code-hooks-v1",
+        observedAt,
+        query: completed.query,
+        session,
+        startedAt: completed.startedAt,
+        completedAt: completed.completedAt,
+        completionEvidence: "stop_hook",
+        completionOutcome: "failure",
+        completionFailureCategory: effectiveFailureCategory,
+        observationIdentity: `claude-code|stop_failure|${session}|${completed.query}|${effectiveFailureCategory}`
       });
     }
     if (eventName === "subagentstart" || eventName === "subagentstop") {
@@ -792,17 +1733,35 @@ export class DefaultAgentPrivacyGuard {
       return undefined;
     }
     const session = firstText(raw.session_id);
-    const current = session ? this.claudeQueriesBySession.get(session) : undefined;
+    const current = session
+      ? this.claudeSubmissionHooksBySession.get(session) ?? this.claudeQueriesBySession.get(session)
+      : undefined;
     if (!session || !current) {
       return undefined;
     }
     const toolName = safeActivityName(firstText(raw.tool_name)) ?? "unknown";
-    const descriptor = activityDescriptor("claude-code", "claude_code.tool_result", { tool_name: toolName }) ?? {
-      kind: "tool" as const,
-      name: toolName
-    };
+    const toolInput = isRecord(raw.tool_input) ? raw.tool_input : undefined;
+    const toolResponse = isRecord(raw.tool_response) ? raw.tool_response : undefined;
+    const isAgentTool = normalizedName(toolName) === "agent";
+    // Claude Code 2.1.207 reports the exact SubagentStart agent_id as
+    // PostToolUse tool_response.agentId. Read only that opaque identity and the
+    // allowlisted subtype; the rest of both content-bearing objects is discarded.
+    const childSession = eventName === "posttooluse" && isAgentTool
+      ? firstText(toolResponse?.agentId)
+      : undefined;
+    const subagentName = isAgentTool
+      ? safeActivityName(firstText(toolInput?.subagent_type))
+      : undefined;
+    const descriptor = isAgentTool && (subagentName || childSession)
+      ? { kind: "subagent" as const, name: subagentName ?? "Agent" }
+      : activityDescriptor("claude-code", "claude_code.tool_result", { tool_name: toolName }) ?? {
+          kind: "tool" as const,
+          name: toolName
+        };
     const durationMs = nonnegativeInteger(firstText(raw.duration_ms));
-    const startedAt = subtractDurationMs(observedAt, durationMs) ?? observedAt;
+    const startedAt = childSession
+      ? observedAt
+      : subtractDurationMs(observedAt, durationMs) ?? observedAt;
     const toolUseId = firstText(raw.tool_use_id);
     const attributes = hookSensitiveAttributes(
       raw.tool_input,
@@ -811,9 +1770,16 @@ export class DefaultAgentPrivacyGuard {
         : {
             error: firstText(raw.error) ?? "tool_failed",
             is_interrupt: raw.is_interrupt === true
-          },
+      },
       firstText(raw.cwd)
     );
+    const outcome = eventName === "posttoolusefailure"
+      ? raw.is_interrupt === true ? "rejected" : "failure"
+      : childSession
+        // Agent calls are background-by-default in the accepted native version.
+        // A successful PostToolUse proves launch/return, not child completion.
+        ? "unknown"
+        : claudeHookOutcome(toolName, raw.tool_response);
     return hookObservation({
       provider: "claude-code",
       sourceId: "hook_claude_code_tools",
@@ -825,21 +1791,20 @@ export class DefaultAgentPrivacyGuard {
       activity: {
         kind: descriptor.kind,
         name: descriptor.name,
-        outcome: eventName === "posttoolusefailure"
-          ? raw.is_interrupt === true ? "rejected" : "failure"
-          : hookOutcomeFromResponse(raw.tool_response),
-        durationMs
+        outcome,
+        durationMs: childSession ? undefined : durationMs,
+        childSession,
+        timingConfidence: childSession ? "medium" : undefined
       },
       node: {
         nodeKind: executionNodeKindForActivity(descriptor.kind),
         name: descriptor.name,
         toolName: descriptor.name,
-        outcome: eventName === "posttoolusefailure"
-          ? raw.is_interrupt === true ? "rejected" : "failure"
-          : hookOutcomeFromResponse(raw.tool_response),
+        ...(toolUseId ? { invocation: toolUseId } : {}),
+        outcome,
         startedAt,
-        endedAt: observedAt,
-        durationMs
+        endedAt: childSession ? undefined : observedAt,
+        durationMs: childSession ? undefined : durationMs
       }
     });
   }
@@ -850,23 +1815,33 @@ export class DefaultAgentPrivacyGuard {
     eventName: "subagentstart" | "subagentstop"
   ): SafeObservationV1 | undefined {
     const session = firstText(raw.session_id);
-    const current = session ? this.claudeQueriesBySession.get(session) : undefined;
+    const current = session
+      ? this.claudeSubmissionHooksBySession.get(session) ?? this.claudeQueriesBySession.get(session)
+      : undefined;
     if (!session || !current) {
       return undefined;
     }
-    const name = safeActivityName(firstText(raw.subagent_type, raw.agent_name, raw.name)) ?? "subagent";
+    const name = safeActivityName(firstText(raw.agent_type, raw.subagent_type, raw.agent_name, raw.name)) ?? "subagent";
     const childSession = firstText(raw.subagent_id, raw.agent_id);
     const request = childSession ?? `subagent|${name}|${observedAt}`;
-    if (eventName === "subagentstart") {
-      this.claudeSubagentStarts.set(request, observedAt);
+    const ledgerKey = childSession ? `${session}|${current.query}|${childSession}` : undefined;
+    if (eventName === "subagentstop" && (!ledgerKey || !this.claudeSubagentStarts.has(ledgerKey))) {
+      return undefined;
+    }
+    if (eventName === "subagentstart" && ledgerKey) {
+      setBoundedMap(this.claudeSubagentStarts, ledgerKey, observedAt);
     }
     const durationMs = nonnegativeInteger(firstText(raw.duration_ms));
-    const startedAt = this.claudeSubagentStarts.get(request)
+    const startedAt = (ledgerKey ? this.claudeSubagentStarts.get(ledgerKey) : undefined)
       ?? subtractDurationMs(observedAt, durationMs)
       ?? observedAt;
-    if (eventName === "subagentstop") {
-      this.claudeSubagentStarts.delete(request);
-    }
+    const outcome = eventName === "subagentstart"
+      ? "unknown"
+      : raw.is_interrupt === true
+        ? "rejected"
+        : firstText(raw.error)
+          ? "failure"
+          : "unknown";
     return hookObservation({
       provider: "claude-code",
       sourceId: "hook_claude_code_lifecycle",
@@ -875,19 +1850,19 @@ export class DefaultAgentPrivacyGuard {
       query: current.query,
       session,
       request,
+      observationRevision: `${eventName}|${observedAt}`,
       activity: {
         kind: "subagent",
         name,
-        outcome: eventName === "subagentstart" ? "unknown" : raw.error ? "failure" : "success",
+        outcome,
         durationMs,
         childSession
       },
       node: {
         nodeKind: "subagent",
         name,
-        outcome: eventName === "subagentstart" ? "unknown" : raw.error ? "failure" : "success",
+        outcome,
         startedAt,
-        endedAt: eventName === "subagentstop" ? observedAt : undefined,
         durationMs
       }
     });
@@ -1491,8 +2466,12 @@ function rememberSessionQuery(
   session: string,
   query: ActiveProviderQuery
 ): void {
-  store.delete(session);
-  store.set(session, query);
+  setBoundedMap(store, session, query);
+}
+
+function setBoundedMap<K, V>(store: Map<K, V>, key: K, value: V): void {
+  store.delete(key);
+  store.set(key, value);
   while (store.size > MAX_ACTIVE_PROVIDER_QUERIES) {
     const oldest = store.keys().next().value;
     if (oldest == null) {
@@ -1502,20 +2481,461 @@ function rememberSessionQuery(
   }
 }
 
+function sameClaudeQueryIdentity(left: ClaudeQueryIdentity, right: ClaudeQueryIdentity): boolean {
+  return left.query === right.query && left.session === right.session;
+}
+
+function claudeQueryIdentityKey(session: string, query: string): string {
+  return JSON.stringify([session, query]);
+}
+
+function claudeBackgroundRootTerminalKey(session: string, query: string): string {
+  return opaqueHash("cbr", JSON.stringify([session, query]));
+}
+
+function claudeNativePromptIdentityKey(session: string, prompt: string): string {
+  return JSON.stringify([session, prompt]);
+}
+
+const CLAUDE_TRANSCRIPT_MATCH_WINDOW_MS = 2_000;
+const CLAUDE_IDLESS_TRANSCRIPT_MATCH_WINDOW_MS = 250;
+const CLAUDE_TRANSCRIPT_MAX_TAIL_CHARACTERS = 262_144;
+const CLAUDE_TRANSCRIPT_MAX_RECORDS = 512;
+const TIRION_CLAUDE_PROMPT_DIGEST_FIELD = "tirion_claude_submission_prompt_digest";
+const CLAUDE_TRANSCRIPT_TAIL_UNAVAILABLE_REASONS = new Set<ClaudeTranscriptTailUnavailableReason>([
+  "transcript_locator_invalid",
+  "transcript_trust_rejected",
+  "transcript_read_unavailable",
+  "transcript_read_unstable"
+]);
+const CLAUDE_SUBMISSION_PROVENANCE_DIAGNOSTIC_REASONS = new Set<ClaudeSubmissionProvenanceDiagnosticReason>([
+  ...CLAUDE_TRANSCRIPT_TAIL_UNAVAILABLE_REASONS,
+  "transcript_tail_exceeded",
+  "hook_identity_unavailable",
+  "transcript_candidate_missing",
+  "idless_candidate_stale",
+  "prompt_digest_mismatch",
+  "prompt_identity_conflict",
+  "candidate_ambiguous",
+  "transcript_origin_kind_missing",
+  "transcript_origin_kind_unrecognized",
+  "transcript_prompt_source_missing",
+  "transcript_prompt_source_unrecognized",
+  "transcript_origin_prompt_source_incompatible",
+  "origin_not_human_typed",
+  "malformed_provenance"
+]);
+
+function resolveClaudeSubmissionProvenance(
+  raw: Record<string, unknown>,
+  transcript: ClaudeTranscriptTailInput,
+  observedAt: string,
+  consumedTranscriptRows: Set<string>,
+  transcriptRowReservations: Map<string, string>,
+  reservationKey: string
+): ClaudeSubmissionProvenance {
+  if (transcript.state !== "available") {
+    return unavailableClaudeSubmissionProvenance(
+      claudeTranscriptTailUnavailableReason(transcript.diagnosticReason) ?? "transcript_read_unavailable"
+    );
+  }
+  if (transcript.tail.length > CLAUDE_TRANSCRIPT_MAX_TAIL_CHARACTERS) {
+    return unavailableClaudeSubmissionProvenance("transcript_tail_exceeded");
+  }
+  const session = firstText(raw.session_id);
+  const observedMs = Date.parse(observedAt);
+  if (!session || !Number.isFinite(observedMs)) {
+    return unavailableClaudeSubmissionProvenance("hook_identity_unavailable");
+  }
+  const candidates = transcript.tail
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "")
+    .slice(-CLAUDE_TRANSCRIPT_MAX_RECORDS)
+    .flatMap((line) => {
+      let record: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        if (!isRecord(parsed)) {
+          return [];
+        }
+        record = parsed;
+      } catch {
+        return [];
+      }
+      const message = isRecord(record.message) ? record.message : undefined;
+      const recordSession = firstText(record.sessionId, record.session_id);
+      const transcriptPromptId = boundedOpaqueText(firstText(
+        record.promptId,
+        record.prompt_id,
+        record.uuid
+      ));
+      const timestamp = firstText(record.timestamp);
+      const timestampMs = timestamp ? Date.parse(timestamp) : Number.NaN;
+      if (
+        normalizedName(firstText(record.type) ?? "") !== "user"
+        || normalizedName(firstText(message?.role) ?? "") !== "user"
+        || typeof message?.content !== "string"
+        || recordSession !== session
+        || !transcriptPromptId
+        || !Number.isFinite(timestampMs)
+      ) {
+        return [];
+      }
+      const distanceMs = Math.abs(timestampMs - observedMs);
+      if (distanceMs > CLAUDE_TRANSCRIPT_MATCH_WINDOW_MS) {
+        return [];
+      }
+      const transcriptRecordKey = opaqueHash(
+        "claude_transcript_row",
+        JSON.stringify([session, transcriptPromptId, timestamp])
+      );
+      const reservedBy = transcriptRowReservations.get(transcriptRecordKey);
+      if (consumedTranscriptRows.has(transcriptRecordKey) || (reservedBy && reservedBy !== reservationKey)) {
+        return [];
+      }
+      const origin = isRecord(record.origin) ? record.origin : undefined;
+      return [{
+        transcriptPromptId,
+        transcriptRecordKey,
+        distanceMs,
+        promptDigest: claudePromptDigest(message.content),
+        originKind: firstText(origin?.kind),
+        promptSource: firstText(record.promptSource, record.prompt_source)
+      }];
+    });
+  if (candidates.length === 0) {
+    return unavailableClaudeSubmissionProvenance("transcript_candidate_missing");
+  }
+  const rawPrompt = boundedOpaqueText(firstText(raw.prompt_id, raw.turn_id));
+  if (!rawPrompt) {
+    const freshCandidates = candidates.filter(
+      (candidate) => candidate.distanceMs <= CLAUDE_IDLESS_TRANSCRIPT_MATCH_WINDOW_MS
+    );
+    if (freshCandidates.length === 0) {
+      return unavailableClaudeSubmissionProvenance("idless_candidate_stale");
+    }
+    candidates.splice(0, candidates.length, ...freshCandidates);
+  }
+  const hookPromptDigest = claudeSubmissionHookPromptDigest(raw);
+  if (hookPromptDigest) {
+    const promptMatches = candidates.filter((candidate) => candidate.promptDigest === hookPromptDigest);
+    if (promptMatches.length === 0) {
+      return unavailableClaudeSubmissionProvenance("prompt_digest_mismatch");
+    }
+    const rawPromptMatches = rawPrompt
+      ? candidates.filter((candidate) => candidate.transcriptPromptId === rawPrompt)
+      : [];
+    if (
+      rawPromptMatches.length > 0
+      && !rawPromptMatches.some((candidate) => candidate.promptDigest === hookPromptDigest)
+    ) {
+      return ambiguousClaudeSubmissionProvenance("prompt_identity_conflict");
+    }
+    candidates.splice(0, candidates.length, ...promptMatches);
+  }
+  const exactPromptCandidates = rawPrompt
+    ? candidates.filter((candidate) => candidate.transcriptPromptId === rawPrompt)
+    : [];
+  const pool = exactPromptCandidates.length > 0 ? exactPromptCandidates : candidates;
+  const nearestDistance = Math.min(...pool.map((candidate) => candidate.distanceMs));
+  const nearest = pool.filter((candidate) => candidate.distanceMs === nearestDistance);
+  if (nearest.length !== 1) {
+    return ambiguousClaudeSubmissionProvenance("candidate_ambiguous");
+  }
+  const match = nearest[0];
+  const originKind = claudeTranscriptOriginKind(match.originKind);
+  const promptSource = claudeTranscriptPromptSource(match.promptSource);
+  if (originKind === "human" && promptSource === "typed") {
+    setBoundedMap(transcriptRowReservations, match.transcriptRecordKey, reservationKey);
+    return {
+      state: "resolved",
+      originKind: "human",
+      promptSource: "typed",
+      transcriptPromptId: match.transcriptPromptId,
+      transcriptRecordKey: match.transcriptRecordKey,
+      transcriptReservationKey: reservationKey
+    };
+  }
+  if (originKind === "task-notification" && promptSource === "system") {
+    setBoundedMap(transcriptRowReservations, match.transcriptRecordKey, reservationKey);
+    return {
+      state: "resolved",
+      originKind: "task-notification",
+      promptSource: "system",
+      transcriptPromptId: match.transcriptPromptId,
+      transcriptRecordKey: match.transcriptRecordKey,
+      transcriptReservationKey: reservationKey
+    };
+  }
+  if (originKind === "missing") {
+    return unavailableClaudeSubmissionProvenance("transcript_origin_kind_missing");
+  }
+  if (originKind === "unrecognized") {
+    return unavailableClaudeSubmissionProvenance("transcript_origin_kind_unrecognized");
+  }
+  if (promptSource === "missing") {
+    return unavailableClaudeSubmissionProvenance("transcript_prompt_source_missing");
+  }
+  if (promptSource === "unrecognized") {
+    return unavailableClaudeSubmissionProvenance("transcript_prompt_source_unrecognized");
+  }
+  return unavailableClaudeSubmissionProvenance("transcript_origin_prompt_source_incompatible");
+}
+
+function claudeTranscriptOriginKind(
+  value: string | undefined
+): "human" | "task-notification" | "missing" | "unrecognized" {
+  if (!value) return "missing";
+  if (value === "human" || value === "task-notification") return value;
+  return "unrecognized";
+}
+
+function claudeTranscriptPromptSource(
+  value: string | undefined
+): "typed" | "system" | "missing" | "unrecognized" {
+  if (!value) return "missing";
+  if (value === "typed" || value === "system") return value;
+  return "unrecognized";
+}
+
+function unavailableClaudeSubmissionProvenance(
+  diagnosticReason: ClaudeSubmissionProvenanceDiagnosticReason
+): Extract<ClaudeSubmissionProvenance, { state: "unavailable" }> {
+  return { state: "unavailable", diagnosticReason };
+}
+
+function ambiguousClaudeSubmissionProvenance(
+  diagnosticReason: ClaudeSubmissionProvenanceDiagnosticReason
+): Extract<ClaudeSubmissionProvenance, { state: "ambiguous" }> {
+  return { state: "ambiguous", diagnosticReason };
+}
+
+function claudeSubmissionHookPromptDigest(raw: Record<string, unknown>): string | undefined {
+  const prompt = firstText(raw.prompt);
+  if (prompt != null) {
+    return claudePromptDigest(prompt);
+  }
+  const retainedDigest = boundedOpaqueText(firstText(raw[TIRION_CLAUDE_PROMPT_DIGEST_FIELD]));
+  if (retainedDigest && /^[a-f0-9]{64}$/.test(retainedDigest)) {
+    return retainedDigest;
+  }
+  return undefined;
+}
+
+function claudeSubmissionReservationKey(raw: Record<string, unknown>, observedAt: string): string {
+  const attemptId = boundedOpaqueText(firstText(raw[TIRION_CLAUDE_SUBMISSION_ATTEMPT_FIELD]));
+  return attemptId ?? opaqueHash("claude_submission_attempt", JSON.stringify([
+    firstText(raw.session_id),
+    firstText(raw.prompt_id, raw.turn_id),
+    claudeSubmissionHookPromptDigest(raw),
+    observedAt
+  ]));
+}
+
+function claudePromptDigest(prompt: string): string {
+  return createHash("sha256").update(prompt).digest("hex");
+}
+
+function claudeSubmissionProvenance(
+  raw: Record<string, unknown>
+): ClaudeSubmissionProvenance | undefined {
+  if (!("tirion_claude_submission_provenance" in raw)) {
+    return undefined;
+  }
+  const value = raw.tirion_claude_submission_provenance;
+  if (!isRecord(value)) {
+    return unavailableClaudeSubmissionProvenance("malformed_provenance");
+  }
+  if (value.state === "unavailable" || value.state === "ambiguous") {
+    const diagnosticReason = claudeSubmissionProvenanceDiagnosticReason(value.diagnosticReason);
+    return {
+      state: value.state,
+      ...(diagnosticReason ? { diagnosticReason } : {})
+    };
+  }
+  const transcriptPromptId = boundedOpaqueText(firstText(value.transcriptPromptId));
+  if (
+    value.state === "resolved"
+    && transcriptPromptId
+    && (
+      (value.originKind === "human" && value.promptSource === "typed")
+      || (value.originKind === "task-notification" && value.promptSource === "system")
+    )
+  ) {
+    return {
+      state: "resolved",
+      originKind: value.originKind,
+      promptSource: value.promptSource,
+      transcriptPromptId
+    };
+  }
+  return unavailableClaudeSubmissionProvenance("malformed_provenance");
+}
+
+export function isClaudeSubmissionProvenanceDiagnosticReason(
+  value: unknown
+): value is ClaudeSubmissionProvenanceDiagnosticReason {
+  return typeof value === "string" && CLAUDE_SUBMISSION_PROVENANCE_DIAGNOSTIC_REASONS.has(
+    value as ClaudeSubmissionProvenanceDiagnosticReason
+  );
+}
+
+function claudeSubmissionProvenanceDiagnosticReason(
+  value: unknown
+): ClaudeSubmissionProvenanceDiagnosticReason | undefined {
+  return isClaudeSubmissionProvenanceDiagnosticReason(value) ? value : undefined;
+}
+
+function claudeTranscriptTailUnavailableReason(
+  value: unknown
+): ClaudeTranscriptTailUnavailableReason | undefined {
+  return typeof value === "string" && CLAUDE_TRANSCRIPT_TAIL_UNAVAILABLE_REASONS.has(
+    value as ClaudeTranscriptTailUnavailableReason
+  )
+    ? value as ClaudeTranscriptTailUnavailableReason
+    : undefined;
+}
+
+function boundedOpaqueText(value: string | undefined): string | undefined {
+  return value && value.length <= 4_096 && !value.includes("\0") ? value : undefined;
+}
+
+function boundedOpaqueIds(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.length <= 4_096 && !value.includes("\0")))].slice(0, 8);
+}
+
+function monotonicClaudeFailureCategory(
+  current: RunCompletionFailureCategory,
+  incoming: RunCompletionFailureCategory
+): RunCompletionFailureCategory | undefined {
+  if (current === incoming) {
+    return current;
+  }
+  if (current === "unknown") {
+    return incoming;
+  }
+  if (incoming === "unknown") {
+    return current;
+  }
+  return undefined;
+}
+
+function rememberClaudeQueryCorrelation(
+  store: Map<string, ClaudeCorrelation<ClaudeQueryIdentity>>,
+  key: string,
+  value: ClaudeQueryIdentity
+): ClaudeCorrelation<ClaudeQueryIdentity> {
+  const current = store.get(key);
+  const next: ClaudeCorrelation<ClaudeQueryIdentity> = current?.state === "conflict"
+    || (current?.state === "resolved" && !sameClaudeQueryIdentity(current.value, value))
+    ? { state: "conflict" }
+    : { state: "resolved", value: current?.state === "resolved" ? current.value : value };
+  setBoundedMap(store, key, next);
+  return next;
+}
+
+function rememberClaudeRequestCorrelation(
+  store: Map<string, ClaudeCorrelation<ClaudeRequestIdentity>>,
+  key: string,
+  value: ClaudeRequestIdentity
+): ClaudeCorrelation<ClaudeRequestIdentity> {
+  const current = store.get(key);
+  if (
+    current?.state === "conflict"
+    || (current?.state === "resolved" && !sameClaudeQueryIdentity(current.value, value))
+    || (
+      current?.state === "resolved"
+      && current.value.usagePurpose
+      && value.usagePurpose
+      && current.value.usagePurpose !== value.usagePurpose
+    )
+  ) {
+    const conflict = { state: "conflict" } as const;
+    setBoundedMap(store, key, conflict);
+    return conflict;
+  }
+  const resolved = {
+    state: "resolved",
+    value: {
+      ...value,
+      ...(current?.state === "resolved" && current.value.usagePurpose
+        ? { usagePurpose: current.value.usagePurpose }
+        : {})
+    }
+  } as const;
+  setBoundedMap(store, key, resolved);
+  return resolved;
+}
+
+function claudeUsagePurpose(value: unknown): UsagePurposeV1 | undefined {
+  if (value === "generate_session_title") {
+    return "auxiliary_session_title";
+  }
+  return value === "sdk" ? "customer" : undefined;
+}
+
+function claudeOperationUsagePurpose(value: unknown): UsagePurposeV1 | undefined {
+  return value === "generate_session_title" ? "auxiliary_session_title" : undefined;
+}
+
+function hasProviderWorkItems(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  if (isRecord(value)) {
+    return Object.keys(value).length > 0;
+  }
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 function owningToolActivityIds(
   provider: SafeObservationV1["provider"],
+  signal: TelemetrySignal,
   records: Record<string, unknown>[],
-  resourceAttributes: Record<string, unknown>
+  resourceAttributes: Record<string, unknown>,
+  claudeTraceOwnership?: {
+    parents: Map<string, ClaudeCorrelation<string>>;
+    toolActivities: Map<string, ClaudeCorrelation<string>>;
+  }
 ): Map<string, string> {
+  if (provider === "claude-code" && signal === "traces" && claudeTraceOwnership) {
+    rememberClaudeTraceOwnership(records, resourceAttributes, claudeTraceOwnership);
+    const result = new Map<string, string>();
+    for (const record of records) {
+      const owningActivityId = resolveClaudeTraceToolActivity(record, claudeTraceOwnership);
+      if (owningActivityId) {
+        result.set(traceSpanRecordKey(record), owningActivityId);
+      }
+    }
+    return result;
+  }
+
   const bySpanId = new Map(records.flatMap((record) => {
     const spanId = firstText(record.spanId);
     return spanId ? [[spanId, record] as const] : [];
   }));
-  const toolSpanIds = new Set(records.flatMap((record) => {
+  const toolActivityIdsBySpan = new Map(records.flatMap((record) => {
     const spanId = firstText(record.spanId);
     const attributes = { ...resourceAttributes, ...otlpAttributes(record.attributes) };
     const name = firstText(record.name, attributes["event.name"]) ?? "";
-    return spanId && provider !== "codex" && activityDescriptor(provider, name, attributes) ? [spanId] : [];
+    const isNativeClaudeToolDecision = provider === "claude-code"
+      && isClaudeToolDecisionEventName(normalizedName(name));
+    if (!spanId || provider === "codex" || isNativeClaudeToolDecision || !activityDescriptor(provider, name, attributes)) {
+      return [];
+    }
+    // sanitizeActivityAtoms uses the native tool/call identity ahead of the
+    // wrapper span ID. Preserve that exact identity here so descendant usage
+    // points at the same activity instead of an unreachable span-keyed clone.
+    const activityIdentity = firstText(
+      attributes["tool_use_id"],
+      attributes["call_id"],
+      attributes["tool.call.id"],
+      record.spanId
+    );
+    const traceId = firstText(record.traceId) ?? "";
+    return activityIdentity
+      ? [[spanId, activityIdFor(provider, traceId, activityIdentity)] as const]
+      : [];
   }));
   const result = new Map<string, string>();
   for (const record of records) {
@@ -1531,8 +2951,9 @@ function owningToolActivityIds(
         break;
       }
       seen.add(currentSpanId);
-      if (toolSpanIds.has(currentSpanId)) {
-        result.set(spanId, activityIdFor(provider, firstText(current.traceId) ?? "", currentSpanId));
+      const owningActivityId = toolActivityIdsBySpan.get(currentSpanId);
+      if (owningActivityId) {
+        result.set(spanId, owningActivityId);
         break;
       }
       const parentSpanId = firstText(current.parentSpanId);
@@ -1542,16 +2963,120 @@ function owningToolActivityIds(
   return result;
 }
 
+function rememberClaudeTraceOwnership(
+  records: Record<string, unknown>[],
+  resourceAttributes: Record<string, unknown>,
+  stores: {
+    parents: Map<string, ClaudeCorrelation<string>>;
+    toolActivities: Map<string, ClaudeCorrelation<string>>;
+  }
+): void {
+  for (const record of records) {
+    const traceId = firstText(record.traceId);
+    const spanId = firstText(record.spanId);
+    if (!traceId || !spanId) {
+      continue;
+    }
+    const spanKey = traceSpanKey(traceId, spanId);
+    const parentSpanId = firstText(record.parentSpanId);
+    if (parentSpanId) {
+      rememberExactStringCorrelation(stores.parents, spanKey, traceSpanKey(traceId, parentSpanId));
+    }
+
+    const attributes = { ...resourceAttributes, ...otlpAttributes(record.attributes) };
+    const name = normalizedName(firstText(record.name, attributes["event.name"]) ?? "");
+    const toolName = normalizedName(firstText(
+      attributes["gen_ai.tool.name"],
+      attributes["tool.name"],
+      attributes["tool_name"]
+    ) ?? "");
+    const toolUseId = firstText(attributes["tool_use_id"]);
+    if (name === "claude_code.tool" && toolName === "agent" && toolUseId) {
+      rememberExactStringCorrelation(
+        stores.toolActivities,
+        spanKey,
+        activityIdFor("claude-code", traceId, toolUseId)
+      );
+    }
+  }
+}
+
+function resolveClaudeTraceToolActivity(
+  record: Record<string, unknown>,
+  stores: {
+    parents: Map<string, ClaudeCorrelation<string>>;
+    toolActivities: Map<string, ClaudeCorrelation<string>>;
+  }
+): string | undefined {
+  const traceId = firstText(record.traceId);
+  const spanId = firstText(record.spanId);
+  if (!traceId || !spanId) {
+    return undefined;
+  }
+  let current = traceSpanKey(traceId, spanId);
+  const seen = new Set<string>();
+  while (!seen.has(current)) {
+    seen.add(current);
+    const tool = stores.toolActivities.get(current);
+    if (tool?.state === "conflict") {
+      return undefined;
+    }
+    if (tool?.state === "resolved") {
+      return tool.value;
+    }
+    const parent = stores.parents.get(current);
+    if (!parent || parent.state === "conflict") {
+      return undefined;
+    }
+    current = parent.value;
+  }
+  return undefined;
+}
+
+function rememberExactStringCorrelation(
+  store: Map<string, ClaudeCorrelation<string>>,
+  key: string,
+  value: string
+): void {
+  const current = store.get(key);
+  const next: ClaudeCorrelation<string> = current?.state === "conflict"
+    || (current?.state === "resolved" && current.value !== value)
+    ? { state: "conflict" }
+    : { state: "resolved", value };
+  setBoundedMap(store, key, next);
+}
+
+function traceSpanRecordKey(record: Record<string, unknown>): string {
+  const traceId = firstText(record.traceId);
+  const spanId = firstText(record.spanId);
+  return traceId && spanId ? traceSpanKey(traceId, spanId) : "";
+}
+
+function owningToolRecordKey(
+  provider: SafeObservationV1["provider"],
+  signal: TelemetrySignal,
+  record: Record<string, unknown>
+): string {
+  return provider === "claude-code" && signal === "traces"
+    ? traceSpanRecordKey(record)
+    : firstText(record.spanId) ?? "";
+}
+
+function traceSpanKey(traceId: string, spanId: string): string {
+  return opaqueHash("tsp", `claude-trace|${traceId}|${spanId}`);
+}
+
 function activityDescriptor(
   provider: SafeObservationV1["provider"],
   rawName: string,
   attributes: Record<string, unknown>
 ): { kind: SafeActivityAtomV1["kind"]; name: string } | undefined {
   const name = normalizedName(rawName);
+  const claudeToolDecision = provider === "claude-code" && isClaudeToolDecisionEventName(name);
   const isTool = provider === "github-copilot"
     ? name.startsWith("execute_tool") || name === "copilot_chat.tool.call"
       : provider === "claude-code"
-      ? name.includes("tool_result") || name.includes("tool_use")
+      ? name === "claude_code.tool" || claudeToolDecision || name.includes("tool_result") || name.includes("tool_use")
       : provider === "codex"
         // Current Codex exposes the authoritative tool boundary through PostToolUse.
         // dispatch_tool_call spans are internal wrappers and can appear more than once
@@ -1568,9 +3093,48 @@ function activityDescriptor(
     attributes["copilot.tool.name"],
     rawName.replace(/^execute_tool\s*/i, "")
   )) ?? "unknown";
-  const toolParameters = parseJsonRecord(firstText(attributes["tool_parameters"]));
+  if (
+    claudeToolDecision
+    && (
+      claudeToolDecisionOutcome(attributes["decision"]) == null
+      || !firstText(attributes["tool_use_id"])
+      || toolName === "unknown"
+    )
+  ) {
+    return undefined;
+  }
+  // A permission decision carries an authority boundary, not a result. Its
+  // parameters can contain input content, so never derive a richer semantic
+  // name from them; retain only the safe primary tool category.
+  const toolParameters = claudeToolDecision ? undefined : parseJsonRecord(firstText(attributes["tool_parameters"]));
   const skillName = safeActivityName(firstText(attributes["skill.name"], attributes["skill_name"], toolParameters?.skill_name));
-  const mcpName = safeActivityName(firstText(attributes["mcp_server"], attributes["mcp_server.name"], toolParameters?.mcp_server_name));
+  const explicitMcpServer = safeActivityName(firstText(
+    attributes["mcp_server"],
+    attributes["mcp_server.name"],
+    toolParameters?.mcp_server_name
+  ));
+  const explicitMcpTool = safeActivityName(firstText(
+    attributes["mcp_tool"],
+    attributes["mcp_tool.name"],
+    toolParameters?.mcp_tool_name
+  ));
+  // Claude Code can surface an MCP invocation only through its namespaced tool
+  // name (`mcp__server__tool`). Parse that bounded identifier directly, never
+  // tool arguments, and fail back to a generic tool if explicit metadata
+  // disagrees with it.
+  const namespacedMcp = provider === "claude-code" ? claudeMcpToolParts(toolName) : undefined;
+  const mcpMetadataConflict = Boolean(
+    namespacedMcp
+    && (
+      (explicitMcpServer && normalizedName(explicitMcpServer) !== normalizedName(namespacedMcp.server))
+      || (explicitMcpTool && normalizedName(explicitMcpTool) !== normalizedName(namespacedMcp.tool))
+    )
+  );
+  const mcpServer = mcpMetadataConflict ? undefined : explicitMcpServer ?? namespacedMcp?.server;
+  const mcpTool = mcpMetadataConflict ? undefined : explicitMcpTool ?? namespacedMcp?.tool;
+  const mcpName = mcpServer
+    ? safeActivityName(mcpTool ? `${mcpServer}/${mcpTool}` : mcpServer)
+    : undefined;
   const subagentName = safeActivityName(firstText(attributes["subagent_type"], toolParameters?.subagent_type));
   const normalizedTool = normalizedName(toolName);
   const isProviderSubagentOperation = provider === "github-copilot"
@@ -1582,12 +3146,28 @@ function activityDescriptor(
       : subagentName || isProviderSubagentOperation
         ? "subagent"
         : "tool";
-  return { kind, name: skillName ?? mcpName ?? subagentName ?? toolName };
+  return { kind, name: mcpName ?? skillName ?? subagentName ?? toolName };
 }
 
 function safeActivityName(value?: string): string | undefined {
   const text = value?.trim();
   return text && /^[A-Za-z0-9_.:/ -]{1,100}$/.test(text) ? text : undefined;
+}
+
+const CLAUDE_NAMESPACED_MCP_TOOL_NAME = /^mcp__([A-Za-z0-9][A-Za-z0-9_.-]{0,59})__([A-Za-z0-9][A-Za-z0-9_.-]{0,59})$/;
+
+// This is the shared grammar for Claude's metadata-only MCP tool identity.
+// Callers must still apply their own safe-name/output bounds before persisting
+// a derived activity name.
+export function isClaudeNamespacedMcpToolName(value: unknown): value is string {
+  return typeof value === "string" && CLAUDE_NAMESPACED_MCP_TOOL_NAME.test(value);
+}
+
+function claudeMcpToolParts(toolName: string): { server: string; tool: string } | undefined {
+  const match = CLAUDE_NAMESPACED_MCP_TOOL_NAME.exec(toolName);
+  if (!match) return undefined;
+  const [, server, tool] = match;
+  return { server, tool };
 }
 
 function parseJsonRecord(value?: string): Record<string, unknown> | undefined {
@@ -1622,6 +3202,15 @@ function activityOutcome(record: Record<string, unknown>, attributes: Record<str
   return "unknown";
 }
 
+function explicitLlmOutcome(
+  record: Record<string, unknown>,
+  attributes: Record<string, unknown>,
+  endedAt: string | undefined
+): SafeActivityAtomV1["outcome"] {
+  const explicit = activityOutcome(record, attributes);
+  return explicit === "unknown" && endedAt ? "success" : explicit;
+}
+
 function providerActivityOutcome(
   provider: SafeObservationV1["provider"],
   eventName: string,
@@ -1629,11 +3218,48 @@ function providerActivityOutcome(
   record: Record<string, unknown>,
   attributes: Record<string, unknown>
 ): SafeActivityAtomV1["outcome"] {
+  if (provider === "claude-code" && isClaudeToolDecisionEventName(normalizedName(eventName))) {
+    // Claude's documented tool-decision event establishes only whether
+    // permission was accepted or rejected. An accepted decision is not a tool
+    // result, so it must remain unknown until explicit result evidence arrives.
+    return claudeToolDecisionOutcome(attributes["decision"]) ?? "unknown";
+  }
   const outcome = activityOutcome(record, attributes);
+  if (
+    provider === "claude-code"
+    && normalizedName(firstText(
+      attributes["gen_ai.tool.name"],
+      attributes["tool.name"],
+      attributes["tool_name"]
+    ) ?? "") === "agent"
+  ) {
+    if (outcome === "failure" || outcome === "rejected") {
+      return outcome;
+    }
+    // Agent tool success establishes a successful launch/return boundary. It
+    // does not prove that the linked child has reached an accepted terminal.
+    return "unknown";
+  }
+  if (
+    provider === "claude-code"
+    && isHookShellTool(toolName)
+  ) {
+    if (outcome === "failure" || outcome === "rejected") {
+      return outcome;
+    }
+    const explicit = explicitOtlpShellOutcome(attributes);
+    if (explicit) {
+      return explicit;
+    }
+    // Claude's log events and trace spans describe tool-protocol completion.
+    // Neither surface establishes the child process result without an explicit
+    // exit code or semantic process status.
+    return "unknown";
+  }
   if (
     provider === "codex"
     && normalizedName(eventName) === "codex.tool_result"
-    && isCodexShellTool(toolName)
+    && isHookShellTool(toolName)
     && outcome === "success"
   ) {
     // Codex reports whether unified exec returned a protocol result here, not
@@ -1642,6 +3268,99 @@ function providerActivityOutcome(
     return "unknown";
   }
   return outcome;
+}
+
+function claudeToolDecisionOutcome(value: unknown): SafeActivityAtomV1["outcome"] | undefined {
+  const decision = normalizedName(firstText(value) ?? "");
+  if (decision === "reject") return "rejected";
+  if (decision === "accept") return "unknown";
+  return undefined;
+}
+
+function isClaudeToolDecisionEventName(name: string): boolean {
+  return name === "claude_code.tool_decision" || name === "tool_decision";
+}
+
+function explicitOtlpShellOutcome(
+  attributes: Record<string, unknown>
+): SafeActivityAtomV1["outcome"] | undefined {
+  if (
+    explicitBoolean(attributes["interrupted"]) === true
+    || explicitBoolean(attributes["is_interrupt"]) === true
+    || explicitBoolean(attributes["isInterrupt"]) === true
+  ) {
+    return "rejected";
+  }
+  if (
+    explicitBoolean(attributes["success"]) === false
+    || explicitBoolean(attributes["is_error"]) === true
+    || explicitBoolean(attributes["isError"]) === true
+    || firstText(attributes["error"])
+  ) {
+    return "failure";
+  }
+  const statusOutcomes = [
+    attributes["command_status"],
+    attributes["shell.status"],
+    attributes["exit_status"],
+    attributes["status"],
+    attributes["outcome"]
+  ].map((value) => explicitShellStatusOutcome(firstText(value)));
+  if (statusOutcomes.includes("rejected")) {
+    return "rejected";
+  }
+  if (statusOutcomes.includes("failure")) {
+    return "failure";
+  }
+  const exitCode = nonnegativeInteger(firstText(
+    attributes["exit_code"],
+    attributes["exit.code"],
+    attributes["process.exit_code"],
+    attributes["process.exit.code"],
+    attributes["command.exit_code"],
+    attributes["shell.exit_code"]
+  ));
+  if (exitCode != null) {
+    return exitCode === 0 ? "success" : "failure";
+  }
+  return statusOutcomes.includes("success") ? "success" : undefined;
+}
+
+function explicitShellStatusOutcome(value?: string): SafeActivityAtomV1["outcome"] | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const status = normalizedName(value);
+  const tokens = status.split(/[^a-z0-9]+/).filter(Boolean);
+  if (
+    status === "unsuccessful"
+    || tokens.some((token) => ["fail", "failed", "failure", "error", "errored"].includes(token))
+  ) {
+    return "failure";
+  }
+  if (tokens.some((token) => [
+    "interrupt",
+    "interrupted",
+    "cancel",
+    "canceled",
+    "cancelled",
+    "reject",
+    "rejected"
+  ].includes(token))) {
+    return "rejected";
+  }
+  if (["success", "successful", "succeeded", "ok"].includes(status)) {
+    return "success";
+  }
+  return undefined;
+}
+
+function explicitBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  const text = firstText(value)?.trim().toLowerCase();
+  return text === "true" ? true : text === "false" ? false : undefined;
 }
 
 function codexMetricOutcome(value: unknown): SafeActivityAtomV1["outcome"] {
@@ -1776,8 +3495,21 @@ function durationBetween(startedAt: string, endedAt?: string): number | undefine
   return Number.isFinite(duration) && duration >= 0 ? duration : undefined;
 }
 
+function timestampAtOrAfterWithin(candidate: string, anchor: string, maximumDifferenceMs: number): boolean {
+  const difference = Date.parse(candidate) - Date.parse(anchor);
+  return Number.isFinite(difference) && difference >= 0 && difference <= maximumDifferenceMs;
+}
+
 function activityIdFor(provider: SafeObservationV1["provider"], traceId: string, spanId: string): string {
   return opaqueHash("act", `${provider}|${traceId}|${spanId}`);
+}
+
+function nativeClaudeToolDecisionActivityId(traceId: string, toolUseId: string): string {
+  return opaqueHash("act", `claude-code|${traceId}|native_permission_decision|${toolUseId}`);
+}
+
+function nativeClaudeToolDecisionExecutionNodeId(queryId: string, traceId: string, toolUseId: string): string {
+  return opaqueHash("node", `claude-code|${queryId}|${traceId}|native_permission_decision|${toolUseId}`);
 }
 
 function promptNodeId(queryId: string): string {
@@ -1942,12 +3674,19 @@ function completionHookObservation(input: {
   session: string;
   startedAt: string;
   completionEvidence: NonNullable<QueryOccurrenceV1["completionEvidence"]>;
+  completionOutcome?: QueryOccurrenceV1["completionOutcome"];
+  completionFailureCategory?: RunCompletionFailureCategory;
+  observationIdentity?: string;
+  completedAt?: string;
 }): SafeObservationV1 {
   const queryId = opaqueHash("qry", `${input.provider}|${input.query}`);
   const sessionId = opaqueHash("ses", `${input.provider}|${input.session}`);
   return {
     schemaVersion: 1,
-    observationId: opaqueHash("obs", `${input.sourceId}|${input.query}|completed|${input.observedAt}`),
+    observationId: opaqueHash(
+      "obs",
+      input.observationIdentity ?? `${input.sourceId}|${input.query}|completed|${input.observedAt}`
+    ),
     sourceId: input.sourceId,
     provider: input.provider,
     runtime: input.provider,
@@ -1963,14 +3702,58 @@ function completionHookObservation(input: {
       provider: input.provider,
       runtime: input.provider,
       startedAt: input.startedAt,
-      completedAt: input.observedAt,
+      completedAt: input.completedAt ?? input.observedAt,
       completionEvidence: input.completionEvidence,
+      ...(input.completionOutcome ? { completionOutcome: input.completionOutcome } : {}),
+      ...(input.completionFailureCategory
+        ? { completionFailureCategory: input.completionFailureCategory }
+        : {}),
       promptState: "disabled",
       evidence: "submission_hook"
     }],
     usageAtoms: []
   };
 }
+
+function claudeCompletedOccurrence(
+  candidate: ClaudeStopCandidate,
+  completedAt: string,
+  classification: ReturnType<DefaultTelemetryClassification["classify"]>
+): QueryOccurrenceV1 {
+  return {
+    schemaVersion: 1,
+    queryId: opaqueHash("qry", `claude-code|${candidate.query}`),
+    sessionId: opaqueHash("ses", `claude-code|${candidate.session}`),
+    provider: "claude-code",
+    runtime: classification.runtime,
+    startedAt: candidate.startedAt,
+    completedAt,
+    completionEvidence: "closed_root_span",
+    promptState: "disabled",
+    evidence: "submission_hook"
+  };
+}
+
+function claudeStopFailureCategory(value: unknown): RunCompletionFailureCategory | undefined {
+  const category = firstText(value);
+  if (!category) {
+    return undefined;
+  }
+  return CLAUDE_STOP_FAILURE_CATEGORIES.has(category as RunCompletionFailureCategory)
+    ? category as RunCompletionFailureCategory
+    : "unknown";
+}
+
+const CLAUDE_STOP_FAILURE_CATEGORIES = new Set<RunCompletionFailureCategory>([
+  "rate_limit",
+  "authentication_failed",
+  "oauth_org_not_allowed",
+  "billing_error",
+  "invalid_request",
+  "server_error",
+  "max_output_tokens",
+  "unknown"
+]);
 
 function hookObservation(input: {
   provider: ProviderHookSource;
@@ -1980,6 +3763,7 @@ function hookObservation(input: {
   query: string;
   session: string;
   request: string;
+  observationRevision?: string;
   activity: {
     kind: SafeActivityAtomV1["kind"];
     name: string;
@@ -1987,11 +3771,14 @@ function hookObservation(input: {
     durationMs?: number;
     sensitiveAuditEvidence?: SensitiveAuditEvidenceV1[];
     childSession?: string;
+    timingConfidence?: SafeActivityAtomV1["timingConfidence"];
   };
   node: {
     nodeKind: ExecutionNodeAtomV1["nodeKind"];
     name: string;
     toolName?: string;
+    /** Raw provider tool-use ID; converted to an opaque execution identity below. */
+    invocation?: string;
     outcome: ExecutionNodeAtomV1["outcome"];
     startedAt: string;
     endedAt?: string;
@@ -2002,7 +3789,13 @@ function hookObservation(input: {
   const queryId = opaqueHash("qry", `${input.provider}|${input.query}`);
   const sessionId = opaqueHash("ses", `${input.provider}|${input.session}`);
   const requestId = opaqueHash("req", `${input.provider}|${input.request}`);
-  const activityId = activityIdFor(input.provider, input.query, requestId);
+  const invocationId = input.node.invocation
+    ? opaqueHash("invocation", `${input.provider}|${input.node.invocation}`)
+    : undefined;
+  // Keep separate provider tool uses separately durable even when a hook
+  // surface reuses its request ID. The opaque invocation field joins them
+  // semantically; this ID prevents storage replacement before that join.
+  const activityId = activityIdFor(input.provider, input.query, input.node.invocation ?? requestId);
   return {
     schemaVersion: 1,
     observationId: opaqueHash("obs", [
@@ -2010,7 +3803,8 @@ function hookObservation(input: {
       input.query,
       input.request,
       input.node.startedAt,
-      JSON.stringify(input.node.contents ?? [])
+      JSON.stringify(input.node.contents ?? []),
+      input.observationRevision ?? "semantic"
     ].join("|")),
     sourceId: input.sourceId,
     provider: input.provider,
@@ -2026,6 +3820,7 @@ function hookObservation(input: {
       queryId,
       sessionId,
       requestId,
+      ...(input.provider === "claude-code" && invocationId ? { invocationId } : {}),
       provider: input.provider,
       runtime: input.provider,
       kind: input.activity.kind,
@@ -2036,7 +3831,7 @@ function hookObservation(input: {
       evidenceSourceId: input.sourceId,
       evidenceProfileVersion: input.profileVersion,
       identityConfidence: "high",
-      timingConfidence: "high",
+      timingConfidence: input.activity.timingConfidence ?? "high",
       ...(input.activity.childSession
         ? { childSessionId: opaqueHash("ses", `${input.provider}|${input.activity.childSession}`) }
         : {}),
@@ -2050,6 +3845,7 @@ function hookObservation(input: {
       queryId,
       sessionId,
       requestId,
+      ...(invocationId ? { invocationId } : {}),
       provider: input.provider,
       runtime: input.provider,
       signal: "logs",
@@ -2390,14 +4186,46 @@ function hookOutcomeFromResponse(value: unknown): SafeActivityAtomV1["outcome"] 
   return "success";
 }
 
+function claudeHookOutcome(toolName: string, value: unknown): SafeActivityAtomV1["outcome"] {
+  if (!isHookShellTool(toolName)) {
+    return hookOutcomeFromResponse(value);
+  }
+  if (!isRecord(value)) {
+    return "unknown";
+  }
+  if (
+    explicitBoolean(value.interrupted) === true
+    || explicitBoolean(value.is_interrupt) === true
+    || explicitBoolean(value.isInterrupt) === true
+  ) {
+    return "rejected";
+  }
+  if (
+    explicitBoolean(value.success) === false
+    || explicitBoolean(value.is_error) === true
+    || explicitBoolean(value.isError) === true
+    || firstText(value.error)
+  ) {
+    return "failure";
+  }
+  const exitCode = nonnegativeInteger(firstText(value.exit_code, value.exitCode));
+  if (exitCode != null) {
+    return exitCode === 0 ? "success" : "failure";
+  }
+  if (typeof value.status === "string") {
+    return explicitShellStatusOutcome(value.status) ?? "unknown";
+  }
+  return "unknown";
+}
+
 function codexHookOutcome(toolName: string, value: unknown): SafeActivityAtomV1["outcome"] {
-  if (!isRecord(value) && isCodexShellTool(toolName)) {
+  if (!isRecord(value) && isHookShellTool(toolName)) {
     return "unknown";
   }
   return hookOutcomeFromResponse(value);
 }
 
-function isCodexShellTool(toolName: string): boolean {
+function isHookShellTool(toolName: string): boolean {
   const normalized = normalizedName(toolName).replace(/[.:/\-]/g, "_");
   return ["bash", "exec_command", "write_stdin", "shell", "shell_command", "unified_exec"].includes(normalized);
 }
@@ -2476,7 +4304,7 @@ function providerIdentity(
   record: Record<string, unknown>,
   attributes: Record<string, unknown>,
   name: string
-): { query: string; session: string; request: string } | undefined {
+): ProviderTelemetryIdentity | undefined {
   const traceId = firstText(record.traceId);
   const spanId = firstText(record.spanId);
   const eventSequence = firstText(attributes["event.sequence"]);
@@ -2555,9 +4383,9 @@ function providerIdentity(
 }
 
 function mergeCodexTraceIdentity(
-  traceIdentity: { query: string; session: string; request: string } | undefined,
-  promptIdentity: { query: string; session: string; request: string } | undefined
-): { query: string; session: string; request: string } | undefined {
+  traceIdentity: ProviderTelemetryIdentity | undefined,
+  promptIdentity: ProviderTelemetryIdentity | undefined
+): ProviderTelemetryIdentity | undefined {
   if (!traceIdentity) {
     return promptIdentity;
   }

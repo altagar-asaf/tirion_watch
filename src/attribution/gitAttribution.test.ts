@@ -51,6 +51,39 @@ describe("DefaultGitAttribution", () => {
     });
   });
 
+  it("retracts an arrival-order native causal rejection without letting the candidate remain reportable", async () => {
+    const initial = causalEvidence("query-1", "state-a", ["node-write-a"]);
+    const state = await attributionWith([episode(["query-1"], [initial])]);
+    await persistCompletedRun(state, run("query-1", 15_000_000));
+
+    await state.observations.addCandidate(candidate("commit-1", "state-a"));
+    const [claimed] = await state.ledger.listQueryAttributions({});
+    expect(claimed.allocations[0]?.proof?.matchedCausalWriteArtifacts).toEqual([{
+      queryId: "query-1",
+      artifactKey: "artifact-a",
+      executionNodeId: "node-write-a"
+    }]);
+
+    state.tracker.replaceEvidence("query-1", causalEvidence("query-1", "state-a", [], ["node-write-a"]));
+    await state.attribution.reconcile();
+
+    const [retracted] = await state.ledger.listQueryAttributions({});
+    expect(retracted).toMatchObject({ status: "rejected" });
+    expect(retracted.allocations[0]).toMatchObject({ status: "superseded", decision: "superseded" });
+    expect((await state.attribution.listCommitAttributions({}))[0]).toMatchObject({
+      status: "superseded",
+      decision: "superseded",
+      allocatedNanoUsd: undefined
+    });
+    expect(await state.ledger.listCommitPublicationSnapshots({})).toEqual([
+      expect.objectContaining({ commitHash: "commit-1", state: "superseded", allocatedNanoUsd: undefined })
+    ]);
+    expect((await state.observations.listCandidates())[0]).toMatchObject({
+      decision: "pending_evidence",
+      reasonCodes: expect.arrayContaining(["native_causal_write_retracted"])
+    });
+  });
+
   it("does not report same-file overlap when the committed state differs", async () => {
     const state = await attributionWith([episode(["query-1"], [evidence("query-1", "state-agent")])]);
     await persistCompletedRun(state, run("query-1", 10_000_000));
@@ -571,6 +604,20 @@ class FakeEpisodeTracker implements AgenticWorkEpisodeTracker {
     episode.epochIds = evidenceRecord.epochId ? [evidenceRecord.epochId] : [];
   }
 
+  replaceEvidence(queryId: string, evidenceRecord: QueryWorkEvidence): void {
+    const episode = this.episodes.find((item) => item.queryIds.includes(queryId));
+    if (!episode) {
+      return;
+    }
+    episode.evidence = episode.evidence.map((existing) =>
+      existing.queryId === queryId
+      && existing.repoKey === evidenceRecord.repoKey
+      && existing.epochId === evidenceRecord.epochId
+        ? evidenceRecord
+        : existing
+    );
+  }
+
   addQuery(queryId: string): void {
     const episode = this.episodes[0];
     episode.queryIds.push(queryId);
@@ -678,6 +725,28 @@ function evidence(queryId: string, worktreeStateKey: string): QueryWorkEvidence 
     addedLines: 1,
     deletedLines: 0,
     status: "completed"
+  };
+}
+
+function causalEvidence(
+  queryId: string,
+  worktreeStateKey: string,
+  successfulNodeIds: string[],
+  nativeRejectedNodeIds: string[] = []
+): QueryWorkEvidence {
+  const base = evidence(queryId, worktreeStateKey);
+  return {
+    ...base,
+    causalArtifactKeys: successfulNodeIds.length > 0 ? ["artifact-a"] : [],
+    causalWriteArtifacts: successfulNodeIds.map((executionNodeId) => ({
+      artifactKey: "artifact-a",
+      executionNodeId
+    })),
+    nativeRejectedCausalWriteArtifacts: nativeRejectedNodeIds.map((executionNodeId) => ({
+      artifactKey: "artifact-a",
+      executionNodeId
+    })),
+    causalWriteArtifactsComplete: true
   };
 }
 

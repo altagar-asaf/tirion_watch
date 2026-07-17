@@ -581,11 +581,11 @@ Maintained end-to-end anchors remain:
 | Risk | Current posture | Recommended next experiment |
 | --- | --- | --- |
 | Harness omits workspace context | Exact known query/session records still route independently in a mixed multi-repository export, including after restart. Truly unknown or conflicting records fail closed and remain local. | Measure field availability per supported harness/version and add only fixture-backed aliases. |
-| One in-flight HTTP request still occupies the serial delivery worker | Bounded to five seconds and durably retried. | Prototype limited concurrency across run subjects while preserving strict order inside each subject. |
+| One in-flight HTTP request can occupy the ordinary delivery worker | One reserved lifecycle-anchor lane may bypass it for a due start, settling update, or terminal from a different run. Exact event/run claims preserve strict per-run order and cap delivery at two concurrent attempts; forced retries never use the bypass. | Benchmark with receiver ingestion isolated from dashboard indexing, then stress two simultaneous slow anchors plus a fresh third run to decide whether the bounded lane needs configurable capacity. |
 | Completed projection can still improve grouped activity after live final usage | The explicit-terminal snapshot remains fixed at three seconds. A query-family projection has its own fixed scheduler key, atomically upserts one run, and enters the fresh lane without waiting for global rebuild, attribution, historical replay, or commit reconciliation. A non-final version retains a 15-second correction horizon. A final-usage correction with unresolved child activity gets a 250 ms replaceable window so grouped activity can collapse into the same version; without grouping it releases at the bound. Grouped semantic rows and verified descendant attribution remain monotonic across alternating live/completed projections. The controlled Codex Desktop acceptance collapsed exact grouped authority into version 1 and remained stable under later projections. | Record p50/p95 completion-to-live-final and completion-to-grouped-final timing separately across the maintained Claude, Codex, Cursor, and Copilot matrix. |
 | Codex Desktop emits hooks for ephemeral internal sessions | A transcriptless prompt stores an opaque internal marker without repository binding. Usage and dispatch enforce it across later Stop/trace/log evidence and restarts. Persistent root and child hooks require a transcript locator, which is used transiently and discarded. | Retain desktop title-generation fixtures and re-run them whenever Codex hook schema or trust behavior changes. |
 | Active repository scans can contend with the first live delivery | Scheduler lanes are independent, but one observed first-tool update waited about 1.03 seconds before its HTTP attempt while an active repository scan overlapped. Later updates were below 161 ms. | Add storage-operation latency spans, then prototype priority point delivery or smaller snapshot persistence batches without weakening causal file evidence. |
-| The local validation receiver shares an event loop with synchronous dashboard scans | A 35k-file dashboard/model scan blocked one loopback response for about 1.63 seconds even though Tirion had already queued the update. This is outside Tirion's acceptance-to-attempt path but inflates end-to-end test latency. | Move receiver ingestion to a separate process/worker or make dashboard indexing incremental before using it for p95 delivery benchmarks. |
+| The local validation receiver shares an event loop with synchronous dashboard scans | With about 36k event files, dashboard/model scans have held loopback responses for as long as 4.648 seconds even though Tirion had already queued the event. This receiver contention is outside Tirion's acceptance-to-attempt path but invalidates end-to-end p95 delivery measurements. | Move receiver ingestion to a separate process/worker or make dashboard indexing incremental before using it for p95 delivery benchmarks. |
 | Provider request/child IDs are absent or drift | Corroborating facts remain separate or child runs remain standalone; Tirion does not guess. | Maintain versioned native fixtures and diagnostics for unlinked/ambiguous evidence. |
 | Span DB source latency | Up to one poll interval before acceptance. | Include source-to-acceptance timing in the Copilot local harness and report it separately. |
 | Codex hook trust is user-controlled | Activation now fails visibly with `hook_trust_required`; Tirion never bypasses trust in product mode. | Add a signed-install trust UX and continue probing provider hook state after upgrades. |
@@ -597,8 +597,17 @@ Maintained end-to-end anchors remain:
 
 Keep this direction. The shared implementation has passed real Claude Code and
 Codex CLI runs, the controlled Codex Desktop root/child acceptance, and isolated
-Cursor and Copilot source-path validation. Before merge, run the live
-cross-harness matrix. Compare each webhook to the harness ledger, closed
-turn/root trace, hook counts, child evidence, and causal file set. Any
-unsupported native field must reduce coverage rather than trigger temporal or
-naming heuristics.
+Cursor and Copilot source-path validation. The final current-release live
+cross-harness gate `REL-E2E-20260716T082716Z` also passed against the normal
+authenticated loopback receiver: concurrent Claude Code and Codex roots ran for
+349 and 520 seconds, delivered 20 and 43 updates respectively, then emitted
+strictly ordered versioned terminals with exact final conservation, no duplicate
+or post-terminal event, a drained queue, and clean privacy evidence. The agent
+subsequently reached an ingress/runtime/webhook fixed point and restarted
+healthy.
+
+Treat that as functional release acceptance, not a statistical benchmark.
+Repeated isolated-receiver p50/p95 runs, slow-sink concurrency, retry/restart
+load, and exact semantic interpretation of layered Codex `Bash`/`exec` rows move
+to the next-release register. Any unsupported native field must continue to
+reduce coverage rather than trigger temporal or naming heuristics.

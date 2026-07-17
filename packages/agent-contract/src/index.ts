@@ -138,6 +138,9 @@ export type ProviderConfigurationReasonCode =
   | "source_configuration_unavailable"
   | "logs_missing"
   | "traces_missing"
+  | "enhanced_traces_disabled"
+  | "trace_batch_delay_unoptimized"
+  | "trace_export_interval_unoptimized"
   | "tool_details_disabled"
   | "tool_content_disabled"
   | "response_content_disabled"
@@ -313,6 +316,8 @@ export type SafeObservationV1 = {
 export type SafeUsageAuthority = "run" | "request" | "turn" | "model" | "event";
 export type SafeActivityKind = "tool" | "subagent" | "skill" | "mcp";
 export type SafeActivityOutcome = "success" | "failure" | "rejected" | "unknown";
+/** A bounded semantic authority for an activity outcome; never raw provider decision payload. */
+export type SafeActivityOutcomeAuthorityV1 = "native_permission_decision";
 export type SensitiveAuditEvidenceKind =
   | "tool_arguments"
   | "tool_output"
@@ -331,6 +336,16 @@ export type SensitiveAuditEvidenceV1 = {
   capturedAt: string;
 };
 export type RunCompletionMode = "explicit" | "inactivity";
+export type RunCompletionOutcome = "success" | "failure" | "unknown";
+export type RunCompletionFailureCategory =
+  | "rate_limit"
+  | "authentication_failed"
+  | "oauth_org_not_allowed"
+  | "billing_error"
+  | "invalid_request"
+  | "server_error"
+  | "max_output_tokens"
+  | "unknown";
 export type CostEstimateBasis = "catalog_estimate" | "provider_reported_estimate" | "unavailable";
 /** Legacy compatibility only. New prompt lifecycle records use QueryOccurrenceV1. */
 export type SafeAtomKind = "usage" | "lifecycle";
@@ -350,6 +365,7 @@ export type BillingContextV1 =
   | "cursor"
   | "subscription"
   | "unknown";
+export type UsagePurposeV1 = "customer" | "auxiliary_session_title";
 
 export type ModelProviderV1 = "anthropic" | "openai" | "google" | "microsoft" | "github" | "cursor" | "unknown";
 export type ModelProviderBasisV1 = "telemetry_reported" | "model_name_rule" | "conflict" | "unknown";
@@ -364,6 +380,8 @@ export type SafeUsageAtomV1 = {
   repositoryKey?: string;
   requestId?: string;
   owningActivityId?: string;
+  /** Bounded opaque owner IDs proving that request-to-activity ownership conflicted. */
+  ownershipConflictActivityIds?: string[];
   signal?: TelemetrySignal;
   sourceId?: string;
   profileVersion?: string;
@@ -373,6 +391,8 @@ export type SafeUsageAtomV1 = {
   lifecycle?: SafeQueryLifecycle;
   authority: SafeUsageAuthority;
   completionMode?: RunCompletionMode;
+  /** Bounded provider-neutral purpose derived only from exact allowlisted source values. */
+  usagePurpose?: UsagePurposeV1;
   billingContext?: BillingContextV1;
   providerReportedNanoUsd?: number;
   model?: string;
@@ -395,6 +415,11 @@ export type SafeActivityAtomV1 = {
   sessionId?: string;
   repositoryKey?: string;
   requestId?: string;
+  /**
+   * Opaque provider tool-invocation identity. It joins hook and telemetry
+   * activity surfaces when they describe one underlying tool use.
+   */
+  invocationId?: string;
   /** Opaque child session identity for a provider-reported subagent activity. */
   childSessionId?: string;
   provider: SafeObservationV1["provider"];
@@ -402,6 +427,8 @@ export type SafeActivityAtomV1 = {
   kind: SafeActivityKind;
   name: string;
   outcome: SafeActivityOutcome;
+  /** Exact safe authority for a non-generic outcome, when the source proves one. */
+  outcomeAuthority?: SafeActivityOutcomeAuthorityV1;
   durationMs?: number;
   resultSizeBytes?: number;
   providerReportedResultTokens?: number;
@@ -428,6 +455,10 @@ export type QueryOccurrenceV1 = {
   startedAt: string;
   completedAt?: string;
   completionEvidence?: "stop_hook" | "session_hook" | "closed_root_span" | "provider_completed_event" | "inactivity";
+  /** Evidence-backed terminal outcome. Absence means the provider surface did not prove one. */
+  completionOutcome?: RunCompletionOutcome;
+  /** Allowlisted structured failure class; content-bearing error details are never retained. */
+  completionFailureCategory?: RunCompletionFailureCategory;
   repositoryKey?: string;
   promptState: QueryPromptState;
   promptText?: string;
@@ -475,6 +506,12 @@ export type ExecutionNodeAtomV1 = {
   sessionId?: string;
   repositoryKey?: string;
   requestId?: string;
+  /**
+   * Opaque provider tool-invocation identity. Unlike requestId, this is
+   * intentionally stable across provider telemetry and hook surfaces when
+   * both report the same underlying tool use.
+   */
+  invocationId?: string;
   provider: SafeObservationV1["provider"];
   runtime: string;
   signal?: TelemetrySignal;
@@ -482,10 +519,14 @@ export type ExecutionNodeAtomV1 = {
   name: string;
   parentNodeId?: string;
   outcome: SafeActivityOutcome;
+  /** Exact safe authority for a non-generic execution-node outcome, when the source proves one. */
+  outcomeAuthority?: SafeActivityOutcomeAuthorityV1;
   startedAt: string;
   endedAt?: string;
   durationMs?: number;
   model?: string;
+  /** Bounded provider-neutral purpose derived only from exact allowlisted source values. */
+  usagePurpose?: UsagePurposeV1;
   toolName?: string;
   /** Opaque repository artifact identities from an exact successful write signal. */
   artifactKeys?: string[];
@@ -497,6 +538,117 @@ export type ExecutionNodeAtomV1 = {
   reasoningOutputTokens?: number;
   contents?: ExecutionNodeContentV1[];
 };
+
+/**
+ * Claude's documented permission-decision surface is activity evidence, not an
+ * execution result.  The marker is deliberately bounded: it lets downstream
+ * causal-proof consumers reject an exact same-invocation conflict without
+ * retaining the provider decision payload.
+ */
+export function isNativePermissionRejectionExecutionNode(
+  node: Pick<
+    ExecutionNodeAtomV1,
+    "provider" | "nodeKind" | "outcome" | "outcomeAuthority" | "requestId" | "invocationId" | "name" | "toolName"
+  >
+): boolean {
+  return node.provider === "claude-code"
+    && node.nodeKind === "tool"
+    && node.outcome === "rejected"
+    && node.outcomeAuthority === "native_permission_decision"
+    && hasSafeExecutionInvocationIdentity(node)
+    && isNonEmptySafeExecutionIdentityPart(node.name)
+    && isNonEmptySafeExecutionIdentityPart(node.toolName);
+}
+
+/**
+ * Returns true only when a native Claude permission rejection identifies the
+ * exact same tool invocation as the candidate node.  A rejection without a
+ * complete opaque identity, or one for another request/name/tool, cannot
+ * erase a separately proven write.
+ */
+export function hasExactNativePermissionRejectionForExecutionNode(
+  candidate: Pick<
+    ExecutionNodeAtomV1,
+    "provider" | "queryId" | "nodeKind" | "requestId" | "invocationId" | "name" | "toolName"
+  >,
+  nodes: Iterable<
+    Pick<
+      ExecutionNodeAtomV1,
+      "provider" | "queryId" | "nodeKind" | "outcome" | "outcomeAuthority" | "requestId" | "invocationId" | "name" | "toolName"
+    >
+  >
+): boolean {
+  if (
+    candidate.provider !== "claude-code"
+    || candidate.nodeKind !== "tool"
+    || !hasSafeExecutionInvocationIdentity(candidate)
+    || !isNonEmptySafeExecutionIdentityPart(candidate.name)
+    || !isNonEmptySafeExecutionIdentityPart(candidate.toolName)
+  ) {
+    return false;
+  }
+  for (const node of nodes) {
+    if (
+      isNativePermissionRejectionExecutionNode(node)
+      && node.queryId === candidate.queryId
+      && sameSafeInvocationIdentity(node, candidate)
+      && node.nodeKind === candidate.nodeKind
+      && node.name === candidate.name
+      && node.toolName === candidate.toolName
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Exact activity identity is provider/query/semantic identity plus the same
+ * opaque invocation precedence rule used for execution nodes. It is shared by
+ * activity projection and live terminal correction, so a reused request ID
+ * can never join two provider tool uses when either side has tool-use ID.
+ */
+export function sameExactSafeActivityIdentity(
+  left: Pick<SafeActivityAtomV1, "provider" | "queryId" | "kind" | "name" | "requestId" | "invocationId">,
+  right: Pick<SafeActivityAtomV1, "provider" | "queryId" | "kind" | "name" | "requestId" | "invocationId">
+): boolean {
+  return left.provider === right.provider
+    && left.queryId === right.queryId
+    && left.kind === right.kind
+    && left.name === right.name
+    && sameSafeInvocationIdentity(left, right);
+}
+
+/**
+ * Invocation identity takes precedence whenever either surface reports it.
+ * Request identity is retained solely as a legacy fallback for pairs that
+ * both predate provider tool-use IDs. This prevents an unrelated request ID
+ * from making a partial cross-surface match look exact.
+ */
+export function sameSafeInvocationIdentity(
+  left: { requestId?: string; invocationId?: string },
+  right: { requestId?: string; invocationId?: string }
+): boolean {
+  const leftHasInvocation = isNonEmptySafeExecutionIdentityPart(left.invocationId);
+  const rightHasInvocation = isNonEmptySafeExecutionIdentityPart(right.invocationId);
+  if (leftHasInvocation || rightHasInvocation) {
+    return leftHasInvocation && rightHasInvocation && left.invocationId === right.invocationId;
+  }
+  return isNonEmptySafeExecutionIdentityPart(left.requestId)
+    && isNonEmptySafeExecutionIdentityPart(right.requestId)
+    && left.requestId === right.requestId;
+}
+
+function hasSafeExecutionInvocationIdentity(
+  node: Pick<ExecutionNodeAtomV1, "requestId" | "invocationId">
+): boolean {
+  return isNonEmptySafeExecutionIdentityPart(node.invocationId)
+    || isNonEmptySafeExecutionIdentityPart(node.requestId);
+}
+
+function isNonEmptySafeExecutionIdentityPart(value: string | undefined): value is string {
+  return typeof value === "string" && value.length > 0;
+}
 
 export type ExecutionTreeNodeV1 = ExecutionNodeAtomV1 & {
   nodeKey: string;
@@ -555,6 +707,8 @@ export type RunBreakdownV1 = {
   name: string;
   count: number;
   failureCount: number;
+  /** Exact rejection observations represented by this row; always a subset of failureCount. */
+  rejectedCount?: number;
   /** Number of represented observations whose native outcome is unavailable. */
   unknownCount?: number;
   totalDurationMs?: number;
@@ -640,6 +794,9 @@ export type ShadowRunV1 = {
   breakdown?: RunBreakdownV1[];
   /** Optional only when no privacy-safe reported input-token footprint is available. */
   context?: RunContextFootprintV1;
+  /** Authoritative lifecycle evidence retained for outcome-bearing terminal projections. */
+  completionEvidence?: QueryOccurrenceV1["completionEvidence"];
+  completionOutcome?: RunCompletionOutcome;
   startedAt: string;
   endedAt?: string;
   warnings: ShadowReasonCode[];
@@ -653,6 +810,7 @@ export type ShadowReasonCode =
   | "provider_reported_estimate"
   | "session_identity_unavailable"
   | "lower_authority_overlap_discarded"
+  | "auxiliary_session_title_excluded"
   | "no_usage_atoms";
 
 export type ShadowTotalsV1 = {
@@ -891,6 +1049,8 @@ export type RunLifecycleActivityWebhookV1 = {
   count?: number;
   /** Number of represented observations that failed or were rejected. */
   failureCount?: number;
+  /** Exact rejection observations represented by this row; always a subset of failureCount. */
+  rejectedCount?: number;
   /** Number of represented observations whose native outcome is unavailable. */
   unknownCount?: number;
   startedAt: string;
@@ -958,6 +1118,8 @@ export type RunUpdatedWebhookEventV1 = RunWebhookEventBaseV1 & {
 export type RunEndedWebhookEventV1 = RunWebhookEventBaseV1 & {
   eventType: "run.ended";
   version?: number;
+  /** Optional provider-evidenced outcome; `state` continues to describe lifecycle completion. */
+  outcome?: RunCompletionOutcome;
   endedAt: string;
   inputTokens: number;
   outputTokens: number;
@@ -1141,6 +1303,25 @@ export type AgentStatusV1 = {
     port: number;
     paths: ("/v1/traces" | "/v1/logs" | "/v1/metrics")[];
   };
+};
+
+/** A bounded local pre-stop drain request. It never contains telemetry data. */
+export type AgentRuntimeQuiesceRequestV1 = {
+  schemaVersion: 1;
+  timeoutMs: number;
+};
+
+/**
+ * Safe status for a sealed-producer drain. A timeout is deliberately explicit:
+ * callers must not interpret it as permission to discard queued evidence.
+ */
+export type AgentRuntimeQuiesceStatusV1 = {
+  schemaVersion: 1;
+  state: "drained" | "timed_out";
+  elapsedMs: number;
+  telemetryIngressDrained: boolean;
+  runtimeWorkDrained: boolean;
+  webhookDrained: boolean;
 };
 
 export type AgentVersionV1 = {

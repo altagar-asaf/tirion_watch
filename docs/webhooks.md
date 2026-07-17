@@ -34,14 +34,38 @@ HMAC_SHA256(secret, "<timestamp>.<raw-body>")
 ```
 
 Delivery uses a durable local outbox with retry, lifecycle-first scheduling,
-exact next-deadline wake-up, and a bounded request timeout. Queueing and HTTP
-delivery for one terminal subject are serialized, and delivery re-reads the
+exact next-deadline wake-up, and a bounded request timeout. HTTP delivery
+attempts for one terminal subject are serialized, and delivery re-reads the
 current durable row before sending. Fresh queueing and delivery use point reads
-and due-row selection rather than loading historical outbox payloads. The live
-projection lane processes lifecycle anchors before enrichment, and ordinary
-delivery re-reads priority after each event so a newly queued start can preempt
-a stale batch of updates from other runs. Per-run order remains
-`run.start -> run.update -> run.ended`. Receivers should dedupe by
+and due-row selection rather than loading historical outbox payloads. Terminal
+admission has a dedicated projection path: it never awaits outbound HTTP and
+durably queues an eligible terminal even while a same-run update attempt is in
+flight. That does not make same-run delivery concurrent. The live projection
+lane processes lifecycle anchors before enrichment, and ordinary delivery
+re-reads priority after each event so a newly queued start can preempt a stale
+batch of updates from other runs. If that ordinary lane is waiting for one HTTP
+response, one reserved bounded lane may deliver a due start, settling update, or
+terminal for a different run. Exact in-memory event/run claims keep the two lanes
+from duplicating an attempt or overlapping one run; forced retries never use the
+  reserved lane. Lifecycle order describes receiver-visible HTTP deliveries, not
+every durable outbox row. A successful terminal suppresses pending stale running
+updates for that run, so queueing a snapshot does not promise it will be sent.
+Normal completed lifecycle delivery retains an eligible `settling` update before
+the terminal: `run.start -> delivered run.update(s) -> run.ended`.
+
+Among fresh due lifecycle entries in both ordinary and bounded-bypass selection,
+`run.start` ranks first. A fresh due trusted Claude Code closed-root terminal
+ranks next, ahead of fresh `settling` updates from either the same or a different
+run. It is limited to a terminal whose webhook `codingHarness` and runtime are
+`claude-code`, `evidence.basis` is `root_span`, and `evidence.delayed` is
+`false`; this fresh-entry priority does not change retry or blocked-delivery
+policy. Within that terminal's own run, the public sequence is
+`run.start -> optional delivered run.update(s) -> run.ended`. It does not
+preempt an update HTTP attempt already in flight: it completes before the
+terminal attempt. If the terminal attempt fails or retries, the pending settling
+update remains a valid fallback; successful terminal delivery suppresses any
+still-pending same-run update. All other completed lifecycles retain their
+settling-update-before-terminal order. Receivers should dedupe by
 `x-tirion-event-id` or `idempotency-key`.
 
 Fresh completed-run corrections and evidence enrichment use a projection lane
@@ -72,6 +96,33 @@ deserialized.
 ## Event Types
 
 Current schema version: `1`.
+
+### Claude Code 2.1.201/2.1.207 correlation boundary
+
+Claude request purpose is derived only through an exact metadata-only chain in
+the current agent process: the `UserPromptSubmit` prompt/session anchors the
+prompt log's trace, and that trace plus the API log's request identity joins the
+matching LLM span. Exact `query_source=generate_session_title` is classified as
+`auxiliary_session_title`; exact `query_source=sdk` is classified as customer
+work. The accepted 2.1.201 failed-request fixture also classifies exact
+`operation.name=generate_session_title` as auxiliary. Unknown or missing
+purpose remains unclassified and counted; arbitrary operation names are
+discarded. Conflicting prompt, session, trace, request, or purpose evidence
+fails closed.
+
+Tirion retains exact title-purpose usage in privacy-safe upstream atoms for
+corroboration, then removes it before customer usage and every live lifecycle
+snapshot. All log/trace copies of the same proven title request are excluded
+from activity, tokens, models, context, and estimated cost. The request never
+creates a separate public run. Unclassified usage is not guessed away.
+
+The correlation maps are bounded and in-memory. They do not survive an agent
+restart, so a join split across restart remains unclassified rather than being
+reconstructed speculatively. The implemented boundary has native metadata-only,
+focused deterministic, and fixed-binary Tirion-managed full-stack evidence for
+the accepted non-interactive root slice. It does not establish restart-spanning,
+interactive, recursive/nested-subagent, workflow/team, authenticated-MCP, or
+broader auxiliary behavior.
 
 ### `run.start`
 
@@ -122,17 +173,36 @@ Important fields include:
 - `activity`
 - token totals and `llmModels`
 - `context` when reported token-footprint evidence is available
+- `estimatedNanoUsd`, optional `usageValueNanoUsd`, `costEstimateBasis`, and
+  `costCoverage`
 - `evidence` and `coverage`
+
+`usageValueNanoUsd` is a catalog-rate value for the observed usage, not a
+claim about what the user was billed. It is independent of billed-cost
+coverage: a catalog-matched subscription run update can include
+`usageValueNanoUsd` while retaining `estimatedNanoUsd: 0`,
+`costEstimateBasis: "unavailable"`, and `costCoverage: "unavailable"`. Tirion
+omits the value when any usage-bearing component in the snapshot cannot be
+valued; it never publishes a partial subtotal as the whole run's usage value.
 
 Successive updates for one `runId` must not be added together. A receiver should
 replace its current non-terminal snapshot when a later `updatedAt` arrives.
 Stable request and activity identities let stronger revisions replace earlier
-evidence without counting both.
+evidence without counting both. If one provider envelope yields distinct
+meanings at the same source time, Tirion advances `updatedAt` by a logical
+millisecond beyond the durable delivered high-water; `evidence.observedAt`
+retains the actual source timestamp.
 
 Running updates are content-addressed and delivered immediately. A
 completed-run update with `state: "settling"` uses one replaceable outbox slot
 until the terminal deadline. This lets a provider root/turn authority replace
 provisional request-slice totals before the ordered settling update is sent.
+After successful terminal delivery, a pending stale running snapshot is
+suppressed rather than sent; lifecycle order therefore constrains delivered
+snapshots, not every queued row.
+The trusted Claude Code closed-root exception described in [Delivery](#delivery)
+is the only case where an unsent settling update is optional before the first
+terminal.
 
 When multiple repositories are watched, a trusted observation-level
 `repositoryKey` remains the direct routing path. An unkeyed observation may
@@ -148,6 +218,19 @@ suppress an exactly bound run update.
 
 Canonical terminal event for a completed run.
 
+For ordinary Claude Code completion, a `Stop` hook is a candidate rather than a
+terminal by itself. The same opaque prompt/session must also produce a matching
+closed root `claude_code.interaction`. A nonempty `background_tasks` or
+`session_crons` collection makes the Stop nonterminal, and
+`stop_hook_active` is diagnostic metadata rather than authority. Either surface
+alone, or a pair separated by an agent restart, fails closed without emitting a
+Claude terminal. An exactly matched non-blockable `StopFailure` remains the
+separate provider-terminal failure path. Claude `SessionEnd` is configured only
+as a diagnostic surface: it has session scope rather than a prompt identity and
+also fires for clear, resume, logout, and session-switch flows. Tirion retains
+at most its safe event category and allowlisted normalized reason in local
+diagnostics; it never treats that hook as a terminal or dispatches it.
+
 Important fields include:
 
 - `endedAt`
@@ -156,18 +239,45 @@ Important fields include:
 - `filesChanged`,
 - `activity`,
 - `estimatedNanoUsd`,
+- optional `usageValueNanoUsd`,
 - `costEstimateBasis`,
 - `costCoverage`,
+- optional `outcome`,
 - `state`.
 
-`filesChanged` values are repo-relative paths only. For ordinary run lifecycle
-delivery, Tirion includes a file only when a successful provider write signal
-was resolved transiently to an opaque artifact key for that run. A file merely
-changing during the same time window is not enough. Snapshot continuity can
-still support later commit attribution, and commit-proven evidence may publish
-a corrected higher terminal version. Codex `apply_patch` targets are parsed
-transiently from `tool_input.command`; command, patch, and file content are
-discarded before persistence.
+`state: "completed"` means the run lifecycle ended; it does not imply that the
+work succeeded. `outcome` is present only when provider evidence proves
+`success`, `failure`, or `unknown`. When it is absent, receivers must preserve
+the outcome as unavailable rather than infer success. A proven failure is
+monotonic across corrected higher terminal versions.
+
+A terminal rebuilt from durable provider evidence uses `evidence.delayed: true`.
+Its timing can still be high-confidence when Tirion retained the original
+provider terminal timestamp. An outcome-backed delayed terminal with no usage
+reports `coverage.usageCoverage: "none"`; this is unavailable usage, not zero
+provider-reported consumption.
+
+`filesChanged` values are repo-relative paths only. Ordinary durable or
+correction lifecycle and commit projections require retained bounded
+`{ artifactKey, executionNodeId }` evidence, revalidated against the exact
+same-query/repository durable execution node. That node must contain the exact
+artifact and be a successful allowlisted provider semantic-write tool node; a
+missing, malformed, or unreadable proof fails external file and commit
+projection closed. A grouped activity result or generic causal-key set cannot
+bless another artifact, and a file merely changing during the same time window
+is not enough. Snapshot continuity can still support later commit attribution.
+
+The sole live provisional exception is direct retained source-node proof: that
+same successful allowlisted semantic-write node supplies the artifact key. It
+never accepts an unpaired raw key, generic causal-key set, or grouped activity
+outcome. A late exact native decision may source-prune only its matching
+provisional activity/file proof during the 15-second retention and then issue
+a higher terminal version; an active version may already have been sent.
+Historical internal allocation revokes only with a complete census containing
+`nativeRejectedCausalWriteArtifacts`; missing, empty, or unreadable marker
+evidence does not revoke allocation or an independently valid sibling writer.
+Codex `apply_patch` targets are parsed transiently from `tool_input.command`;
+command, patch, and file content are discarded before persistence.
 
 The first terminal event is delivered at a fixed deadline derived from trusted
 explicit completion when available, otherwise authoritative completion (three
@@ -178,6 +288,24 @@ already supplied a closed authoritative turn/run boundary. In that case the
 live terminal may state `final`, and any optional context carries the same
 coverage. The completed-run projection can still improve grouped activity or
 workspace evidence through a higher version.
+
+`final` describes the closed authority represented by that version; it is not
+an immutability promise. Late-delivered evidence that began on or before the
+same completion boundary can publish a higher complete replacement, including
+revised usage, without reopening `run.update` delivery.
+
+For Claude Code, the exact eligible Stop/matching closed-root interaction join
+immediately triggers query-family terminal projection; ordinary Stop alone
+remains nonterminal. This path does not wait for the global usage quiet window
+or an outbound update response. It persists the terminal outbox row while any
+same-run update attempt is in flight. Only the trusted closed-root form with
+webhook `codingHarness`/runtime `claude-code`, `evidence.basis: "root_span"`,
+and `evidence.delayed: false` gets fresh due selection precedence after starts,
+ahead of fresh settling rows from the same or another run in ordinary and
+bounded-bypass lifecycle selection. An in-flight same-run update completes first;
+a failed/retrying terminal retains the settling fallback, while successful
+terminal delivery suppresses any remaining same-run update. Other Claude terminal
+evidence retains the normal settling-update-before-terminal order.
 
 For linked subagents, Tirion keeps one public root lifecycle. Child prompts,
 tools, usage, and closed child turns revise that root's accumulated snapshot,
@@ -203,7 +331,9 @@ transcript locators remain transient and are never included in the webhook. A
 durable child anchor found while earlier OTLP evidence is being projected is
 resolved through that parent link; provisional child state remains private
 until an actual public `run.start` exists and is reparented if the link arrives
-later.
+later, but only before any child or parent terminal is selected, reserved,
+queued, or delivered. After that boundary, Tirion retains the child subject for
+its correction route.
 
 The grace period is measured from the terminal evidence timestamp, not from
 when projection or queueing finishes. Empty `filesChanged` does not add another
@@ -213,7 +343,15 @@ eligible for delivery.
 After a non-final first terminal is delivered, Tirion retains its live identity
 for a bounded 15-second correction horizon. A late closed root turn/run boundary
 can therefore emit a corrected terminal immediately without publishing a
-post-terminal `run.update`. Final usage releases that state immediately; a run
+post-terminal `run.update`. Final usage releases live webhook mappings
+immediately, but a separate opaque session/query/completion-boundary correction
+marker remains for that bounded horizon. A late exact native decision matches
+by `invocationId` whenever either source has one, with request identity only
+when both invocation IDs are absent. It may source-prune only its matching live
+provisional activity/file proof; authoritative grouped activity still waits for
+the completed-run rebuild. This bounded correction can follow an active first
+delivery rather than prevent it. Other eligible late pre-boundary evidence can
+also publish a higher terminal replacement without reopening updates; a run
 that receives no correction is released when the horizon expires.
 
 Each explicit completion also schedules a query-scoped terminal projection at a
@@ -222,13 +360,24 @@ linked child query family and atomically updates that completed run. The ordinar
 global projection quiet period may move while other harness sessions continue
 producing telemetry, but it cannot postpone this terminal reconciliation. If a
 closed authoritative boundary arrives for the recently terminal session first,
-Tirion projects that family immediately.
+Tirion projects that family immediately. A Claude closed root that completes its
+exact Stop join uses this immediate path rather than waiting for the ordinary
+global quiet period.
 
 Later authoritative telemetry may correct usage, activity, terminal timing,
 models, estimated cost, or workspace evidence. Tirion emits that changed
 meaning as a higher `version` for the same `runId`; corrections may move numeric
 values down as well as up. The first published `startedAt` remains immutable
 across versions. Each version has its own idempotent `eventId`.
+
+The delivered-update high-water governs successive non-terminal `run.update`
+snapshots; a `run.ended` event replaces that running snapshot. In particular,
+`costCoverage: "complete"` on a running update describes the usage selected at
+that moment. A later preferred provider surface can expose requests whose
+matching provider-reported cost has not arrived yet, so a terminal may retain
+the same token vector while changing the estimate and honestly reporting
+`costCoverage: "partial"`. Receivers should use the terminal's
+`costEstimateBasis` and `costCoverage`, never merge its cost with the update.
 
 Terminal meaning is hashed from canonical JSON with `eventId` and `version`
 excluded. Object-key insertion order therefore cannot create a false semantic
@@ -248,8 +397,9 @@ Rows can represent an individual observation or a grouped terminal breakdown.
 | `parentActivityId` | Parent subagent activity for a nested child row, when provider linkage is unambiguous. |
 | `count` | Number of privacy-safe observations represented by the row. |
 | `failureCount` | Represented observations that failed or were rejected. |
+| `rejectedCount` | Exact native permission rejections represented by the row; when present, it is a subset of `failureCount`. |
 | `unknownCount` | Represented observations whose native outcome was unavailable. |
-| `outcome` | `unknown` for a mixed or natively unknown group; it is never coerced to success merely because `failureCount` is zero. |
+| `outcome` | `success` only when every represented observation is known success; `rejected` only when every one is an exact rejection; `failure` when all are non-success and at least one is a generic failure; otherwise `unknown`. |
 | token fields | Usage attributed to this row from captured telemetry. |
 | `usageAttributionBasis` | `provider_reported`, `trace_descendant`, `activity_only`, or `unavailable`. |
 | `usageCoverage` | `complete`, `partial`, or `unavailable` for this row's token attribution. |
@@ -262,10 +412,24 @@ uses the direct safe live activity and explicit terminal evidence available at
 its deadline. This avoids presenting a derived terminal row as though Tirion
 directly observed a hook or span for it.
 
+For an exact Claude permission decision, Tirion keeps separate opaque decision
+evidence. It matches ordinary evidence only with the same provider/query/tool
+kind/name and exact safe invocation identity: `invocationId` whenever either
+source supplies it, otherwise request identity only when both lack one. A
+validated native rejection carries decision timing and outcome only; it owns no
+usage, accounting, context, execution, or lifecycle authority and cannot
+inherit duration, result, audit, or causal-artifact evidence. During the
+retained live correction horizon it source-prunes only the matching provisional
+activity/file proof. A durable grouped activity changes only through the
+authoritative completed-run rebuild, never a direct broad prune.
+
 When the completed-run projection supplies a grouped kind/name already present
 in a provisional or older terminal snapshot, the grouped row replaces those
-rows. Its `count` and `failureCount` cover the represented calls; Tirion does
-not add the direct and grouped views together across terminal versions.
+rows. Its `count`, `failureCount`, and (when present) `rejectedCount` cover the
+represented calls; Tirion does not add the direct and grouped views together
+across terminal versions. A row is `rejected` only when every represented call
+is an exact rejection; a group that also contains an execution failure remains
+`failure` rather than claiming every failure was a rejection.
 
 When provisional LLM rows and an authoritative same-name subagent aggregate
 carry the same usage, Tirion treats them as two views of the children only when
@@ -372,7 +536,11 @@ Important fields:
 - `updatedAt`
 
 Commit events may be re-delivered with a later `version` if attribution state
-changes, for example `rewrite_pending` or `superseded`.
+changes, for example `rewrite_pending` or `superseded`. If an existing active
+event later loses exactly the proof pruned by a native decision, its later
+version is `superseded`; Tirion does not create a new unrelated event or remove
+an independently valid sibling writer. The active version can precede that
+superseding correction in source-arrival order.
 
 ## Privacy Exclusions
 

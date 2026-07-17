@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AttributionHasher } from "../attribution/fingerprints";
 import { DefaultPrivacyGuard } from "../privacy/privacyGuard";
-import { QueryCostAttribution } from "../types";
+import { ObservedCommitCandidate, QueryCostAttribution, QueryWorkEvidence } from "../types";
 import { JsonlCommitAttributionLedger } from "./commitAttributionLedger";
 
 describe("JsonlCommitAttributionLedger", () => {
@@ -367,6 +367,214 @@ describe("JsonlCommitAttributionLedger", () => {
     ]));
   });
 
+  it("retracts only an existing exact native-rejected causal claim and retains a superseded correction snapshot", async () => {
+    const ledger = new JsonlCommitAttributionLedger(
+      dir,
+      new DefaultPrivacyGuard(),
+      () => Date.parse("2026-06-08T00:05:00.000Z")
+    );
+    const record = attribution("query-1", 10);
+    record.allocations[0].proof = {
+      ...record.allocations[0].proof!,
+      matchedCausalWriteArtifacts: [matchedPair("query-1", "node-write-a")]
+    };
+    await ledger.upsertQueryAttribution(record);
+
+    const result = await ledger.reconcileNativeRejectedCausalClaims({
+      evidence: [nativeRejectionEvidence("query-1", "node-write-a")],
+      candidates: [candidate()]
+    });
+
+    expect(result).toEqual({
+      revokedQueryIds: ["query-1"],
+      revokedCommitHashes: ["commit-1"],
+      revalidatedQueryIds: [],
+      revalidatedCommitHashes: []
+    });
+    const [recorded] = await ledger.listQueryAttributions({});
+    expect(recorded).toMatchObject({ status: "rejected" });
+    expect(recorded.allocations[0]).toMatchObject({
+      status: "superseded",
+      decision: "superseded",
+      evidenceReasons: expect.arrayContaining(["native_causal_write_retracted"])
+    });
+    expect((await ledger.listCommitAttributions({}))[0]).toMatchObject({
+      status: "superseded",
+      decision: "superseded",
+      allocatedNanoUsd: undefined
+    });
+    expect(await ledger.listCommitPublicationSnapshots({})).toEqual([
+      expect.objectContaining({
+        commitHash: "commit-1",
+        state: "superseded",
+        allocatedNanoUsd: undefined,
+        attributedQueryCount: 1
+      })
+    ]);
+    expect((await ledger.export("json", {})).content).toContain('"status": "superseded"');
+  });
+
+  it("does not fabricate or revoke an allocation from an empty or unproven later census", async () => {
+    const ledger = new JsonlCommitAttributionLedger(dir, new DefaultPrivacyGuard());
+    const legacy = attribution("legacy-query", 10);
+    await ledger.upsertQueryAttribution(legacy);
+
+    const result = await ledger.reconcileNativeRejectedCausalClaims({
+      evidence: [{
+        ...nativeRejectionEvidence("legacy-query", "node-write-a"),
+        nativeRejectedCausalWriteArtifacts: []
+      }],
+      candidates: [candidate()]
+    });
+
+    expect(result).toEqual({
+      revokedQueryIds: [],
+      revokedCommitHashes: [],
+      revalidatedQueryIds: [],
+      revalidatedCommitHashes: []
+    });
+    expect((await ledger.listQueryAttributions({}))[0]).toMatchObject({ status: "attributed" });
+    expect(await ledger.listCommitPublicationSnapshots({})).toHaveLength(1);
+
+    const empty = new JsonlCommitAttributionLedger(path.join(dir, "empty"), new DefaultPrivacyGuard());
+    await expect(empty.reconcileNativeRejectedCausalClaims({
+      evidence: [nativeRejectionEvidence("query-1", "node-write-a")],
+      candidates: [candidate()]
+    })).resolves.toEqual({
+      revokedQueryIds: [],
+      revokedCommitHashes: [],
+      revalidatedQueryIds: [],
+      revalidatedCommitHashes: []
+    });
+    expect(await empty.listCommitPublicationSnapshots({})).toEqual([]);
+  });
+
+  it("keeps a sibling direct writer active and scopes stored causal pairs per query", async () => {
+    const ledger = new JsonlCommitAttributionLedger(dir, new DefaultPrivacyGuard());
+    const claim = await ledger.tryFirstClaim({
+      candidate: candidate(),
+      episode: {
+        episodeId: "episode-1",
+        repoKey: "repo-key",
+        repoKeys: ["repo-key"],
+        epochIds: ["epoch-1"],
+        queryIds: ["query-a", "query-b"],
+        runIds: ["query-a-run", "query-b-run"],
+        startedAt: "2026-06-05T00:00:00.000Z",
+        lastAgentActivityAt: "2026-06-05T00:01:00.000Z",
+        status: "open",
+        decision: "pending_evidence",
+        evidence: []
+      },
+      proof: {
+        kind: "exact_content_state",
+        anchorQueryIds: ["query-a", "query-b"],
+        inheritedQueryIds: [],
+        matchedArtifactCount: 1,
+        matchedCausalWriteArtifacts: [
+          matchedPair("query-a", "node-write-a"),
+          matchedPair("query-b", "node-write-b")
+        ],
+        reasonCodes: ["content_state_continuity"]
+      },
+      queryIds: ["query-a", "query-b"]
+    });
+    expect(claim).toEqual({ claimedQueryIds: ["query-a", "query-b"], skippedQueryIds: [] });
+    const claimed = await ledger.listQueryAttributions({});
+    expect(claimed.find((item) => item.queryId === "query-a")?.allocations[0]?.proof?.matchedCausalWriteArtifacts).toEqual([
+      matchedPair("query-a", "node-write-a")
+    ]);
+    expect(claimed.find((item) => item.queryId === "query-b")?.allocations[0]?.proof?.matchedCausalWriteArtifacts).toEqual([
+      matchedPair("query-b", "node-write-b")
+    ]);
+
+    const result = await ledger.reconcileNativeRejectedCausalClaims({
+      evidence: [
+        nativeRejectionEvidence("query-a", "node-write-a"),
+        validCausalEvidence("query-b", "node-write-b")
+      ],
+      candidates: [candidate()]
+    });
+    expect(result.revokedQueryIds).toEqual(["query-a"]);
+    const after = await ledger.listQueryAttributions({});
+    expect(after.find((item) => item.queryId === "query-a")).toMatchObject({ status: "rejected" });
+    expect(after.find((item) => item.queryId === "query-b")).toMatchObject({ status: "attributed" });
+    expect((await ledger.listCommitAttributions({}))[0]).toMatchObject({
+      status: "mixed",
+      decision: "reportable"
+    });
+  });
+
+  it("retains anchor source pairs for an inherited allocation and revokes it only from that anchor census", async () => {
+    const ledger = new JsonlCommitAttributionLedger(dir, new DefaultPrivacyGuard());
+    await ledger.tryFirstClaim({
+      candidate: candidate(),
+      episode: {
+        episodeId: "episode-inherited",
+        repoKey: "repo-key",
+        repoKeys: ["repo-key"],
+        epochIds: ["epoch-1"],
+        queryIds: ["anchor-query", "inherited-query"],
+        runIds: ["anchor-run", "inherited-run"],
+        startedAt: "2026-06-05T00:00:00.000Z",
+        lastAgentActivityAt: "2026-06-05T00:01:00.000Z",
+        status: "open",
+        decision: "pending_evidence",
+        evidence: []
+      },
+      proof: {
+        kind: "exact_content_state",
+        anchorQueryIds: ["anchor-query"],
+        inheritedQueryIds: ["inherited-query"],
+        matchedArtifactCount: 1,
+        matchedCausalWriteArtifacts: [matchedPair("anchor-query", "node-anchor-write")],
+        reasonCodes: ["content_state_continuity", "unambiguous_episode_inheritance"]
+      },
+      queryIds: ["inherited-query"]
+    });
+    const [claimed] = await ledger.listQueryAttributions({});
+    expect(claimed.allocations[0]?.proof).toMatchObject({
+      kind: "episode_inheritance",
+      inheritedQueryIds: ["inherited-query"],
+      matchedCausalWriteArtifacts: [matchedPair("anchor-query", "node-anchor-write")]
+    });
+
+    const result = await ledger.reconcileNativeRejectedCausalClaims({
+      evidence: [nativeRejectionEvidence("anchor-query", "node-anchor-write")],
+      candidates: [candidate()]
+    });
+    expect(result.revokedQueryIds).toEqual(["inherited-query"]);
+    expect((await ledger.listQueryAttributions({}))[0]).toMatchObject({ status: "rejected" });
+  });
+
+  it("revalidates a shared-artifact claim to the independent current writer rather than retaining a rejected pair", async () => {
+    const ledger = new JsonlCommitAttributionLedger(dir, new DefaultPrivacyGuard());
+    const record = attribution("query-1", 10);
+    record.allocations[0].proof = {
+      ...record.allocations[0].proof!,
+      matchedCausalWriteArtifacts: [matchedPair("query-1", "node-write-a")]
+    };
+    await ledger.upsertQueryAttribution(record);
+
+    const result = await ledger.reconcileNativeRejectedCausalClaims({
+      evidence: [nativeRejectionEvidence("query-1", "node-write-a", ["node-write-b"])],
+      candidates: [candidate()]
+    });
+
+    expect(result).toEqual({
+      revokedQueryIds: [],
+      revokedCommitHashes: [],
+      revalidatedQueryIds: ["query-1"],
+      revalidatedCommitHashes: ["commit-1"]
+    });
+    const [recorded] = await ledger.listQueryAttributions({});
+    expect(recorded).toMatchObject({ status: "attributed" });
+    expect(recorded.allocations[0]).toMatchObject({ status: "active", decision: "reportable" });
+    expect(recorded.allocations[0]?.proof?.matchedCausalWriteArtifacts).toEqual([
+      matchedPair("query-1", "node-write-b")
+    ]);
+  });
+
   it("quarantines verified allocations whose repository epoch is no longer active", async () => {
     const ledger = new JsonlCommitAttributionLedger(dir, new DefaultPrivacyGuard());
     await ledger.upsertQueryAttribution(attribution("query-1", 10));
@@ -427,5 +635,79 @@ function attribution(queryId: string, estimatedNanoUsd: number): QueryCostAttrib
       stateChangedAt: "2026-06-05T00:00:02.000Z",
       createdAt: "2026-06-05T00:00:02.000Z"
     }]
+  };
+}
+
+function candidate(): ObservedCommitCandidate {
+  return {
+    candidateId: "epoch-1:commit-1",
+    epochId: "epoch-1",
+    repoKey: "repo-key",
+    commitHash: "commit-1",
+    parentHashes: ["parent-1"],
+    observedAt: "2026-06-05T00:00:02.000Z",
+    observedSequence: 3,
+    artifactStates: [{
+      artifactKey: "artifact-a",
+      stateKey: "state-a",
+      changeKind: "modified",
+      observedSequence: 3
+    }],
+    transitionKind: "fast_forward",
+    decision: "reportable",
+    reasonCodes: ["verified_content_continuity"]
+  };
+}
+
+function matchedPair(queryId: string, executionNodeId: string) {
+  return {
+    queryId,
+    artifactKey: "artifact-a",
+    executionNodeId
+  };
+}
+
+function nativeRejectionEvidence(
+  queryId: string,
+  rejectedNodeId: string,
+  validNodeIds: string[] = []
+): QueryWorkEvidence {
+  return {
+    queryId,
+    runIds: [`${queryId}-run`],
+    repoKey: "repo-key",
+    epochId: "epoch-1",
+    startedAt: "2026-06-05T00:00:00.000Z",
+    completedAt: "2026-06-05T00:00:01.000Z",
+    baselineTrusted: true,
+    baselineReasons: ["clean_baseline"],
+    headCommitAtStart: "base",
+    baselineSequence: 1,
+    dirtyAtStart: false,
+    observedChangeCount: 1,
+    artifactKeys: ["artifact-a"],
+    causalArtifactKeys: validNodeIds.length > 0 ? ["artifact-a"] : [],
+    causalWriteArtifacts: validNodeIds.map((executionNodeId) => ({ artifactKey: "artifact-a", executionNodeId })),
+    nativeRejectedCausalWriteArtifacts: [{
+      artifactKey: "artifact-a",
+      executionNodeId: rejectedNodeId
+    }],
+    causalWriteArtifactsComplete: true,
+    artifactStates: [{
+      artifactKey: "artifact-a",
+      worktreeStateKey: "state-a",
+      changeKind: "modified",
+      observedSequence: 2
+    }],
+    addedLines: 1,
+    deletedLines: 0,
+    status: "completed"
+  };
+}
+
+function validCausalEvidence(queryId: string, executionNodeId: string): QueryWorkEvidence {
+  return {
+    ...nativeRejectionEvidence(queryId, "node-unrelated", [executionNodeId]),
+    nativeRejectedCausalWriteArtifacts: []
   };
 }

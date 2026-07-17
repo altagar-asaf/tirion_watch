@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -196,6 +196,7 @@ describe("agent diagnostics", () => {
       protocolVersion: "1.0"
     });
     const diagnostics = new AgentDiagnosticsService(storage, join(root, "agent.log.jsonl"));
+    await diagnostics.record("runtime_started", "info", "2026-06-30T07:59:59.000Z");
 
     for (let index = 0; index < 1005; index += 1) {
       await diagnostics.record("construct_lifecycle", "info", `2026-06-30T08:00:${String(index % 60).padStart(2, "0")}.000Z`, {
@@ -212,6 +213,70 @@ describe("agent diagnostics", () => {
 
     expect(await storage.listAgentDocuments("diagnostic_event")).toHaveLength(1000);
     expect(await diagnostics.events()).toHaveLength(1000);
+    expect(await diagnostics.events(5000)).toHaveLength(1000);
+    expect(await diagnostics.events(1000, {
+      since: "2026-06-30T07:59:59.000Z",
+      until: "2026-06-30T07:59:59.000Z"
+    })).toEqual([
+      expect.objectContaining({ code: "runtime_started", at: "2026-06-30T07:59:59.000Z" })
+    ]);
+  });
+
+  it("filters the capped durable fallback by an inclusive diagnostic window", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-diagnostics-window-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    storages.push(storage);
+    await storage.initialize({
+      now: "2026-06-30T08:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const diagnostics = new AgentDiagnosticsService(storage);
+    await diagnostics.record("runtime_started", "info", "2026-06-30T08:00:01.000Z");
+    await diagnostics.record("runtime_warmup_changed", "info", "2026-06-30T08:00:02.000Z");
+    await diagnostics.record("runtime_stopping", "info", "2026-06-30T08:00:03.000Z");
+
+    expect(await diagnostics.events(100, {
+      since: "2026-06-30T08:00:02.000Z",
+      until: "2026-06-30T08:00:02.000Z"
+    })).toEqual([
+      expect.objectContaining({ code: "runtime_warmup_changed", at: "2026-06-30T08:00:02.000Z" })
+    ]);
+  });
+
+  it("reads a matching window from only the three bounded structured-log rotations", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tirion-diagnostics-rotations-"));
+    roots.push(root);
+    const storage = new AgentStorageClient({ databasePath: join(root, "agent.db") });
+    storages.push(storage);
+    await storage.initialize({
+      now: "2026-06-30T08:00:00.000Z",
+      ownershipState: "agent_full_owner",
+      protocolVersion: "1.0"
+    });
+    const logPath = join(root, "agent.log.jsonl");
+    const retained = {
+      schemaVersion: 1,
+      eventId: "diagnostic_retained_rotation",
+      code: "runtime_started",
+      severity: "info",
+      at: "2026-06-30T08:00:01.000Z"
+    };
+    writeFileSync(`${logPath}.3`, `${JSON.stringify(retained)}\n`);
+    writeFileSync(`${logPath}.4`, `${JSON.stringify({
+      ...retained,
+      eventId: "diagnostic_expired_rotation",
+      code: "runtime_stopping"
+    })}\n`);
+    const diagnostics = new AgentDiagnosticsService(storage, logPath);
+
+    expect(await diagnostics.events(1000, {
+      since: "2026-06-30T08:00:01.000Z",
+      until: "2026-06-30T08:00:01.000Z"
+    })).toEqual([
+      expect.objectContaining({ eventId: "diagnostic_retained_rotation", code: "runtime_started" })
+    ]);
   });
 });
 

@@ -6,6 +6,11 @@ import { ensurePrivateDirectory } from "@tirion/platform";
 export const MAX_LOG_BYTES = 5 * 1024 * 1024;
 export const MAX_LOG_ROTATIONS = 3;
 
+export type SafeStructuredLogWindow = {
+  since?: string;
+  until?: string;
+};
+
 export class SafeStructuredLog {
   constructor(private readonly path: string) {}
 
@@ -18,7 +23,7 @@ export class SafeStructuredLog {
     chmodSync(this.path, 0o600);
   }
 
-  read(limit: number): AgentDiagnosticEventV1[] {
+  read(limit: number, window?: SafeStructuredLogWindow): AgentDiagnosticEventV1[] {
     const boundedLimit = Math.max(1, Math.floor(limit));
     const events: AgentDiagnosticEventV1[] = [];
     for (const candidate of retainedPaths(this.path)) {
@@ -30,7 +35,10 @@ export class SafeStructuredLog {
           continue;
         }
         try {
-          events.push(JSON.parse(line) as AgentDiagnosticEventV1);
+          const event = JSON.parse(line) as AgentDiagnosticEventV1;
+          if (eventWithinWindow(event, window)) {
+            events.push(event);
+          }
         } catch {
           continue;
         }
@@ -44,6 +52,11 @@ export class SafeStructuredLog {
       rmSync(candidate, { force: true });
     }
   }
+}
+
+function eventWithinWindow(event: AgentDiagnosticEventV1, window?: SafeStructuredLogWindow): boolean {
+  return (!window?.since || event.at >= window.since)
+    && (!window?.until || event.at <= window.until);
 }
 
 function rotateLogs(path: string): void {

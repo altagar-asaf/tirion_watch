@@ -39,11 +39,31 @@ describe("agent attribution stores", () => {
       dirtyAtStart: false,
       observedChangeCount: 1,
       artifactKeys: ["artifact_12345678"],
+      causalArtifactKeys: ["artifact_12345678"],
+      causalWriteArtifacts: [{
+        artifactKey: "artifact_12345678",
+        executionNodeId: "node_successful_write_01"
+      }],
+      nativeRejectedCausalWriteArtifacts: [{
+        artifactKey: "artifact_rejected_12345678",
+        executionNodeId: "node_rejected_write_01"
+      }],
       addedLines: 1,
       deletedLines: 0,
       status: "completed"
     });
-    expect(await evidenceStore.listEvidence({ queryId: "query_12345678" })).toHaveLength(1);
+    expect(await evidenceStore.listEvidence({ queryId: "query_12345678" })).toEqual([
+      expect.objectContaining({
+        causalWriteArtifacts: [{
+          artifactKey: "artifact_12345678",
+          executionNodeId: "node_successful_write_01"
+        }],
+        nativeRejectedCausalWriteArtifacts: [{
+          artifactKey: "artifact_rejected_12345678",
+          executionNodeId: "node_rejected_write_01"
+        }]
+      })
+    ]);
 
     const episodeStore = new SqliteWorkEpisodeLedger(storage);
     await episodeStore.upsertEpisode({
@@ -170,6 +190,24 @@ describe("agent attribution stores", () => {
       deletedLines: 0,
       repositoryPath: "/private/repository"
     } as never)).rejects.toThrow("privacy_violation");
+    expect(await storage.listAgentDocuments("workspace_evidence")).toEqual([]);
+    await expect(new SqliteWorkspaceEvidenceLedger(storage).upsertEvidence({
+      queryId: "query_opaque_proof",
+      runIds: [],
+      repoKey: "repo_12345678",
+      startedAt: "2026-06-08T00:00:01.000Z",
+      baselineTrusted: false,
+      baselineReasons: [],
+      dirtyAtStart: false,
+      observedChangeCount: 1,
+      artifactKeys: ["artifact_opaque"],
+      causalWriteArtifacts: [{
+        artifactKey: "/private/repository.ts",
+        executionNodeId: "node_successful_write_01"
+      }],
+      addedLines: 0,
+      deletedLines: 0
+    })).rejects.toThrow("privacy_violation");
     expect(await storage.listAgentDocuments("workspace_evidence")).toEqual([]);
     await storage.close();
   });
